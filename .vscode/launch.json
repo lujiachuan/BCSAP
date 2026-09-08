@@ -1,0 +1,43 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "客户端：PySide6",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "apps.desktop_client.main",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "服务：仪器执行",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "apps.instrument_service.main",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "服务：共享数据",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "apps.data_service.main",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ],
+    "compounds": [
+        {
+            "name": "调试：完整平台骨架",
+            "configurations": [
+                "服务：仪器执行",
+                "服务：共享数据",
+                "客户端：PySide6"
+            ],
+            "stopAll": true
+        }
+    ]
+}
