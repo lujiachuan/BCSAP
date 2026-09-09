@@ -1,0 +1,25 @@
+flowchart LR
+    subgraph SERVER["A 数据服务器（长期运行）"]
+        DS["data_service<br/>FastAPI /api/v1"]
+        PG[("PostgreSQL")]
+        DS <--> PG
+    end
+
+    subgraph OP["B 授权操作电脑 · EPICS 控制网"]
+        CLI["spectrum-client.exe<br/>desktop_client"]
+        IS["spectrum-instrument-service.exe<br/>instrument_service"]
+        SPOOL[("本地暂存<br/>SQLite + NPZ")]
+        CLI <-->|"127.0.0.1 REST :8765"| IS
+        IS --> SPOOL
+    end
+
+    subgraph RET["C 纯检索/分析电脑"]
+        CLI2["spectrum-client.exe<br/>（同一可执行文件）"]
+    end
+
+    IOC["EPICS IOC / PV<br/>192.168.x · 控制网"]
+    IS <-->|"CA / PVA 待接入（当前模拟）"| IOC
+
+    CLI <-->|"HTTPS REST :8000<br/>拉数据/健康检查"| DS
+    CLI2 <-->|"HTTPS REST :8000"| DS
+    IS -.->|"可靠上传 规划"| DS

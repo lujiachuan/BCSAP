@@ -1,0 +1,9 @@
+record(ai, "BD:43:DCCT:Offset") { field(DESC, "set the offset") field(PINI, "YES") field(VAL, "0.05")}
+record(ai, "BD:43:DCCT:SamplePerioduSec") { field(DESC, "set the Sample Period uSec") field(PINI, "YES") field(VAL, "100") field(EGU, "V")}
+record(ai, "BD:43:DCCT:AverageNumber") { field(DESC, "set Average Number") field(PINI, "YES") field(VAL, "20") field(EGU, "V")}
+record(ao, "BD:43:DCCT:ZeroMQData") { field(DESC, "get the DCCTValue") field(PINI, "YES")}
+record(ai, "BD:43:DCCT:Alpha") { field(DESC, "Alpha") field(PINI, "YES") field(VAL, "0.314159")}
+record(stringin, "BD:43:DCCT:DataType") { field(DESC, "descrip the datatype") field(PINI, "YES") field(VAL, "multipass ewma data")}
+record(waveform, "BD:43:DCCT:Rawdata") { field(DESC, "rawdata") field(PINI, "YES") field(NELM, "100") field(FTVL, "DOUBLE")}
+record(bi,"BD:43:DCCT:WindowAverage") { field(DESC, "wind") field(PINI, "YES") field(VAL, "0")}
+record(ai, "BD:43:DCCT:Heartbeat") { field(DESC, "set offset") field(PINI, "YES") field(VAL, "0")}

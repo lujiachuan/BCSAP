@@ -1,0 +1,29 @@
+flowchart TB
+    subgraph L1["展示与交互层"]
+        UI["desktop_client<br/>PySide6 统一桌面客户端（唯一的用户界面）"]
+    end
+
+    subgraph L2["进程/服务层（按角色部署）"]
+        IS["instrument_service<br/>本机仪器执行服务（127.0.0.1:8765）"]
+        DS["data_service<br/>共享数据服务（服务器，:8000）"]
+    end
+
+    subgraph L3["共享业务包 packages/*"]
+        CT["contracts<br/>跨进程 DTO/契约"]
+        DOM["domain<br/>扫描状态机"]
+        EP["epics_adapter<br/>EPICS 网关抽象"]
+        OPT["optimizer<br/>（演示/规划）"]
+        SP["spectrum<br/>NPZ 谱图编解码"]
+    end
+
+    subgraph L4["存储与硬件"]
+        DB[("PostgreSQL<br/>中央数据")]
+        IOC["EPICS IOC / PV<br/>（控制网 192.168.x）"]
+    end
+
+    UI --> IS
+    UI --> DS
+    DS --> DB
+    IS -.-> IOC
+    IS -.->|"上传/归档 规划"| DS
+    L2 -. 依赖 .-> L3

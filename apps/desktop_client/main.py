@@ -136,6 +136,7 @@ class MainWindow(QMainWindow):
         self._navigation_items: list[tuple[QListWidgetItem, str, str, bool]] = []
         self._settings_page: QWidget | None = None
         self._workbench_page: QWidget | None = None
+        self._pages_by_key: dict[str, QWidget] = {}
         self._init_worker: InitializationWorker | None = None
         self._sync_in_progress = False
 
@@ -163,7 +164,9 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._start_initialization)
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        """退出前记住窗口几何、侧栏状态与当前页面。"""
+        """退出前确认进行中的任务，再记住窗口几何、侧栏状态与当前页面。"""
+        if not self._confirm_exit_while_active(event):
+            return
         if self._init_worker is not None and self._init_worker.isRunning():
             self._init_worker.requestInterruption()
             self._init_worker.wait(5_500)
@@ -172,6 +175,46 @@ class MainWindow(QMainWindow):
         self._settings.setValue("sidebarCollapsed", self._sidebar_collapsed)
         self._settings.setValue("lastPageRow", self.navigation.currentRow())
         super().closeEvent(event)
+
+    _ACTIVE_PAGE_NAMES = {"scan": "扫谱", "tuning": "自动调束"}
+
+    def _operation_active(self, key: str) -> bool:
+        """询问页面实例是否有进行中的任务（扫谱/调束各自实现）。"""
+        page = self._pages_by_key.get(key)
+        if page is None:
+            return False
+        checker = getattr(page, "is_operation_active", None)
+        return bool(checker is not None and checker())
+
+    def _confirm_exit_while_active(self, event) -> bool:
+        """扫谱/调束进行中退出时弹确认；返回 False 表示用户取消退出。"""
+        active_names = [
+            name
+            for key, name in self._ACTIVE_PAGE_NAMES.items()
+            if self._operation_active(key)
+        ]
+        if not active_names:
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("任务仍在进行")
+        box.setText(
+            f"当前仍有“{'、'.join(active_names)}”正在进行。\n\n"
+            "退出将中断当前任务并停止采集。确定停止并退出吗？"
+        )
+        cancel_button = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.addButton("停止并退出", QMessageBox.ButtonRole.AcceptRole)
+        box.setDefaultButton(cancel_button)
+        box.setEscapeButton(cancel_button)
+        box.exec()
+        if box.clickedButton() is cancel_button:
+            event.ignore()
+            return False
+        for key in self._ACTIVE_PAGE_NAMES:
+            page = self._pages_by_key.get(key)
+            if page is not None and getattr(page, "safe_stop", None) is not None:
+                page.safe_stop()
+        return True
 
     def showEvent(self, event) -> None:  # noqa: N802
         """首次显示后按主题给原生标题栏着色（失败自动回退系统外观）。"""
@@ -220,6 +263,7 @@ class MainWindow(QMainWindow):
             item.setIcon(make_nav_icon(symbol))
             self._navigation_items.append((item, label, symbol, False))
             page = _PAGE_SPEC_BY_KEY[key].factory()
+            self._pages_by_key[key] = page
             if key == "settings":
                 page.themeChanged.connect(self._set_theme)
                 page.motionPreferenceChanged.connect(self._on_motion_preference_changed)
@@ -544,12 +588,21 @@ def main() -> int:
     # 启动时恢复上次选择的主题（浅色 / 深色）
     settings = QSettings("SpectrumPlatform", "DesktopClient")
     apply_theme(app, str(settings.value("theme", "light")))
+    # 操作电脑单文件夹交付：探测并拉起同目录分发的本机执行服务
+    # （找不到服务 exe 的检索电脑/开发环境会自动跳过，见 instrument_supervisor）。
+    from apps.desktop_client.instrument_supervisor import InstrumentServiceSupervisor
+
+    supervisor = InstrumentServiceSupervisor()
+    supervisor.ensure_started()
     window = MainWindow()
     if window._start_maximized:
         window.showMaximized()
     else:
         window.show()
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        supervisor.shutdown()
 
 
 if __name__ == "__main__":

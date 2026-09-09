@@ -1,0 +1,17 @@
+sequenceDiagram
+    actor U as 操作员
+    participant W as MainWindow
+    participant P as scan / tuning 页面
+    U->>W: 关闭窗口（X / Alt+F4）
+    W->>P: is_operation_active()?
+    alt 无进行中任务
+        W->>W: 直接退出（保存偏好）
+    else 有进行中任务
+        W-->>U: “停止并退出 / 取消”确认框
+        alt 选择取消
+            W-->>U: 留在界面
+        else 选择停止并退出
+            P->>P: safe_stop()（保留数据/不应用结果）
+            W->>W: 保存偏好并退出
+        end
+    end

@@ -10,3 +10,9 @@ dist/
 .env
 data/
 logs/
+
+# 桌面/工具遗留物
+.idea/
+unins000.exe
+unins000.dat
+*.lnk

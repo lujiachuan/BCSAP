@@ -1,0 +1,23 @@
+flowchart TB
+    subgraph APPS["应用（apps/*，允许引用 packages/*）"]
+        DC["desktop_client"]
+        ISS["instrument_service"]
+        DTS["data_service"]
+    end
+
+    subgraph PKG["共享业务包（packages/*，互不反向依赖应用）"]
+        C["contracts<br/>跨进程共享 DTO（pydantic）"]
+        D["domain/scan<br/>扫描状态机（DRAFT→RUNNING→…）"]
+        E["epics_adapter<br/>read/write/subscribe/snapshot 抽象"]
+        S["spectrum/codec<br/>NPZ + SHA-256"]
+        O["optimizer<br/>（演示，规划接自动调束）"]
+    end
+
+    DC --> C
+    DC --> S
+    ISS --> C
+    ISS --> E
+    DTS --> C
+    DTS --> S
+    D -.规划.-> ISS
+    O -.规划.-> DC

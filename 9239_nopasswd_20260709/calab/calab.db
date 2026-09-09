@@ -1,0 +1,211 @@
+record(waveform, "RING:BD4WSH:WireSignal")
+{ 
+	field(DESC, "Horizontal Raw Profile")
+	field(PINI, "YES")
+	field(NELM, "2000")
+	field(FTVL, "DOUBLE")
+}
+
+record(waveform, "RING:BD4WSH:WirePosition")
+{ 
+	field(DESC, "Horizontal RawProfile")
+	field(PINI, "YES")
+	field(NELM, "2000")
+	field(FTVL, "DOUBLE")
+}
+
+record(ao, "RING:BD4WSH:MotionPositionMonitor") 
+{
+	field(DESC, "Vertical FWHM")
+	field(PINI, "YES") 
+	field(EGU, "mm") 
+	field(MDEL, "0")
+}
+
+record(ao, "RING:BD4WSH:MotionPLTValueMonitor") 
+{
+	field(DESC, "Vertical FWHM")
+	field(PINI, "YES") 
+	field(EGU, "mm") 
+	field(MDEL, "0")
+}
+
+record(ao, "EXTLINE:BD51MIC01:VCenterPosition") 
+{
+	field(DESC, "Vertical Center Position")
+	field(PINI, "YES") 
+	field(EGU, "mm") 
+	field(MDEL, "0")
+}
+record(ai, "RING:BD4WSH:MotionTargetPostion")
+{
+	field(DESC, "Count High")
+	field(VAL, "0")
+	field(PINI, "YES")
+	field(EGU, "mm")
+	field(MDEL, "0")
+}
+record(ai, "RING:BD4WSH:ScanStartPosition")
+{
+	field(DESC, "Count High")
+	field(VAL, "0")
+	field(PINI, "YES")
+	field(EGU, "mm")
+	field(MDEL, "0")
+}
+
+record(ai, "RING:BD4WSH:ScanEndPosition")
+{
+	field(DESC, "Count High")
+	field(VAL, "0")
+	field(PINI, "YES")
+	field(EGU, "mm")
+	field(MDEL, "0")
+}
+
+record(longin, "RING:BD4WSH:CAWorkingMode") 
+{
+	field(DESC, "Work Mode")
+	field(VAL, "1")
+	field(PINI, "YES")
+	field(MDEL, "0")
+}
+
+record(longin, "RING:BD4WSH:CACouplingMode") 
+{
+	field(DESC, "Work Mode")
+	field(VAL, "1")
+	field(PINI, "YES")
+	field(MDEL, "0")
+}
+record(longin, "RING:BD4WSH:CAGainLevel") 
+{
+	field(DESC, "Work Mode")
+	field(VAL, "0")
+	field(PINI, "YES")
+	field(MDEL, "0")
+}
+
+record(bi, "RING:BD4WSH:MotionPowerOn")
+{
+	field(DESC, "ProcessNoise")
+	field(VAL, "0")
+	field(PINI, "YES")
+	field(ZNAM, "OFF")
+	field(ONAM, "ON")
+}
+
+record(bi, "RING:BD4WSH:MotionPowerOff")
+{
+	field(DESC, "ProcessNoise")
+	field(VAL, "0")
+	field(PINI, "YES")
+	field(ZNAM, "OFF")
+	field(ONAM, "ON")
+}
+
+record(bi, "RING:BD4WSH:MotionMoveCMD")
+{
+	field(DESC, "ProcessNoise")
+	field(VAL, "0")
+	field(PINI, "YES")
+	field(ZNAM, "OFF")
+	field(ONAM, "ON")
+}
+
+record(bi, "RING:BD4WSH:MotionMoveStop")
+{
+	field(DESC, "ProcessNoise")
+	field(VAL, "0")
+	field(PINI, "YES")
+	field(ZNAM, "OFF")
+	field(ONAM, "ON")
+}
+
+record(bi, "RING:BD4WSH:MotionFindHome")
+{
+	field(DESC, "ProcessNoise")
+	field(VAL, "0")
+	field(PINI, "YES")
+	field(ZNAM, "OFF")
+	field(ONAM, "ON")
+}
+
+record(bi, "RING:BD4WSH:DAQMoveCMD")
+{
+	field(DESC, "ProcessNoise")
+	field(VAL, "0")
+	field(PINI, "YES")
+	field(ZNAM, "OFF")
+	field(ONAM, "ON")
+}
+
+record(bi, "RING:BD4WSH:DAQEnable")
+{
+	field(DESC, "ProcessNoise")
+	field(VAL, "0")
+	field(PINI, "YES")
+	field(ZNAM, "OFF")
+	field(ONAM, "ON")
+}
+record(longout, "RING:BD4WSH:Heartbeat") 
+{
+	field(DESC, "Heartbeat")
+	field(VAL, "10")
+	field(PINI, "YES")
+	field(MDEL, "0")
+}
+
+record(bo, "RING:BD4WSH:CAOVERLOAD")
+{
+	field(DESC, "ProcessNoiseMonitor")
+	field(VAL, "0")
+	field(PINI, "YES")
+	field(ZNAM, "OFF")
+	field(ONAM, "ON")
+}
+
+record(bo, "RING:BD4WSH:MotionFwdLimtMonitor")
+{
+	field(DESC, "ProcessNoiseMonitor")
+	field(VAL, "0")
+	field(PINI, "YES")
+	field(ZNAM, "OFF")
+	field(ONAM, "ON")
+}
+
+record(bo, "RING:BD4WSH:MotionRevLimtMonitor")
+{
+	field(DESC, "ProcessNoiseMonitor")
+	field(VAL, "0")
+	field(PINI, "YES")
+	field(ZNAM, "OFF")
+	field(ONAM, "ON")
+}
+
+record(bo, "RING:BD4WSH:MotionMotorIsBusy")
+{
+	field(DESC, "ProcessNoiseMonitor")
+	field(VAL, "0")
+	field(PINI, "YES")
+	field(ZNAM, "OFF")
+	field(ONAM, "ON")
+}
+
+record(bo, "RING:BD4WSH:MotionPowerMonitor")
+{
+	field(DESC, "ProcessNoiseMonitor")
+	field(VAL, "0")
+	field(PINI, "YES")
+	field(ZNAM, "OFF")
+	field(ONAM, "ON")
+}
+
+record(bo, "RING:BD4WSH:Error")
+{
+	field(DESC, "ProcessNoiseMonitor")
+	field(VAL, "0")
+	field(PINI, "YES")
+	field(ZNAM, "OFF")
+	field(ONAM, "ON")
+}

@@ -1,0 +1,9 @@
+record(ai, "DAQSamplePerioduSec") { field(DESC, "  ") field(PINI, "YES") field(VAL, "100")}
+record(ai, "DAQAverageNumber") { field(DESC, "  ") field(PINI, "YES") field(VAL, "10")}
+record(bi,"DAQAverage") { field(DESC, "wind") field(PINI, "YES") field(VAL, "0")}
+record(ai, "DAQReSample") { field(DESC, "set Average Number") field(PINI, "YES") field(VAL, "1"})
+record(waveform, "DAQSourceFC") { field(DESC, "rawdata") field(PINI, "YES") field(NELM, "100") field(FTVL, "DOUBLE")}
+record(waveform, "DAQFC1") { field(DESC, "rawdata") field(PINI, "YES") field(NELM, "100") field(FTVL, "DOUBLE")}
+record(waveform, "DAQFC2") { field(DESC, "rawdata") field(PINI, "YES") field(NELM, "100") field(FTVL, "DOUBLE")}
+record(waveform, "DAQLoopFC") { field(DESC, "rawdata") field(PINI, "YES") field(NELM, "100") field(FTVL, "DOUBLE")}
+record(ai, "Systemheartbeat") { field(DESC, "Alpha") field(PINI, "YES") field(VAL, "0")}

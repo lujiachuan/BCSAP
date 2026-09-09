@@ -214,8 +214,18 @@ class ScanPage(QWidget):
 
     def stop_scan(self) -> None:
         self._timer.stop()
+        self._paused = False
         self._set_scan_state("已安全停止，当前数据已保留", "warn")
         self._reset_scan_buttons()
+
+    def is_operation_active(self) -> bool:
+        """是否仍有进行中的扫谱（运行中，或暂停待续）。"""
+        return self._timer.isActive() or (self._paused and 0 < self._cursor < len(self._x))
+
+    def safe_stop(self) -> None:
+        """退出前的最佳努力停止：停止采集并保留已绘数据。"""
+        if self.is_operation_active():
+            self.stop_scan()
 
     def _finish_scan(self) -> None:
         self._timer.stop()

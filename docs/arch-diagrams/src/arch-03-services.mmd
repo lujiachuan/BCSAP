@@ -1,0 +1,33 @@
+flowchart LR
+    subgraph IS["instrument_service（操作电脑本机，127.0.0.1:8765）"]
+        ISR["/control/v1 路由"]
+        ISH["/status /health/live /pvs/health"]
+        PCH["pv_health.py<br/>受控 PV 清单 + 只读健康检查"]
+        GATE["epics_adapter 网关"]
+        SIM["SimulatedEpicsGateway（当前）"]
+        CA["ChannelAccessGateway / PvAccessGateway [待接入]"]
+        ISR --> ISH
+        ISH --> PCH
+        PCH --> GATE
+        GATE --> SIM
+        GATE -.-> CA
+    end
+
+    subgraph DS["data_service（服务器，:8000）"]
+        DSR["/api/v1 路由"]
+        DSH["/health/live /health/ready"]
+        SYNC["/sync/manifest /sync/changes<br/>/spectra/{id}/content"]
+        CAT["sync_catalog.py<br/>（当前为内存演示数据）"]
+        DB2[("PostgreSQL<br/>[待接入] Alembic 迁移")]
+        DSR --> DSH
+        DSR --> SYNC
+        SYNC --> CAT
+        CAT -.-> DB2
+    end
+
+    CODEC["packages/spectrum<br/>encode/decode/checksum（SHA-256）"]
+    CAT --> CODEC
+
+    CTR["packages/contracts<br/>ServiceStatus · PvHealth* · Sync*  DTO"]
+    IS -.使用.-> CTR
+    DS -.使用.-> CTR

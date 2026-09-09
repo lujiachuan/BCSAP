@@ -1,0 +1,18 @@
+sequenceDiagram
+    actor U as 操作员
+    participant C as spectrum-client.exe
+    participant S as instrument-service.exe
+    participant D as data_service（服务器）
+    U->>C: 双击 spectrum-client.exe
+    C->>C: 恢复主题/窗口偏好（QSettings）
+    C->>C: supervisor 探测 127.0.0.1:8765
+    alt 服务不可达且同目录有服务 exe
+        C->>S: 隐藏窗口拉起
+        S-->>C: /control/v1/health/live ready
+    else 服务已运行 / 检索电脑无服务
+        Note over C: 不重复启动 / 不启动
+    end
+    C->>C: InitializationWorker 后台检查 instrument / data
+    C->>D: /api/v1/health/live、/sync/manifest…
+    D-->>C: ready + 同步清单
+    C-->>U: 服务状态进入侧栏/工作台，按模型启用扫谱调束入口

@@ -321,6 +321,15 @@ class TuningPage(QWidget):
         self.tuning_stop_button.setEnabled(False)
         self.tabs.setTabEnabled(0, True)
 
+    def is_operation_active(self) -> bool:
+        """是否仍有进行中的自动调束。"""
+        return self._timer.isActive()
+
+    def safe_stop(self) -> None:
+        """退出前的最佳努力停止：停止迭代，不应用参数。"""
+        if self.is_operation_active():
+            self.stop_tuning()
+
     def _validate_tuning_parameters(self) -> int | None:
         enabled_count = 0
         for row in range(self.parameter_table.rowCount()):

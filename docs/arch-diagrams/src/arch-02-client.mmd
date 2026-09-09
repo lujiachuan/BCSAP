@@ -1,0 +1,45 @@
+flowchart TB
+    subgraph WIN["MainWindow（main.py）"]
+        NAV["侧栏导航<br/>由页面注册表生成"]
+        STACK["QStackedWidget 页面容器"]
+        GUARD["closeEvent 退出保护<br/>扫谱/调束进行中 → 确认弹窗"]
+    end
+
+    subgraph PAGES["页面层 pages/*（注册表驱动）"]
+        WB["workbench 工作台<br/>服务状态卡 + 快捷入口"]
+        SC["scan 扫谱<br/>（QTimer 模拟采集）"]
+        TU["tuning 自动调束<br/>（F1 配置/G1 监控/H1 结果）"]
+        SA["samples 样品"]
+        LIB["library 谱图库"]
+        AN["analysis 分析"]
+        SY["sync 数据同步"]
+        SE["settings 系统设置<br/>服务地址 · PV 映射 · 外观"]
+    end
+
+    subgraph SVC["状态与服务接线"]
+        MODEL["AppStatusModel<br/>单一状态源"]
+        INIT["InitializationPage + InitializationWorker<br/>（后台线程检查 instrument / data / PV / sync）"]
+        SUP["instrument_supervisor<br/>探测并拉起同目录执行服务"]
+    end
+
+    subgraph INFRA["UI 基础件"]
+        WIDGETS["widgets / nav_icons / theme"]
+        PLOT["spectrum_plot<br/>实时谱图"]
+        UI2["ui_tokens / surfaces / windows_chrome / motion"]
+    end
+
+    subgraph PERSIST["本地持久化 QSettings"]
+        QK["theme · service/dataUrl · service/instrumentUrl<br/>windowGeometry · sidebarCollapsed · lastPageRow<br/>instrument/stopServiceOnExit"]
+    end
+
+    WIN --> NAV
+    WIN --> STACK
+    STACK --> PAGES
+    PAGES --> SE
+    GUARD --> PAGES
+    MODEL -->|"驱动页面可用性"| WB
+    INIT --> MODEL
+    SUP -->|"spawn / health 探测"| INIT
+    WIN --> SUP
+    PAGES -. 读写 .-> QK
+    INFRA --> PAGES

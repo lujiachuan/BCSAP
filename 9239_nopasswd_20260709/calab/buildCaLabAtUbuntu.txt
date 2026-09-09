@@ -1,0 +1,74 @@
+#################################################
+##  How to build and install CA Lab at Ubuntu  ##
+#################################################
+
+## This manual has been updated on 11/Jun/2020
+
+## Testsystem
+# Ubuntu 20.04 (64 bit)
+# LabVIEW 2020 (64 bit) installed in /usr/local/natinst/
+
+## Install EPICS Base
+######################
+sudo apt-get install g++
+sudo apt-get install make
+sudo apt-get install libreadline8
+sudo mkdir /usr/local/epics
+sudo chown owner:group /usr/local/epics/
+cd ~/Downloads
+wget https://epics-controls.org/download/base/base-7.0.4.tar.gz
+tar -C /usr/local/epics/ -zxvf base-7.0.4.tar.gz
+cd /usr/local/epics/base-3.14.12.7/
+export EPICS_HOST_ARCH=linux-x86_64
+make > make.log 2>&1
+
+## Install CA Lab
+##################
+sudo mkdir /usr/local/calab
+sudo chown owner:group /usr/local/calab
+cd ~/Downloads
+wget https://www.helmholtz-berlin.de/media/media/angebote/it/experimentsteuerung/ca-lab/v1.7.0.1/calab-1701.zip
+unzip caLab_1171.zip -d /usr/local/calab/
+cd /usr/local/calab/
+g++ -fPIC -Wall -I/usr/local/epics/base-7.0.4/include/ -I/usr/local/epics/base-7.0.4/include/os/Linux/ -I/usr/local/epics/base-7.0.4/include/compiler/gcc -I/usr/local/natinst/LabVIEW-2020-64/cintools -O0 -g3 -c -fmessage-length=0 -MMD -MP -MF"caLab.d" -MT"caLab.d" -o "caLab.o" "/usr/local/calab/src/calab.cpp"
+g++ -L/usr/local/epics/base-7.0.4/lib/linux-x86_64/ -L/usr/local/natinst/LabVIEW-2020-64/cintools -shared -o "libCaLab.so"  ./caLab.o -lca -lCom
+
+
+## CONFIG SYSTEM
+#################
+cd /etc/ld.so.conf.d
+sudo nano epics.conf => /usr/local/epics/base-7.0.4/lib/linux-x86_64/
+sudo nano calab.conf => /usr/local/natinst/LabVIEW-2020-64/cintools
+                     => /usr/local/calab/
+sudo ldconfig
+restart computer
+
+## LAST ADAPTATIONS
+####################
+optional set enviroment variables EPICS_CA_ADDR_LIST and EPICS_CA_AUTO_ADDR_LIST
+optional set enviroment variables CALAB_NODBG and CALAB_POLLING
+start labVIEW
+open '/usr/local/calab/vis/CaLabInfo.vi' and cancel "Find the Shared Library" dialog.
+   set VI properties (Strg+I) "Category Protection" to "Unlocked"
+   edit 'Library name or path' of 'Call Library Function Nodes' (double click on it) => change entry to '/usr/local/calab/libCaLab.so'
+   optinal set VI properties (Strg+I) "Category Protection" to "Locked"
+repeat these steps with
+'/usr/local/calab/VIs/Private/CaLabDisconnect_PV.vi'
+'/usr/local/calab/VIs/Private/CaLabDisconnect_PV-1D.vi'
+'/usr/local/calab/VIs/Private/CaLabGet_Main.vi'
+'/usr/local/calab/VIs/Private/CaLabGet_Main_Initialized.vi'
+'/usr/local/calab/VIs/Private/CaLabInit_PV-1D.vi'
+'/usr/local/calab/VIs/Private/CaLabInit_PV.vi'
+'/usr/local/calab/VIs/Private/CaLabPut_Main.vi'
+'/usr/local/calab/VIs/Private/CaLabPut_Main_Initialized.vi'
+'/usr/local/calab/VIs/Private/CaLabEvent_PV.vi'
+'/usr/local/calab/VIs/Private/CaLabEvent_PV-1D.vi'
+all example VIs (except SoftIoc*.vi) should be able to run (run example VIs after starting "Demo Soft IOC")
+
+
+## Start Demo Soft IOC
+#######################
+/usr/local/epics/base-7.0.4/bin/linux-x86_64/softIoc -d /usr/local/calab/demo/db/demo.db
+
+
+Enjoy CA Lab!

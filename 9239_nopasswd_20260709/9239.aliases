@@ -1,0 +1,9 @@
+[My Computer]
+My Computer = "169.254.248.252"
+
+[NI-cRIO-9054-01F19FF2]
+NI-cRIO-9054-01F19FF2 = "192.168.1.101"
+
+[RT CompactRIO Target]
+RT CompactRIO Target = "0.0.0.0"
+
