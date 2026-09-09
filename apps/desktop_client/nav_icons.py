@@ -1,29 +1,64 @@
-"""使用 QPainter 绘制导航栏矢量图标。"""
+"""使用 QPainter 绘制导航栏矢量图标与侧栏符号按钮图标。
+
+M1 起按窗口 devicePixelRatio 创建物理像素画布，避免高 DPI 下发虚；
+☾/☀/☰ 等文本字形按钮改由矢量绘制（不依赖字体码位）。
+"""
 
 from __future__ import annotations
 
 import math
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import QColor, QGuiApplication, QIcon, QPainter, QPainterPath, QPen, QPixmap
 
-# 浅色侧栏下的图标配色：常态为蓝灰，当前页为品牌蓝。
+# 兜底图标配色（运行时由主题令牌重绘，见 main._refresh_nav_icons）。
 DEFAULT_ICON_COLOR = "#5d7083"
 ACTIVE_ICON_COLOR = "#0f6cbd"
 
+_LOGICAL_CANVAS = 48
 
-def make_nav_icon(name: str, color: str = DEFAULT_ICON_COLOR) -> QIcon:
-    """生成适合浅色侧栏的线性图标。"""
 
-    pixmap = QPixmap(48, 48)
+def _device_ratio() -> float:
+    try:
+        app = QGuiApplication.instance()
+        if app is not None and app.primaryScreen() is not None:
+            return float(app.primaryScreen().devicePixelRatio())
+    except Exception:  # noqa: BLE001
+        pass
+    return 1.0
+
+
+def _begin_painter(color: str, content_scale: float = 1.0) -> tuple[QPixmap, QPainter]:
+    ratio = max(1.0, _device_ratio())
+    pixmap = QPixmap(int(_LOGICAL_CANVAS * ratio), int(_LOGICAL_CANVAS * ratio))
     pixmap.fill(Qt.GlobalColor.transparent)
+    pixmap.setDevicePixelRatio(ratio)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    pen = QPen(QColor(color), 3.2)
+    # QPixmap 设置 DPR 后，QPainter 已以逻辑像素为坐标系；再次按 DPR
+    # scale 会造成二次缩放，图形被放大并裁切。这里只微调内容占比。
+    if content_scale != 1.0:
+        painter.translate(_LOGICAL_CANVAS / 2, _LOGICAL_CANVAS / 2)
+        painter.scale(content_scale, content_scale)
+        painter.translate(-_LOGICAL_CANVAS / 2, -_LOGICAL_CANVAS / 2)
+    pen = QPen(QColor(color), 2.8)
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
     painter.setPen(pen)
     painter.setBrush(Qt.BrushStyle.NoBrush)
+    return pixmap, painter
+
+
+def _finish_painter(painter: QPainter, pixmap: QPixmap) -> QIcon:
+    painter.end()
+    return QIcon(pixmap)
+
+
+def make_nav_icon(name: str, color: str = DEFAULT_ICON_COLOR) -> QIcon:
+    """生成导航线性图标（DPR 感知）。"""
+
+    # QIcon 会按目标槽位生成 pixmap；保留约 20% 安全边距，避免线帽贴边。
+    pixmap, painter = _begin_painter(color, 0.96)
 
     if name == "dashboard":
         for rect in (
@@ -92,5 +127,38 @@ def make_nav_icon(name: str, color: str = DEFAULT_ICON_COLOR) -> QIcon:
                 QPointF(24 + math.cos(angle) * 17, 24 + math.sin(angle) * 17),
             )
 
-    painter.end()
-    return QIcon(pixmap)
+    return _finish_painter(painter, pixmap)
+
+
+def make_symbol(name: str, color: str = DEFAULT_ICON_COLOR) -> QIcon:
+    """生成侧栏符号按钮（sun / moon / menu）矢量图标。"""
+    # 菜单横线天然较宽，太阳/月亮更接近方形，分别校准视觉占比。
+    symbol_scale = {"menu": 0.90, "sun": 0.95, "moon": 0.98}.get(name, 0.95)
+    pixmap, painter = _begin_painter(color, symbol_scale)
+
+    if name == "menu":
+        painter.drawLine(9, 17, 39, 17)
+        painter.drawLine(9, 24, 39, 24)
+        painter.drawLine(9, 31, 39, 31)
+    elif name == "sun":
+        painter.drawEllipse(QPointF(24, 24), 7, 7)
+        for index in range(8):
+            angle = index * math.pi / 4
+            painter.drawLine(
+                QPointF(24 + math.cos(angle) * 12, 24 + math.sin(angle) * 12),
+                QPointF(24 + math.cos(angle) * 17, 24 + math.sin(angle) * 17),
+            )
+    elif name == "moon":
+        # 实心圆 + 位移圆做 Clear 打洞 → 月牙
+        painter.setBrush(QColor(color))
+        painter.drawEllipse(QRectF(9, 9, 30, 30))
+        painter.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_Clear
+        )
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QRectF(17, 6, 30, 30))
+        painter.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_SourceOver
+        )
+
+    return _finish_painter(painter, pixmap)

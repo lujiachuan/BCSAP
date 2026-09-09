@@ -19,11 +19,14 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QProgressBar,
     QPushButton,
     QRadioButton,
     QSpinBox,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -32,8 +35,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from apps.desktop_client.theme import theme_name
-from apps.desktop_client.widgets import LinePlot, MetricCard, PageHeading, Panel
+from apps.desktop_client.spectrum_plot import SpectrumPlot
+from apps.desktop_client.surfaces import GlassCard
+from apps.desktop_client.theme import current_palette, theme_name
+from apps.desktop_client.widgets import (
+    ClickableLabel,
+    MetricCard,
+    PageHeading,
+    Panel,
+)
 
 
 def page_layout(page: QWidget) -> QVBoxLayout:
@@ -54,34 +64,60 @@ def primary_button(text: str) -> QPushButton:
 class PlaceholderPage(QWidget):
     """尚未进入实施阶段的页面。"""
 
+    CAPABILITIES = {
+        "样品管理": ("样品编号与批次", "实验备注与状态", "与实验任务关联"),
+        "谱图库": ("按条件检索谱图", "查看版本与来源", "受控共享与引用"),
+        "谱图分析": ("峰值与区间分析", "多谱图对比", "分析结果导出"),
+        "任务与同步": ("后台任务进度", "失败任务重试", "本地与中央数据状态"),
+    }
+
     def __init__(self, title: str, description: str) -> None:
         super().__init__()
         layout = page_layout(self)
         layout.addWidget(PageHeading(title, description))
-        panel = QFrame(objectName="panel")
+        panel = GlassCard(object_name="contextCard")
         panel_layout = QVBoxLayout(panel)
         panel_layout.setContentsMargins(28, 28, 28, 28)
-        message = QLabel("该模块已预留统一入口，当前版本暂不实施。", objectName="mutedText")
+        message = QLabel("该模块已预留统一入口，当前版本暂不开放操作。", objectName="mutedText")
         message.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        planned = self.CAPABILITIES.get(title, (description,))
+        capabilities = QLabel(
+            "计划能力\n" + "\n".join(f"• {item}" for item in planned)
+        )
+        capabilities.setAlignment(Qt.AlignmentFlag.AlignCenter)
         panel_layout.addStretch()
         panel_layout.addWidget(message)
+        panel_layout.addWidget(capabilities)
         panel_layout.addStretch()
         layout.addWidget(panel, 1)
 
 
 class WorkbenchPage(QWidget):
-    """以实验任务为中心的工作台。"""
+    """以实验任务为中心的工作台（M0 表面样板：Hero + 服务状态卡 + 快捷操作 + 最近实验）。"""
 
     navigateRequested = Signal(str)
     initializationRequested = Signal()
+    serviceCardRequested = Signal(str)
+
+    # (key, 服务名, 初始文本, 初始语义)
+    SERVICES = (
+        ("data", "数据服务", "待连接", "idle"),
+        ("instrument", "仪器执行服务", "待连接", "idle"),
+        ("epics", "EPICS", "未确认", "idle"),
+        ("cache", "本地数据", "待同步", "idle"),
+    )
 
     def __init__(self) -> None:
         super().__init__()
+        self._service_states: dict[str, str] = {}
+        self._control_enabled = False
         layout = page_layout(self)
+
+        # ---- 标题行：标题 + 设备状态胶囊 + 操作员 + 重新检查 ----
         heading_row = QHBoxLayout()
         heading_row.addWidget(PageHeading("工作台", "上午好，操作员。请先确认设备与服务状态。"))
         heading_row.addStretch()
-        self.device_status = QLabel("●  设备状态待确认", objectName="warnStatus")
+        self.device_status = QLabel("●  正在检查设备与关键服务", objectName="warnStatus")
         heading_row.addWidget(self.device_status)
         heading_row.addSpacing(18)
         heading_row.addWidget(QLabel("操作员  本机", objectName="mutedText"))
@@ -90,77 +126,62 @@ class WorkbenchPage(QWidget):
         heading_row.addWidget(recheck)
         layout.addLayout(heading_row)
 
-        service_strip = QFrame(objectName="serviceStrip")
-        services = QHBoxLayout(service_strip)
-        services.setContentsMargins(0, 0, 0, 0)
-        services.setSpacing(0)
-        self.service_values: dict[str, QLabel] = {}
-        for key, name, value in (
-            ("data", "数据服务", "○  待连接"),
-            ("instrument", "仪器执行服务", "○  待连接"),
-            ("epics", "EPICS", "○  未确认"),
-            ("cache", "本地数据", "○  待同步"),
-        ):
-            cell = QWidget()
-            cell_layout = QVBoxLayout(cell)
-            cell_layout.setContentsMargins(14, 9, 14, 9)
-            cell_layout.setSpacing(4)
-            cell_layout.addWidget(QLabel(name, objectName="mutedText"))
-            value_label = QLabel(value, objectName="mutedText")
-            cell_layout.addWidget(value_label)
-            self.service_values[key] = value_label
-            services.addWidget(cell)
-            if name != "本地暂存":
-                separator = QFrame(objectName="sepLine")
-                separator.setFrameShape(QFrame.Shape.VLine)
-                services.addWidget(separator)
-        layout.addWidget(service_strip)
-
-        body = QHBoxLayout()
-        body.setSpacing(10)
-        current = Panel("准备新实验", "当前为模拟模式")
-        context = QHBoxLayout()
-        for label, value in (
-            ("已选样品", "Cu-Ar-023"),
-            ("最近扫谱配置", "磁场扫描 A-12"),
-            ("探测器", "Faraday FC3"),
-        ):
-            item = QVBoxLayout()
-            item.setSpacing(5)
-            item.addWidget(QLabel(label, objectName="mutedText"))
-            item.addWidget(QLabel(value, objectName="serviceValue"))
-            context.addLayout(item)
-        current.body.addLayout(context)
-        current.body.addStretch()
-        task_actions = QHBoxLayout()
+        # ---- Hero（L2 玻璃卡）：模式、可执行性与下一步操作 ----
+        hero = GlassCard(object_name="heroCard", radius="panel")
+        hero_layout = QVBoxLayout(hero)
+        hero_layout.setContentsMargins(18, 14, 18, 14)
+        hero_layout.setSpacing(8)
+        action_row = QHBoxLayout()
+        mode_chip = QLabel("●  模拟运行", objectName="modeChip")
+        action_row.addWidget(mode_chip)
+        action_row.addStretch()
         self.scan_button = primary_button("开始扫谱")
         self.scan_button.clicked.connect(lambda: self.navigateRequested.emit("scan"))
         self.tuning_button = QPushButton("开始自动调束")
         self.tuning_button.clicked.connect(lambda: self.navigateRequested.emit("tuning"))
         self.scan_button.setEnabled(False)
         self.tuning_button.setEnabled(False)
-        task_actions.addWidget(self.scan_button)
-        task_actions.addWidget(self.tuning_button)
-        task_actions.addStretch()
-        current.body.addLayout(task_actions)
-
-        quick = Panel("快捷操作")
-        for text, target in (
-            ("登记新样品", "samples"),
-            ("导入历史谱图", "library"),
-            ("检索谱图库", "library"),
-        ):
-            button = QPushButton(text)
-            button.setMinimumHeight(36)
-            button.clicked.connect(
-                lambda _checked=False, key=target: self.navigateRequested.emit(key)
+        action_row.addWidget(self.scan_button)
+        action_row.addWidget(self.tuning_button)
+        hero_layout.addLayout(action_row)
+        self.hero_title = QLabel("正在检查设备与关键服务…", objectName="heroTitle")
+        hero_layout.addWidget(self.hero_title)
+        self.hero_caption = QLabel(
+            "就绪后可执行扫谱与自动调束；详情见下方服务状态。", objectName="mutedText"
+        )
+        self.hero_caption.setWordWrap(True)
+        hero_layout.addWidget(self.hero_caption)
+        hero_layout.addWidget(
+            QLabel(
+                "已选样品 Cu-Ar-023 · 最近扫谱配置 磁场扫描 A-12 · 探测器 Faraday FC3",
+                objectName="mutedText",
             )
-            quick.body.addWidget(button)
-        quick.body.addStretch()
-        body.addWidget(current, 2)
-        body.addWidget(quick, 1)
-        layout.addLayout(body)
+        )
+        layout.addWidget(hero)
 
+        # ---- 服务状态卡（L2 玻璃卡 × 4）----
+        services_row = QHBoxLayout()
+        services_row.setSpacing(10)
+        self.service_values: dict[str, QLabel] = {}
+        for key, name, text, state in self.SERVICES:
+            card = GlassCard(object_name="serviceCard")
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(14, 11, 14, 11)
+            card_layout.setSpacing(4)
+            card_layout.addWidget(QLabel(name, objectName="cardCaption"))
+            value_label = ClickableLabel(text, objectName="serviceValue")
+            value_label.setToolTip("双击查看该服务状态明细")
+            value_label.doubleClicked.connect(
+                lambda _key=key: self.serviceCardRequested.emit(_key)
+            )
+            card_layout.addWidget(value_label)
+            self.service_values[key] = value_label
+            services_row.addWidget(card, 1)
+        layout.addLayout(services_row)
+
+        # ---- 主体：最近实验（L1 数据面） + 快捷操作（L2 玻璃卡） ----
+        body = QHBoxLayout()
+        body.setSpacing(10)
         recent = Panel("最近实验")
         recent_actions = QHBoxLayout()
         recent_actions.addStretch()
@@ -177,38 +198,106 @@ class WorkbenchPage(QWidget):
         )
         for row, values in enumerate(rows):
             for column, value in enumerate(values):
-                actions.setItem(row, column, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                if column == 3:  # 数值列右对齐
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                    )
+                actions.setItem(row, column, item)
         actions.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         actions.verticalHeader().setVisible(False)
         actions.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         actions.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        actions.setAlternatingRowColors(True)
         recent.body.addWidget(actions)
-        layout.addWidget(recent, 1)
+        body.addWidget(recent, 2)
+
+        quick = GlassCard(object_name="quickCard")
+        quick_layout = QVBoxLayout(quick)
+        quick_layout.setContentsMargins(16, 14, 16, 16)
+        quick_layout.setSpacing(10)
+        quick_layout.addWidget(QLabel("快捷操作", objectName="panelTitle"))
+        for text, target in (
+            ("登记新样品", "samples"),
+            ("导入历史谱图", "library"),
+            ("检索谱图库", "library"),
+        ):
+            button = QPushButton(text)
+            button.setMinimumHeight(38)
+            button.clicked.connect(
+                lambda _checked=False, key=target: self.navigateRequested.emit(key)
+            )
+            quick_layout.addWidget(button)
+        quick_layout.addStretch()
+        body.addWidget(quick, 1)
+        layout.addLayout(body, 1)
+
+    # ---------- 状态更新（对外 API，供 main 接线） ----------
 
     def set_service_status(self, key: str, state: str, text: str) -> None:
+        self._service_states[key] = state
         value = self.service_values.get(key)
         if value is None:
             return
-        symbol = "●" if state == "good" else "!" if state in {"warn", "error"} else "○"
+        color = self._state_color(state)
+        symbol = "●" if state in {"good", "warn", "error"} else "○"
         value.setText(f"{symbol}  {text}")
-        value.setProperty("state", state)
-        value.style().unpolish(value)
-        value.style().polish(value)
+        value.setStyleSheet(f"color: {color};")
         if key == "epics":
-            if state == "good":
-                self.device_status.setText("●  设备就绪")
-                self.device_status.setObjectName("goodStatus")
-            else:
-                self.device_status.setText("●  设备不可用于控制")
-                self.device_status.setObjectName("errorStatus")
-            self.device_status.style().unpolish(self.device_status)
-            self.device_status.style().polish(self.device_status)
+            self._refresh_device_chip(state)
+        self._refresh_hero()
 
     def set_control_enabled(self, enabled: bool) -> None:
-        reason = "" if enabled else "仪器服务或关键 PV 未就绪"
+        self._control_enabled = enabled
+        reason = "" if enabled else "仪器服务或关键 PV 未就绪，暂不可执行扫谱与调束"
         for button in (self.scan_button, self.tuning_button):
             button.setEnabled(enabled)
             button.setToolTip(reason)
+        self._refresh_hero()
+
+    # ---------- 内部呈现 ----------
+
+    def _refresh_device_chip(self, state: str) -> None:
+        if state == "good":
+            text, object_name = "●  设备就绪", "goodStatus"
+        elif state == "error":
+            text, object_name = "●  设备不可用于控制", "errorStatus"
+        else:
+            text, object_name = "●  设备状态待确认", "warnStatus"
+        self.device_status.setText(text)
+        self.device_status.setObjectName(object_name)
+        self.device_status.style().unpolish(self.device_status)
+        self.device_status.style().polish(self.device_status)
+
+    def _refresh_hero(self) -> None:
+        instrument = self._service_states.get("instrument")
+        epics = self._service_states.get("epics")
+        if self._control_enabled and instrument == "good" and epics == "good":
+            self.hero_title.setText("设备与关键服务就绪")
+            self.hero_caption.setText("可执行扫谱与自动调束；数据服务同步状态见下方状态卡。")
+            return
+        if instrument == "error" or epics == "error":
+            blocked: list[str] = []
+            if instrument != "good":
+                blocked.append("仪器执行服务未就绪")
+            if epics != "good":
+                blocked.append("关键 PV 未连接")
+            self.hero_title.setText("暂不可执行扫谱与调束")
+            self.hero_caption.setText(
+                "阻塞原因：" + "、".join(blocked) + "。请先处理下方服务状态或点击“重新检查”。"
+            )
+            return
+        self.hero_title.setText("正在检查设备与关键服务…")
+        self.hero_caption.setText("完成检查后即可执行扫谱与自动调束。")
+
+    @staticmethod
+    def _state_color(state: str) -> str:
+        token = {
+            "good": "statusGood",
+            "warn": "statusWarn",
+            "error": "statusError",
+        }.get(state, "muted")
+        return current_palette()[token]
 
 
 class ScanPage(QWidget):
@@ -233,7 +322,7 @@ class ScanPage(QWidget):
         layout.addWidget(self._build_controls())
 
         plot_panel = Panel("实时谱图", "曲线优先")
-        self.plot = LinePlot("质荷比 m/z", "离子强度 / a.u.")
+        self.plot = SpectrumPlot("质荷比 m/z", "离子强度 / a.u.")
         plot_panel.body.addWidget(self.plot, 1)
         plot_panel.body.addWidget(self._build_status_bar())
         layout.addWidget(plot_panel, 1)
@@ -359,6 +448,7 @@ class ScanPage(QWidget):
         self._cursor = 0
         self._paused = False
         self.plot.set_data([], [])
+        self.plot.set_ranges(start, end, 0.0, max(self._y) * 1.10)
         self.progress.setValue(0)
         self._set_scan_state("扫描进行中")
         self.start_button.setEnabled(False)
@@ -405,6 +495,7 @@ class ScanPage(QWidget):
 
     def _finish_scan(self) -> None:
         self._timer.stop()
+        self.plot.annotate_peaks(4)
         self._set_scan_state("扫描完成，等待保存服务接入", "good")
         self._reset_scan_buttons()
 
@@ -576,7 +667,7 @@ class TuningPage(QWidget):
         body = QHBoxLayout()
         body.setSpacing(14)
         convergence = Panel("目标量收敛", "束流强度 / μA")
-        self.tuning_plot = LinePlot("迭代次数", "束流强度 / μA")
+        self.tuning_plot = SpectrumPlot("迭代次数", "束流强度 / μA")
         convergence.body.addWidget(self.tuning_plot)
 
         metrics = QVBoxLayout()
@@ -684,6 +775,7 @@ class TuningPage(QWidget):
         self.reviewed_checkbox.setChecked(False)
         self.apply_status.setText("尚未应用结果")
         self.tuning_plot.set_data([], [])
+        self.tuning_plot.set_ranges(1, self._target_iterations, 0.0, 22.0)
         self.tuning_progress.setValue(0)
         self.tabs.setTabEnabled(1, True)
         self.tabs.setTabEnabled(2, False)
@@ -721,6 +813,7 @@ class TuningPage(QWidget):
             self.result_notice.setText("优化正常完成 · 无安全告警（模拟）")
             self.result_detail.setText(f"最佳结果出现在第 {best_index + 1} 次迭代")
             self.result_card.value_label.setText(f"{best:.2f} μA")
+            self.tuning_plot.annotate_peaks(1)
             if self.result_card.detail_label is not None:
                 self.result_card.detail_label.setText(f"提升 {gain:.1f}%")
             self.tabs.setTabEnabled(2, True)
@@ -862,6 +955,7 @@ class SystemSettingsPage(QWidget):
     """
 
     themeChanged = Signal(str)
+    motionPreferenceChanged = Signal(bool)
 
     def __init__(self) -> None:
         super().__init__()
@@ -871,12 +965,50 @@ class SystemSettingsPage(QWidget):
         layout.addWidget(
             PageHeading("系统设置", "配置服务连接、查看 PV 映射、设定日志级别与外观。")
         )
-        self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_service_tab(), "服务与连接")
-        self.tabs.addTab(self._build_pv_tab(), "PV 映射")
-        self.tabs.addTab(self._build_log_tab(), "日志与权限")
-        self.tabs.addTab(self._build_appearance_tab(), "外观")
-        layout.addWidget(self.tabs, 1)
+        section_names = ("服务与连接", "PV 映射", "日志与权限", "外观")
+        self.settings_selector = QComboBox(objectName="settingsSelector")
+        self.settings_selector.addItems(section_names)
+        self.settings_selector.setVisible(False)
+        layout.addWidget(self.settings_selector)
+
+        content = QWidget()
+        content_layout = QHBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(14)
+        self.settings_nav = QListWidget(objectName="settingsNavigation")
+        self.settings_nav.setFixedWidth(180)
+        for name in section_names:
+            self.settings_nav.addItem(QListWidgetItem(name))
+        self.settings_nav.setCurrentRow(0)
+        self.settings_stack = QStackedWidget(objectName="settingsStack")
+        for page in (
+            self._build_service_tab(),
+            self._build_pv_tab(),
+            self._build_log_tab(),
+            self._build_appearance_tab(),
+        ):
+            self.settings_stack.addWidget(page)
+        self.settings_nav.currentRowChanged.connect(self._select_settings_section)
+        self.settings_selector.currentIndexChanged.connect(self._select_settings_section)
+        content_layout.addWidget(self.settings_nav)
+        content_layout.addWidget(self.settings_stack, 1)
+        layout.addWidget(content, 1)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        """窄窗口使用顶部选择器，避免主侧栏与设置侧栏同时挤压内容。"""
+        super().resizeEvent(event)
+        compact = self.width() < 900
+        self.settings_nav.setVisible(not compact)
+        self.settings_selector.setVisible(compact)
+
+    def _select_settings_section(self, index: int) -> None:
+        if index < 0:
+            return
+        self.settings_stack.setCurrentIndex(index)
+        if self.settings_nav.currentRow() != index:
+            self.settings_nav.setCurrentRow(index)
+        if self.settings_selector.currentIndex() != index:
+            self.settings_selector.setCurrentIndex(index)
 
     def showEvent(self, event) -> None:  # noqa: N802
         """切到本页时把主题单选钮与当前主题同步。"""
@@ -1079,6 +1211,13 @@ class SystemSettingsPage(QWidget):
             panel.body.addWidget(radio)
             self._theme_radios.append((radio, name))
         self._theme_radio_group.idClicked.connect(self._emit_theme_change)
+        self.reduce_motion = QCheckBox("减少动态效果")
+        self.reduce_motion.setChecked(
+            self._settings.value("appearance/reduceMotion", False, type=bool)
+        )
+        self.reduce_motion.setToolTip("关闭循环脉冲、扫光和页面过渡")
+        self.reduce_motion.toggled.connect(self._set_reduce_motion)
+        panel.body.addWidget(self.reduce_motion)
         note = QLabel("说明：外观偏好属于用户级设置，保存在本机用户配置中。")
         note.setWordWrap(True)
         panel.body.addWidget(note)
@@ -1090,6 +1229,10 @@ class SystemSettingsPage(QWidget):
 
     def _emit_theme_change(self, button_id: int) -> None:
         self.themeChanged.emit(self._theme_radios[button_id][1])
+
+    def _set_reduce_motion(self, reduced: bool) -> None:
+        self._settings.setValue("appearance/reduceMotion", reduced)
+        self.motionPreferenceChanged.emit(reduced)
 
     def _sync_theme_radio(self) -> None:
         current = theme_name()

@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
+from PySide6.QtCore import QPointF, QRectF, QSettings, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
+from apps.desktop_client.surfaces import GlassCard
 from apps.desktop_client.theme import current_palette
 
 
@@ -25,13 +26,23 @@ class PageHeading(QWidget):
         layout.addWidget(description_label)
 
 
+class ClickableLabel(QLabel):
+    """支持双击交互的文本标签（用于状态卡查看明细）。"""
+
+    doubleClicked = Signal()
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+        super().mouseDoubleClickEvent(event)
+        self.doubleClicked.emit()
+
+
 class Panel(QFrame):
-    """带标题的内容面板。"""
+    """L1 数据工作面面板：不透明，稳定承载图表 / 表格 / 表单。"""
 
     def __init__(self, title: str, subtitle: str = "") -> None:
         super().__init__(objectName="panel")
         self.body = QVBoxLayout()
-        self.body.setContentsMargins(15, 6, 15, 14)
+        self.body.setContentsMargins(16, 8, 16, 16)
         self.body.setSpacing(10)
 
         outer = QVBoxLayout(self)
@@ -39,7 +50,7 @@ class Panel(QFrame):
         outer.setSpacing(0)
         header = QWidget()
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(15, 12, 15, 4)
+        header_layout.setContentsMargins(16, 14, 16, 6)
         header_layout.addWidget(QLabel(title, objectName="panelTitle"))
         header_layout.addStretch()
         if subtitle:
@@ -58,7 +69,11 @@ class SidebarStatusFooter(QWidget):
     后续接入真实服务后可用 ``set_service`` 逐项刷新。
     """
 
-    def __init__(self, services: Sequence[tuple[str, str, str, str]], parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        services: Sequence[tuple[str, str, str, str]],
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setObjectName("sidebarFooter")
         layout = QVBoxLayout(self)
@@ -67,6 +82,10 @@ class SidebarStatusFooter(QWidget):
         self._dots: dict[str, QLabel] = {}
         self._values: dict[str, QLabel] = {}
         self._states: dict[str, str] = {}
+        self._pulse_on = True
+        self._pulse_timer = QTimer(self)
+        self._pulse_timer.setInterval(600)
+        self._pulse_timer.timeout.connect(self._advance_pulse)
         for key, name, text, state in services:
             row = QWidget()
             row_layout = QHBoxLayout(row)
@@ -93,29 +112,67 @@ class SidebarStatusFooter(QWidget):
             palette = current_palette()
             token = f"status{state.capitalize()}"
             color = palette.get(token, palette["statusIdle"])
-            dot.setStyleSheet(f"color: {color}; font-size: 11px;")
+            display_color = QColor(color)
+            if state == "running" and not self._pulse_on:
+                display_color.setAlphaF(0.58)
+            css_color = display_color.name(QColor.NameFormat.HexArgb)
+            dot.setStyleSheet(f"color: {css_color}; font-size: 11px;")
         if text is not None:
             value = self._values.get(key)
             if value is not None:
                 value.setText(text)
+        self._sync_pulse_timer()
 
     def refresh_theme(self) -> None:
         """主题切换后按新调色板重刷状态点颜色。"""
         for key, state in self._states.items():
             self.set_service(key, state)
 
+    def refresh_motion(self) -> None:
+        """外观偏好变化后立即启动或停止运行态脉冲。"""
+        self._sync_pulse_timer()
+        self.refresh_theme()
 
-class MetricCard(QFrame):
-    """工作台和结果页使用的简洁指标卡。"""
+    def _sync_pulse_timer(self) -> None:
+        reduce_motion = QSettings("SpectrumPlatform", "DesktopClient").value(
+            "appearance/reduceMotion", False, type=bool
+        )
+        should_run = self.isVisible() and not reduce_motion and "running" in self._states.values()
+        if should_run and not self._pulse_timer.isActive():
+            self._pulse_timer.start()
+        elif not should_run:
+            self._pulse_timer.stop()
+            self._pulse_on = True
+
+    def _advance_pulse(self) -> None:
+        self._pulse_on = not self._pulse_on
+        for key, state in tuple(self._states.items()):
+            if state == "running":
+                self.set_service(key, state)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._sync_pulse_timer()
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        self._pulse_timer.stop()
+        super().hideEvent(event)
+
+
+class MetricCard(GlassCard):
+    """L2 玻璃指标卡（工作台与结果页使用）。"""
 
     def __init__(self, label: str, value: str, detail: str = "", success: bool = False) -> None:
-        super().__init__(objectName="metricCard")
+        super().__init__(object_name="metricCard")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(15, 13, 15, 13)
+        layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(5)
-        layout.addWidget(QLabel(label, objectName="mutedText"))
+        layout.addWidget(QLabel(label, objectName="cardCaption"))
         value_name = "successValue" if success else "metricValue"
         self.value_label = QLabel(value, objectName=value_name)
+        self.value_label.setMinimumWidth(
+            QFontMetrics(self.value_label.font()).horizontalAdvance("−9999.99 μA")
+        )
         layout.addWidget(self.value_label)
         self.detail_label: QLabel | None = None
         if detail:

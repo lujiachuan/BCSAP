@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QStackedWidget,
@@ -30,7 +31,8 @@ from PySide6.QtWidgets import (
 )
 
 from apps.desktop_client.initialization import InitializationPage, InitializationWorker
-from apps.desktop_client.nav_icons import make_nav_icon
+from apps.desktop_client.motion import PageTransitionController
+from apps.desktop_client.nav_icons import make_nav_icon, make_symbol
 from apps.desktop_client.pages import (
     DEFAULT_SERVICE_URLS,
     PlaceholderPage,
@@ -39,8 +41,11 @@ from apps.desktop_client.pages import (
     TuningPage,
     WorkbenchPage,
 )
+from apps.desktop_client.spectrum_plot import SpectrumPlot
+from apps.desktop_client.status_model import AppStatusModel
+from apps.desktop_client.surfaces import AmbientCanvas
 from apps.desktop_client.theme import apply_theme, current_palette, theme_name
-from apps.desktop_client.widgets import LinePlot, SidebarStatusFooter
+from apps.desktop_client.widgets import SidebarStatusFooter
 
 NAVIGATION = (
     ("实验控制", None, ""),
@@ -78,10 +83,14 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1080, 680)
 
         self._settings = QSettings("SpectrumPlatform", "DesktopClient")
+        self._model = AppStatusModel(self)
+        self._model.updated.connect(self._on_model_updated)
+        self._motion = PageTransitionController(self._settings, self)
         self._sidebar_collapsed = False
         self._start_maximized = False
 
-        shell = QWidget(objectName="appShell")
+        shell = AmbientCanvas()
+        shell.setObjectName("appShell")
         shell_layout = QHBoxLayout(shell)
         shell_layout.setContentsMargins(0, 0, 0, 0)
         shell_layout.setSpacing(0)
@@ -95,10 +104,12 @@ class MainWindow(QMainWindow):
         sidebar_head_layout = QHBoxLayout(sidebar_head)
         sidebar_head_layout.setContentsMargins(12, 8, 10, 8)
         self.sidebar_label = QLabel("控制台", objectName="sidebarLabel")
-        self.theme_button = QPushButton("☾", objectName="themeButton")
+        self.theme_button = QPushButton(objectName="themeButton")
+        self.theme_button.setIconSize(QSize(15, 15))
         self.theme_button.setAccessibleName("切换界面主题")
         self.theme_button.clicked.connect(self._toggle_theme)
-        self.sidebar_button = QPushButton("☰", objectName="sidebarButton")
+        self.sidebar_button = QPushButton(objectName="sidebarButton")
+        self.sidebar_button.setIconSize(QSize(15, 15))
         self.sidebar_button.setAccessibleName("收起或展开侧栏")
         self.sidebar_button.setToolTip("收起侧栏")
         self.sidebar_button.clicked.connect(self._toggle_sidebar)
@@ -129,13 +140,13 @@ class MainWindow(QMainWindow):
         self._settings_page: SystemSettingsPage | None = None
         self._workbench_page: WorkbenchPage | None = None
         self._init_worker: InitializationWorker | None = None
-        self._instrument_ready = False
-        self._pv_ready = False
-        self._data_state = "idle"
-        self._data_text = "待连接"
+        self._sync_in_progress = False
 
         self.initialization_page = InitializationPage()
         self._initialization_index = self.pages.addWidget(self.initialization_page)
+        self.initialization_page.retryRequested.connect(self._retry_service)
+        self.initialization_page.enterRequested.connect(self._enter_workbench)
+        self.initialization_page.settingsRequested.connect(self._open_settings_from_init)
 
         self._sidebar_animation = QVariantAnimation(self)
         self._sidebar_animation.setDuration(_ANIMATION_MS)
@@ -151,6 +162,7 @@ class MainWindow(QMainWindow):
         self.navigation.currentRowChanged.connect(self._show_page)
         self._restore_preferences()
         self._sync_theme_button()
+        self._sync_chrome_icons()
         QTimer.singleShot(0, self._start_initialization)
 
     def closeEvent(self, event) -> None:  # noqa: N802
@@ -163,6 +175,22 @@ class MainWindow(QMainWindow):
         self._settings.setValue("sidebarCollapsed", self._sidebar_collapsed)
         self._settings.setValue("lastPageRow", self.navigation.currentRow())
         super().closeEvent(event)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        """首次显示后按主题给原生标题栏着色（失败自动回退系统外观）。"""
+        super().showEvent(event)
+        self._apply_native_chrome()
+
+    def _apply_native_chrome(self) -> None:
+        """把原生标题栏/边框颜色同步为当前主题（仅 Windows，可重复调用）。"""
+        if sys.platform != "win32":
+            return
+        try:
+            from apps.desktop_client import windows_chrome
+
+            windows_chrome.apply_native_chrome(self, current_palette())
+        except Exception:  # noqa: BLE001  DWM 能力差异时静默回退系统标题栏
+            return
 
     def _restore_preferences(self) -> None:
         """恢复上次会话的窗口几何、侧栏折叠状态与所在页面。"""
@@ -213,17 +241,20 @@ class MainWindow(QMainWindow):
             if page_key == "settings":
                 page = SystemSettingsPage()
                 page.themeChanged.connect(self._set_theme)
+                page.motionPreferenceChanged.connect(self._on_motion_preference_changed)
                 self._settings_page = page
             elif page_key == "workbench":
                 page = WorkbenchPage()
                 page.navigateRequested.connect(self._navigate_to)
                 page.initializationRequested.connect(self._start_initialization)
+                page.serviceCardRequested.connect(self._show_service_details)
                 self._workbench_page = page
             else:
                 page = page_factories[page_key]()
             scroll = QScrollArea(objectName="pageScroll")
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.viewport().setAutoFillBackground(False)
             scroll.setWidget(page)
             page_index = self.pages.addWidget(scroll)
             self._page_rows[self.navigation.count() - 1] = page_index
@@ -235,18 +266,53 @@ class MainWindow(QMainWindow):
                 self.navigation.setCurrentRow(row)
                 return
 
+    # ------------------------------------------------------------------
+    # 初始化与状态接线（AppStatusModel 单一状态源）
+    # ------------------------------------------------------------------
+
+    _SERVICE_NAMES = {
+        "data": "数据服务",
+        "instrument": "仪器执行服务",
+        "epics": "EPICS 连接",
+        "cache": "本地数据",
+    }
+
     def _start_initialization(self) -> None:
-        if self._init_worker is not None and self._init_worker.isRunning():
+        """启动 / 工作台“重新检查”：完整重查全部服务。"""
+        self._run_initialization(("instrument", "data"), reset_page=True)
+
+    def _retry_service(self, step_key: str) -> None:
+        """初始化页单步失败“重试”：只重跑相关目标，不重复已成功的检查。"""
+        target = InitializationPage.RETRY_TARGETS.get(step_key)
+        if target is None or self._worker_busy():
             return
-        self.initialization_page.reset()
-        self.pages.setCurrentIndex(self._initialization_index)
-        self.navigation.setEnabled(False)
-        self._instrument_ready = False
-        self._pv_ready = False
-        for key, text in (("data", "待连接"), ("instrument", "待连接"), ("epics", "未检查")):
-            self._update_startup_service(key, "idle", text)
-        if self._workbench_page is not None:
-            self._workbench_page.set_control_enabled(False)
+        self._run_initialization((target,), reset_page=False)
+
+    def _worker_busy(self) -> bool:
+        return self._init_worker is not None and self._init_worker.isRunning()
+
+    def _run_initialization(
+        self, targets: tuple[str, ...], reset_page: bool
+    ) -> None:
+        if self._worker_busy():
+            return
+        if reset_page:
+            self._model.reset()
+            self.initialization_page.reset()
+            self.pages.setCurrentIndex(self._initialization_index)
+            self.navigation.setEnabled(False)
+            defaults = {
+                "data": ("idle", "待连接"),
+                "instrument": ("idle", "待连接"),
+                "epics": ("idle", "未检查"),
+                "cache": ("idle", "待同步"),
+            }
+            for key, (state, text) in defaults.items():
+                self._model.set_service(key, state, text)
+            self._sync_service_views()
+            if self._workbench_page is not None:
+                self._workbench_page.set_control_enabled(False)
+        self.initialization_page.set_retry_enabled(False)
         data_url = str(
             self._settings.value("service/dataUrl", DEFAULT_SERVICE_URLS["data"])
         )
@@ -255,66 +321,150 @@ class MainWindow(QMainWindow):
                 "service/instrumentUrl", DEFAULT_SERVICE_URLS["instrument"]
             )
         )
-        worker = InitializationWorker(data_url, instrument_url, self)
-        worker.stepChanged.connect(self._update_initialization_step)
-        worker.serviceChanged.connect(self._update_startup_service)
-        worker.syncProgress.connect(self.initialization_page.set_sync_progress)
-        worker.essentialReady.connect(self._initialization_essential_ready)
-        worker.finished.connect(self._initialization_worker_finished)
+        worker = InitializationWorker(data_url, instrument_url, self, targets=targets)
+        worker.stepChanged.connect(self._on_init_step)
+        worker.serviceChanged.connect(self._on_service)
+        worker.pvStatus.connect(self._on_pv_status)
+        worker.syncProgress.connect(self._on_sync_progress)
+        worker.essentialReady.connect(self._on_essential_ready)
+        worker.completed.connect(self._on_init_completed)
+        worker.finished.connect(self._on_worker_finished)
         self._init_worker = worker
         worker.start()
 
-    def _update_initialization_step(self, key: str, state: str, detail: str) -> None:
+    def _on_init_step(self, key: str, state: str, detail: str) -> None:
+        self._model.set_step(key, state, detail)
         self.initialization_page.set_step(key, state, detail)
-        if key == "sync" and self._workbench_page is not None:
+        if key == "sync":
+            self._sync_in_progress = state == "running"
             display_state = "warn" if state == "running" else state
-            self._workbench_page.set_service_status("cache", display_state, detail)
+            self._model.set_service("cache", display_state, detail or "待同步")
+            self._sync_one_service_view("cache")
 
-    def _update_startup_service(self, key: str, state: str, text: str) -> None:
-        self.status_footer.set_service(key, state, text)
+    def _on_service(self, key: str, state: str, text: str) -> None:
+        self._model.set_service(key, state, text)
+        self._sync_one_service_view(key)
+
+    def _on_pv_status(self, connected: int, total: int, details: list) -> None:
+        self._model.set_pv(connected, total, details)
+
+    def _on_sync_progress(self, current: int, total: int) -> None:
+        self._model.set_sync_progress(current, total)
+        self.initialization_page.set_sync_progress(current, total)
+
+    def _sync_one_service_view(self, key: str) -> None:
+        service = self._model.service(key)
+        state, text = service["state"], service["text"]
+        if key != "cache":
+            self.status_footer.set_service(key, state, text or "—")
         if self._workbench_page is not None:
-            self._workbench_page.set_service_status(key, state, text)
-        if key == "instrument":
-            self._instrument_ready = state == "good"
-        elif key == "epics":
-            self._pv_ready = state == "good"
-        elif key == "data":
-            self._data_state = state
-            self._data_text = text
+            self._workbench_page.set_service_status(key, state, text or "—")
 
-    def _initialization_essential_ready(self) -> None:
+    def _sync_service_views(self) -> None:
+        for key in self._model.SERVICE_KEYS:
+            self._sync_one_service_view(key)
+
+    def _on_essential_ready(self) -> None:
+        """必要条件检查完成：解锁导航，允许先进入，同步可继续后台运行。"""
+        self._model.mark_essential_ready()
         self.navigation.setEnabled(True)
-        control_enabled = self._instrument_ready and self._pv_ready
+        self._apply_control_eligibility()
+        self._refresh_init_actions()
+
+    def _on_init_completed(self, ok: bool, message: str) -> None:  # noqa: ARG002
+        self._model.mark_finished()
+        self._refresh_init_actions()
+
+    def _on_worker_finished(self) -> None:
+        if self._init_worker is not None:
+            self._init_worker.deleteLater()
+            self._init_worker = None
+        self.initialization_page.set_retry_enabled(True)
+        self._apply_control_eligibility()
+        self._refresh_init_actions()
+
+    def _on_model_updated(self) -> None:
+        # 预留：未来动画/角标等订阅入口；当前各视图更新由具体 handler 显式驱动。
+        return
+
+    # ---------- 进入判定与操作资格 ----------
+
+    def _apply_control_eligibility(self) -> None:
+        """扫谱/调束入口启用与否由模型推导，页面不自行拼条件。"""
+        can_control = self._model.can_control
         for row, (label, key, _symbol) in enumerate(NAVIGATION):
             if key not in {"scan", "tuning"}:
                 continue
             item = self.navigation.item(row)
-            item.setFlags(
-                item.flags() | Qt.ItemFlag.ItemIsEnabled
-                if control_enabled
-                else item.flags() & ~Qt.ItemFlag.ItemIsEnabled
-            )
-            item.setToolTip(
-                label if control_enabled else "仪器服务或关键 PV 未就绪，暂不可用"
-            )
+            if can_control:
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEnabled)
+                item.setToolTip(label)
+            else:
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
+                item.setToolTip("仪器服务或关键 PV 未就绪，暂不可用")
         if self._workbench_page is not None:
-            self._workbench_page.set_control_enabled(control_enabled)
+            self._workbench_page.set_control_enabled(can_control)
         row = self.navigation.currentRow()
-        if not control_enabled and row in (3, 4):
+        if not can_control and row in (3, 4):
+            self.navigation.setCurrentRow(1)
             row = 1
-            self.navigation.setCurrentRow(row)
         self._show_page(row)
 
-    def _initialization_worker_finished(self) -> None:
-        if self._init_worker is not None:
-            self._init_worker.deleteLater()
-            self._init_worker = None
+    def _refresh_init_actions(self) -> None:
+        """按模型推导初始化页操作行：进入 / 降级进入 / 离线进入。"""
+        if not self._model.essential_ready:
+            self.initialization_page.set_actions("hidden")
+            return
+        instrument = self._model.service("instrument")["state"]
+        data = self._model.service("data")["state"]
+        if self._model.can_control and self._model.data_ready:
+            mode = "ready"
+        elif instrument == "error" and data == "error":
+            mode = "offline"
+        else:
+            mode = "degraded"
+        self.initialization_page.set_actions(mode)
+
+    def _enter_workbench(self) -> None:
+        self._navigate_to("workbench")
+
+    def _open_settings_from_init(self) -> None:
+        self._navigate_to("settings")
+
+    # ---------- 服务明细（工作台状态卡双击查看） ----------
+
+    def _show_service_details(self, key: str) -> None:
+        if key == "epics":
+            title = "PV 连接明细"
+            svc = self._model.service("epics")
+            lines = [f"已连接 {self._model.pv_connected} / {self._model.pv_total}"]
+            if svc["at"]:
+                lines.append(f"最近检查：{svc['at']}")
+            if self._model.pv_details:
+                lines.append("")
+                lines.append("状态明细：")
+                lines.extend(f"· {detail}" for detail in self._model.pv_details)
+            QMessageBox.information(self, title, "\n".join(lines))
+            return
+        svc = self._model.service(key)
+        name = self._SERVICE_NAMES.get(key, key)
+        lines = [f"当前：{svc['text'] or '—'}", f"状态时间：{svc['at'] or '—'}"]
+        if svc["detail"]:
+            lines.append(f"说明：{svc['detail']}")
+        QMessageBox.information(self, f"{name}状态", "\n".join(lines))
 
     def _show_page(self, row: int) -> None:
         page_index = self._page_rows.get(row)
         if page_index is not None:
             self.pages.setCurrentIndex(page_index)
+            current = self.pages.currentWidget()
+            if current is not None:
+                self._motion.fade_in(current)
         self._refresh_nav_icons()
+
+    def _on_motion_preference_changed(self, reduced: bool) -> None:
+        self._motion.set_reduced(reduced)
+        self.status_footer.refresh_motion()
 
     def _refresh_nav_icons(self) -> None:
         """当前页图标用主题强调色，其余用主题默认图标色，让选中态更清晰。"""
@@ -334,29 +484,37 @@ class MainWindow(QMainWindow):
         self._set_theme(target)
 
     def _set_theme(self, name: str) -> None:
-        """应用指定主题并同步所有依赖主题的控件；入口包括侧栏按钮与系统设置页。"""
+        """应用指定主题并同步依赖主题的控件；入口包括侧栏按钮与系统设置页。"""
         if name == theme_name():
             return
         app = QApplication.instance()
         apply_theme(app, name)
         self._settings.setValue("theme", name)
         self._sync_theme_button()
+        self._sync_chrome_icons()
         self._refresh_nav_icons()
         self.status_footer.refresh_theme()
         if self._settings_page is not None:
             self._settings_page.sync_theme_radio()
-        for plot in self.pages.findChildren(LinePlot):
-            plot.update()
-        # 让 QSS/QPalette 变化完整地重刷到所有组件
+        for plot in self.pages.findChildren(SpectrumPlot):
+            plot.refresh_theme()
+        # setStyleSheet/setPalette 会触发全量重刷；这里仅对自绘控件补一次 update，
+        # 避免全树 unpolish/polish 造成的切换开销（M1 性能重构）。
         for widget in app.allWidgets():
-            widget.style().unpolish(widget)
-            widget.style().polish(widget)
             widget.update()
+        self._sync_service_views()
+        self._apply_native_chrome()
 
     def _sync_theme_button(self) -> None:
         dark = theme_name() == "dark"
-        self.theme_button.setText("☀" if dark else "☾")
+        icon = make_symbol("sun" if dark else "moon", current_palette()["navText"])
+        self.theme_button.setIcon(icon)
         self.theme_button.setToolTip("切换到浅色主题" if dark else "切换到深色主题")
+
+    def _sync_chrome_icons(self) -> None:
+        """侧栏头部的菜单/主题按钮图标颜色跟随主题。"""
+        color = current_palette()["navText"]
+        self.sidebar_button.setIcon(make_symbol("menu", color))
 
     def _toggle_sidebar(self) -> None:
         self._sidebar_collapsed = not self._sidebar_collapsed
@@ -364,6 +522,9 @@ class MainWindow(QMainWindow):
         self._settings.setValue("sidebarCollapsed", self._sidebar_collapsed)
         target = _SIDEBAR_COLLAPSED if self._sidebar_collapsed else _SIDEBAR_EXPANDED
         self._sidebar_animation.stop()
+        if self._motion.reduced:
+            self.sidebar.setFixedWidth(target)
+            return
         self._sidebar_animation.setStartValue(self.sidebar.width())
         self._sidebar_animation.setEndValue(target)
         self._sidebar_animation.start()

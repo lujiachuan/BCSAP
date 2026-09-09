@@ -262,6 +262,35 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[client,service,database,dev]"
 ```
 
+> **重要**：`pip install -e .` 后若不带 `[角色分组]`，只会安装 `numpy`、`pydantic` 两个基础依赖，**不会**安装 PySide6、pyqtgraph、FastAPI 等可选依赖。全新克隆的环境要从本节开头创建 `.venv` 起完整执行，并严格按角色选择带分组的安装命令，不要省略成 `pip install -e .`。
+
+**新环境初始化清单（在仓库根目录依次执行）：**
+
+```powershell
+# 1) 创建虚拟环境并升级 pip（只做一次）
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+
+# 2) 按角色安装 —— 操作电脑（客户端 + 本机执行服务）
+.\.venv\Scripts\python.exe -m pip install -e ".[client,service]"
+```
+
+安装后自检一次，确认客户端依赖真实可用：
+
+```powershell
+.\.venv\Scripts\python.exe -c "import PySide6, pyqtgraph; print('client deps ok')"
+```
+
+### 常见问题：`No module named 'PySide6'`
+
+启动桌面客户端报 `ModuleNotFoundError: No module named 'PySide6'`，通常是环境问题而不是代码问题：当前解释器缺少 `client` 可选依赖。依次排查：
+
+1. 只执行了不带分组名的 `pip install -e .` → 回到仓库根目录，按上面的初始化清单第 2 步重新安装（命令必须含 `[client,service]` 分组）。
+2. `.venv` 未创建或已被删除 → 先执行初始化清单第 1 步重建虚拟环境，再按角色安装。
+3. VS Code 选中的解释器不是项目 `.venv` → 命令面板执行 “Python: Select Interpreter” 选择 `.venv\Scripts\python.exe`，再执行 “Developer: Reload Window” 重载窗口。
+
+修复后先运行上面的自检命令，通过后再启动客户端。
+
 当前代码运行不需要 `.env`。将来加入数据库连接、服务凭据或设备配置时，不应把密钥或现场配置提交到仓库。
 
 ## 8. 启动与接口检查

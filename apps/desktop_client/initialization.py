@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PySide6.QtCore import QStandardPaths, QThread, Signal
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QProgressBar,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -148,10 +150,11 @@ class LocalDataCache:
 
 
 class InitializationWorker(QThread):
-    """顺序完成依赖检查，在关键检查结束后允许界面先进入。"""
+    """按目标子集顺序完成依赖检查；支持单项重试（不重复已成功的检查）。"""
 
     stepChanged = Signal(str, str, str)
     serviceChanged = Signal(str, str, str)
+    pvStatus = Signal(int, int, list)
     essentialReady = Signal()
     syncProgress = Signal(int, int)
     completed = Signal(bool, str)
@@ -162,29 +165,55 @@ class InitializationWorker(QThread):
         instrument_url: str,
         parent=None,
         cache_root: Path | None = None,
+        targets: tuple[str, ...] | None = None,
     ) -> None:
         super().__init__(parent)
         self.data_url = data_url.rstrip("/")
         self.instrument_url = instrument_url.rstrip("/")
         self.cache_root = cache_root
+        # targets 是 ("instrument", "data") 的子集；缺省两者都检查。
+        self._targets = targets or ("instrument", "data")
 
     def run(self) -> None:
         essential_emitted = False
         try:
             self.stepChanged.emit("config", "good", "本机配置已加载")
-            instrument_ok = self._check_instrument()
+            all_ok = True
+            want_instrument = "instrument" in self._targets
+            want_data = "data" in self._targets
+            data_ok = False
+            if want_instrument and want_data:
+                # 两个地址互不依赖，并行探测；仪器任务内部在可达后继续检查 PV。
+                # 最大并发固定为 2，避免启动阶段制造额外线程压力。
+                with ThreadPoolExecutor(max_workers=2, thread_name_prefix="startup") as pool:
+                    instrument_future = pool.submit(self._check_instrument)
+                    data_future = pool.submit(self._check_data_service)
+                    instrument_ok = instrument_future.result()
+                    data_ok = data_future.result()
+                all_ok = instrument_ok and data_ok
+            else:
+                if want_instrument:
+                    all_ok &= self._check_instrument()
+                if want_data:
+                    data_ok = self._check_data_service()
+                    all_ok &= data_ok
             if self.isInterruptionRequested():
                 return
-            data_ok = self._check_data_service()
+            # 必要条件（可进入主界面的检查）已完成：允许先进入，同步继续后台执行。
             self.essentialReady.emit()
             essential_emitted = True
             if self.isInterruptionRequested():
                 return
-            if data_ok:
-                self._sync_data()
-            else:
-                self.stepChanged.emit("sync", "warn", "已跳过，继续使用本地缓存")
-            self.completed.emit(instrument_ok and data_ok, "启动初始化已完成")
+            if want_data:
+                if data_ok:
+                    self._sync_data()
+                else:
+                    self.stepChanged.emit("sync", "warn", "已跳过，继续使用本地缓存")
+            scope = "启动初始化" if len(self._targets) == 2 else "单项重试"
+            message = f"{scope}已完成"
+            if not all_ok:
+                message += "（存在失败项，见上方状态）"
+            self.completed.emit(all_ok, message)
         except Exception as exc:
             self.stepChanged.emit("sync", "error", str(exc))
             self.completed.emit(False, f"初始化失败：{exc}")
@@ -196,11 +225,12 @@ class InitializationWorker(QThread):
         self.stepChanged.emit("instrument", "running", "正在连接…")
         try:
             _request_json(self.instrument_url + "/control/v1/status")
-        except Exception as exc:
+        except Exception as exc:  # 连接类错误统一展示，不区分细节
             self.stepChanged.emit("instrument", "error", f"不可达：{exc}")
             self.stepChanged.emit("pv", "warn", "已跳过")
             self.serviceChanged.emit("instrument", "error", "不可达")
             self.serviceChanged.emit("epics", "idle", "未检查")
+            self.pvStatus.emit(0, 0, ["仪器执行服务不可达，未执行 PV 检查。"])
             return False
 
         self.stepChanged.emit("instrument", "good", "仪器执行服务可达")
@@ -213,6 +243,8 @@ class InitializationWorker(QThread):
             connected = int(summary["connected"])
             required_failed = int(summary["required_failed"])
             state = "good" if required_failed == 0 else "error"
+            details = _collect_pv_details(result)
+            self.pvStatus.emit(connected, total, details)
             self.stepChanged.emit("pv", state, f"{connected} / {total} PV 已连接")
             self.serviceChanged.emit("epics", state, f"{connected} / {total}")
             return required_failed == 0
@@ -286,7 +318,11 @@ class InitializationWorker(QThread):
 
 
 class InitializationPage(QWidget):
-    """应用启动期间显示的非阻塞初始化进度页。"""
+    """应用启动期间显示的非阻塞初始化进度页（M1：步骤行重试 + 进入/设置操作）。"""
+
+    retryRequested = Signal(str)
+    enterRequested = Signal()
+    settingsRequested = Signal()
 
     STEP_LABELS = (
         ("config", "加载本机配置"),
@@ -295,6 +331,16 @@ class InitializationPage(QWidget):
         ("data", "检查数据服务"),
         ("sync", "同步中央数据"),
     )
+
+    # 步骤失败时对应重试的 Worker 目标（pv 重试会连带检查仪器服务）
+    RETRY_TARGETS = {
+        "instrument": "instrument",
+        "pv": "instrument",
+        "data": "data",
+        "sync": "data",
+    }
+
+    _PREFIX = {"running": "↻", "good": "✓", "warn": "!", "error": "×"}
 
     def __init__(self) -> None:
         super().__init__(objectName="pageRoot")
@@ -308,44 +354,120 @@ class InitializationPage(QWidget):
 
         panel = QFrame(objectName="panel")
         panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(22, 20, 22, 20)
-        panel_layout.setSpacing(14)
+        panel_layout.setContentsMargins(24, 20, 24, 20)
+        panel_layout.setSpacing(12)
         self.step_values: dict[str, QLabel] = {}
+        self.retry_buttons: dict[str, QPushButton] = {}
         for key, label in self.STEP_LABELS:
             row = QHBoxLayout()
             row.addWidget(QLabel(label))
             row.addStretch()
             value = QLabel("等待", objectName="mutedText")
+            value.setMinimumWidth(220)
             row.addWidget(value)
+            retry = QPushButton("重试", objectName="inlineRetry")
+            retry.setVisible(False)
+            retry.clicked.connect(lambda _checked=False, k=key: self.retryRequested.emit(k))
+            row.addWidget(retry)
             panel_layout.addLayout(row)
             self.step_values[key] = value
+            self.retry_buttons[key] = retry
         self.progress = QProgressBar()
         self.progress.setTextVisible(False)
         self.progress.setVisible(False)
         panel_layout.addWidget(self.progress)
         layout.addWidget(panel)
+
+        self.actions = QWidget()
+        actions_layout = QHBoxLayout(self.actions)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        self.action_note = QLabel("", objectName="mutedText")
+        self.action_note.setWordWrap(True)
+        actions_layout.addWidget(self.action_note, 1)
+        settings = QPushButton("打开系统设置")
+        settings.clicked.connect(self.settingsRequested.emit)
+        actions_layout.addWidget(settings)
+        self.enter_button = QPushButton("进入工作台", objectName="primaryButton")
+        self.enter_button.clicked.connect(self.enterRequested.emit)
+        actions_layout.addWidget(self.enter_button)
+        self.actions.setVisible(False)
+        layout.addWidget(self.actions)
         layout.addStretch()
 
     def reset(self) -> None:
         for value in self.step_values.values():
             value.setText("等待")
             value.setProperty("state", "idle")
+        for button in self.retry_buttons.values():
+            button.setVisible(False)
+            button.setEnabled(True)
         self.progress.setVisible(False)
+        self.actions.setVisible(False)
 
     def set_step(self, key: str, state: str, detail: str) -> None:
         value = self.step_values.get(key)
         if value is None:
             return
-        prefix = {"running": "↻", "good": "✓", "warn": "!", "error": "×"}.get(state, "○")
+        prefix = self._PREFIX.get(state, "○")
         value.setText(f"{prefix}  {detail}")
         value.setProperty("state", "warn" if state == "running" else state)
         value.style().unpolish(value)
         value.style().polish(value)
+        retry = self.retry_buttons.get(key)
+        if retry is not None:
+            retry.setVisible(state == "error" and key in self.RETRY_TARGETS)
+
+    def set_retry_enabled(self, enabled: bool) -> None:
+        """初始化任务运行期间禁点重试，结束后放开。"""
+        for button in self.retry_buttons.values():
+            button.setEnabled(enabled)
 
     def set_sync_progress(self, current: int, total: int) -> None:
         self.progress.setVisible(total > 0)
         self.progress.setRange(0, max(1, total))
         self.progress.setValue(current)
+
+    def set_actions(self, mode: str) -> None:
+        """mode: hidden / ready / degraded / offline"""
+        if mode == "hidden":
+            self.actions.setVisible(False)
+            return
+        if mode == "ready":
+            note, text = "全部关键检查完成，可进入主界面。", "进入工作台"
+        elif mode == "degraded":
+            note, text = (
+                "部分服务不可用，可离线进入（扫谱与自动调束将保持禁用）。",
+                "离线进入",
+            )
+        else:  # offline
+            note = "服务当前均不可达，将以离线模式进入（业务页可浏览，控制禁用）。"
+            text = "进入（离线）"
+        self.action_note.setText(note)
+        self.enter_button.setText(text)
+        self.actions.setVisible(True)
+
+
+def _collect_pv_details(result: dict) -> list[str]:
+    """把 PV 健康接口结果整理为可展示的失败明细（名称 + 原因）。"""
+    raw = result.get("details")
+    if not isinstance(raw, list) or not raw:
+        summary = result.get("summary", {})
+        failed = int(summary.get("required_failed", 0))
+        if failed:
+            return [f"{failed} 个必需 PV 未连接（接口未提供逐项明细）"]
+        return []
+    lines: list[str] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("pv") or "?")
+        ok = bool(item.get("ok") or item.get("connected") or item.get("state") == "connected")
+        if ok and not item.get("error") and not item.get("detail"):
+            lines.append(f"{name}：已连接")
+        else:
+            error = str(item.get("error") or item.get("detail") or "未连接")
+            lines.append(f"{name}：{error}")
+    return lines
 
 
 def _request_json(url: str) -> dict:

@@ -1,6 +1,7 @@
 """启动初始化所需的服务契约与本地缓存验证。"""
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -10,7 +11,7 @@ from apps.data_service.sync_catalog import (
     sync_records,
     sync_spectra,
 )
-from apps.desktop_client.initialization import LocalDataCache
+from apps.desktop_client.initialization import InitializationWorker, LocalDataCache
 from apps.instrument_service.app import create_app as create_instrument_app
 from apps.instrument_service.pv_health import check_pv_health, create_simulated_gateway
 from packages.spectrum import encode_spectrum, spectrum_checksum
@@ -64,6 +65,29 @@ class LocalDataCacheTests(unittest.TestCase):
             self.assertEqual(cache.cursor(), "cursor-1")
             self.assertEqual(list(Path(directory).rglob("*.part")), [])
             cache.close()
+
+
+class InitializationWorkerTests(unittest.TestCase):
+    def test_service_checks_start_in_parallel(self) -> None:
+        worker = InitializationWorker("http://data", "http://instrument")
+        barrier = threading.Barrier(2)
+        overlapped: list[bool] = []
+
+        def check() -> bool:
+            try:
+                barrier.wait(timeout=1.0)
+            except threading.BrokenBarrierError:
+                overlapped.append(False)
+            else:
+                overlapped.append(True)
+            return True
+
+        worker._check_instrument = check  # type: ignore[method-assign]
+        worker._check_data_service = check  # type: ignore[method-assign]
+        worker._sync_data = lambda: None  # type: ignore[method-assign]
+        worker.run()
+
+        self.assertEqual(overlapped, [True, True])
 
 
 if __name__ == "__main__":

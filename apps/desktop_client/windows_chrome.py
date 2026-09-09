@@ -1,17 +1,12 @@
-"""预留工具（当前未接入）：Windows 原生标题栏着色。
+"""Windows 原生标题栏着色（由主题令牌驱动，M0 接入主线）。
 
-当前客户端采用“全浅色一体化”设计，标题栏使用系统默认浅色，主窗口不再调用
-本模块。若未来切换为整体深色主题，可把标题栏/边框涂成页面主题色，保留原生
-窗口的全部行为（拖拽、贴边分屏、双击最大化、系统菜单、圆角等）。非 Windows
-平台调用 ``apply_native_chrome`` 是无操作。
+通过 DWM 窗口属性把原生标题栏、边框与文字颜色同步为当前主题：
+- 深色主题：开启沉浸式暗色标题栏（浅色字形），标题栏/边框涂成侧栏同色；
+- 浅色主题：关闭沉浸式暗色，标题栏涂成侧栏同色，消除与内容区的割裂感。
 
-- 沉浸式暗色（DWMWA_USE_IMMERSIVE_DARK_MODE）：标题栏文字与按钮使用浅色字形；
-- 标题栏/边框颜色（DWMWA_CAPTION_COLOR / DWMWA_BORDER_COLOR，Windows 11 22H2+）：
-  把标题栏涂成与侧栏一致的主题色，消除“浅色标题栏压在深色侧栏上方”的割裂感；
-- 文字颜色（DWMWA_TEXT_COLOR）：与侧栏文字颜色保持一致。
-
-不同 Windows 版本支持程度不同：较老的版本对不受支持的属性返回 E_INVALIDARG，
-此处静默忽略，退回系统默认外观。
+不同 Windows 版本支持程度不同：较老版本对不受支持的属性返回 E_INVALIDARG，
+调用方（main._apply_native_chrome）捕获异常后静默回退系统默认外观。
+非 Windows 平台调用 ``apply_native_chrome`` 是无操作。
 """
 
 from __future__ import annotations
@@ -26,15 +21,17 @@ _DWMWA_BORDER_COLOR = 34  # Windows 11 22H2+
 _DWMWA_CAPTION_COLOR = 35  # Windows 11 22H2+
 _DWMWA_TEXT_COLOR = 36  # Windows 11 22H2+
 
-# 与 apps.desktop_client.theme 中侧边栏保持一致
-SIDEBAR_COLOR = "#152a3a"
-SIDEBAR_TEXT_COLOR = "#dce7ef"
-
 
 def colorref(hex_color: str) -> int:
     """把 '#rrggbb' 转成 DWM 的 COLORREF（0x00bbggrr）。"""
     value = hex_color.lstrip("#")
     return int(value[4:6] + value[2:4] + value[0:2], 16)
+
+
+def _relative_luminance(hex_color: str) -> float:
+    rgb = [int(hex_color[i : i + 2], 16) / 255 for i in (1, 3, 5)]
+    linear = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in rgb]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
 
 
 def _set_attribute(hwnd: int, attribute: int, value: int) -> bool:
@@ -50,21 +47,36 @@ def _set_attribute(hwnd: int, attribute: int, value: int) -> bool:
     return result == 0
 
 
-def apply_native_chrome(window) -> None:
-    """让窗口原生标题栏与侧边栏同色；仅 Windows 生效，可重复调用。"""
+def apply_native_chrome(window, palette: dict[str, str] | None = None) -> None:
+    """让窗口原生标题栏与当前主题同色；仅 Windows 生效，可重复调用。
+
+    palette 传当前主题颜色令牌（ui_tokens LIGHT/DARK），
+    缺省时按旧默认深色侧栏处理（兼容直接调用）。
+    """
     if sys.platform != "win32":
         return
+    tokens = palette or {
+        "sidebarBg": "#10161d",
+        "sidebarBorder": "#26313d",
+        "headText": "#e9f0f7",
+        "canvas": "#161d26",
+    }
     try:
         hwnd = int(window.winId())
     except (AttributeError, RuntimeError, TypeError, ValueError):
         return
 
-    # 1) 深色标题栏：文字与窗口按钮使用浅色字形。
-    #    新构建优先用常量 20，老版本退回常量 19。
-    if not _set_attribute(hwnd, _DWMWA_USE_IMMERSIVE_DARK_MODE_20, 1):
-        _set_attribute(hwnd, _DWMWA_USE_IMMERSIVE_DARK_MODE_19, 1)
+    sidebar_color = tokens["sidebarBg"]
+    border_color = tokens["sidebarBorder"]
+    text_color = tokens["headText"]
+    dark_theme = _relative_luminance(sidebar_color) < 0.3
 
-    # 2) Windows 11 22H2+：标题栏、边框与文字直接涂成侧栏配色。
-    _set_attribute(hwnd, _DWMWA_CAPTION_COLOR, colorref(SIDEBAR_COLOR))
-    _set_attribute(hwnd, _DWMWA_BORDER_COLOR, colorref(SIDEBAR_COLOR))
-    _set_attribute(hwnd, _DWMWA_TEXT_COLOR, colorref(SIDEBAR_TEXT_COLOR))
+    # 1) 沉浸式暗色标题栏：深色主题用浅色字形，浅色主题关闭（退回系统深字）。
+    dark_mode = 1 if dark_theme else 0
+    if not _set_attribute(hwnd, _DWMWA_USE_IMMERSIVE_DARK_MODE_20, dark_mode):
+        _set_attribute(hwnd, _DWMWA_USE_IMMERSIVE_DARK_MODE_19, dark_mode)
+
+    # 2) Windows 11 22H2+：标题栏、边框与文字直接涂成主题色。
+    _set_attribute(hwnd, _DWMWA_CAPTION_COLOR, colorref(sidebar_color))
+    _set_attribute(hwnd, _DWMWA_BORDER_COLOR, colorref(border_color))
+    _set_attribute(hwnd, _DWMWA_TEXT_COLOR, colorref(text_color))
