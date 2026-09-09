@@ -33,32 +33,28 @@ from PySide6.QtWidgets import (
 from apps.desktop_client.initialization import InitializationPage, InitializationWorker
 from apps.desktop_client.motion import PageTransitionController
 from apps.desktop_client.nav_icons import make_nav_icon, make_symbol
-from apps.desktop_client.pages import (
-    DEFAULT_SERVICE_URLS,
-    PlaceholderPage,
-    ScanPage,
-    SystemSettingsPage,
-    TuningPage,
-    WorkbenchPage,
-)
+from apps.desktop_client.pages import DEFAULT_SERVICE_URLS
+from apps.desktop_client.pages.registry import SECTIONS, page_specs
 from apps.desktop_client.spectrum_plot import SpectrumPlot
 from apps.desktop_client.status_model import AppStatusModel
 from apps.desktop_client.surfaces import AmbientCanvas
 from apps.desktop_client.theme import apply_theme, current_palette, theme_name
 from apps.desktop_client.widgets import SidebarStatusFooter
 
-NAVIGATION = (
-    ("实验控制", None, ""),
-    ("工作台", "workbench", "dashboard"),
-    ("样品管理", "samples", "sample"),
-    ("扫谱", "scan", "scan"),
-    ("自动调束", "tuning", "tuning"),
-    ("数据与系统", None, ""),
-    ("谱图库", "library", "database"),
-    ("谱图分析", "analysis", "analysis"),
-    ("任务与同步", "sync", "sync"),
-    ("系统设置", "settings", "settings"),
-)
+# 页面元数据集中在各 pages/ 模块的 PAGE_SPEC，主窗口只按注册表装配。
+_PAGE_SPEC_BY_KEY = {spec.key: spec for spec in page_specs()}
+
+
+def _nav_rows() -> list[tuple[bool, str, str, str]]:
+    """由页面注册表生成侧栏行：(是否分区标题, 标签, 页面 key, 图标名)。"""
+
+    rows: list[tuple[bool, str, str, str]] = []
+    for section_label, section_key in SECTIONS:
+        rows.append((True, section_label, "", ""))
+        for spec in page_specs():
+            if spec.section == section_key:
+                rows.append((False, spec.label, spec.key, spec.icon))
+    return rows
 
 # 侧边栏底部常驻服务状态（跨页面可见）；接入真实服务后改用事件刷新。
 SIDEBAR_SERVICES = (
@@ -136,9 +132,10 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(shell)
 
         self._page_rows: dict[int, int] = {}
+        self._row_of_key: dict[str, int] = {}
         self._navigation_items: list[tuple[QListWidgetItem, str, str, bool]] = []
-        self._settings_page: SystemSettingsPage | None = None
-        self._workbench_page: WorkbenchPage | None = None
+        self._settings_page: QWidget | None = None
+        self._workbench_page: QWidget | None = None
         self._init_worker: InitializationWorker | None = None
         self._sync_in_progress = False
 
@@ -209,62 +206,43 @@ class MainWindow(QMainWindow):
         self.navigation.setCurrentRow(row)
 
     def _add_pages(self) -> None:
-        page_factories = {
-            "samples": lambda: PlaceholderPage(
-                "样品管理", "维护样品编号、类型、批次和实验备注。"
-            ),
-            "scan": ScanPage,
-            "tuning": TuningPage,
-            "library": lambda: PlaceholderPage(
-                "谱图库", "检索与多人访问界面按计划暂缓建设。"
-            ),
-            "analysis": lambda: PlaceholderPage(
-                "谱图分析", "分析工具将在谱图库需求明确后一起设计。"
-            ),
-            "sync": lambda: PlaceholderPage(
-                "任务与同步", "显示本机任务、待上传数据和服务同步状态。"
-            ),
-        }
-
-        for label, page_key, symbol in NAVIGATION:
+        """按页面注册表生成侧栏与堆叠页面；页面内容在各自 pages/ 模块内。"""
+        for row, (is_section, label, key, symbol) in enumerate(_nav_rows()):
             item = QListWidgetItem(label)
             item.setToolTip(label)
-            if page_key is None:
+            if is_section:
                 item.setFlags(Qt.ItemFlag.NoItemFlags)
                 item.setData(Qt.ItemDataRole.UserRole, "section")
                 self.navigation.addItem(item)
-                self._navigation_items.append((item, label, symbol, True))
+                self._navigation_items.append((item, label, "", True))
                 continue
             self.navigation.addItem(item)
             item.setIcon(make_nav_icon(symbol))
             self._navigation_items.append((item, label, symbol, False))
-            if page_key == "settings":
-                page = SystemSettingsPage()
+            page = _PAGE_SPEC_BY_KEY[key].factory()
+            if key == "settings":
                 page.themeChanged.connect(self._set_theme)
                 page.motionPreferenceChanged.connect(self._on_motion_preference_changed)
                 self._settings_page = page
-            elif page_key == "workbench":
-                page = WorkbenchPage()
+            elif key == "workbench":
                 page.navigateRequested.connect(self._navigate_to)
                 page.initializationRequested.connect(self._start_initialization)
                 page.serviceCardRequested.connect(self._show_service_details)
                 self._workbench_page = page
-            else:
-                page = page_factories[page_key]()
             scroll = QScrollArea(objectName="pageScroll")
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QFrame.Shape.NoFrame)
             scroll.viewport().setAutoFillBackground(False)
             scroll.setWidget(page)
             page_index = self.pages.addWidget(scroll)
-            self._page_rows[self.navigation.count() - 1] = page_index
+            self._page_rows[row] = page_index
+            self._row_of_key[key] = row
 
     def _navigate_to(self, page_key: str) -> None:
         """处理工作台快捷入口，复用左侧导航的页面映射。"""
-        for row, (_label, key, _symbol) in enumerate(NAVIGATION):
-            if key == page_key:
-                self.navigation.setCurrentRow(row)
-                return
+        row = self._row_of_key.get(page_key)
+        if row is not None:
+            self.navigation.setCurrentRow(row)
 
     # ------------------------------------------------------------------
     # 初始化与状态接线（AppStatusModel 单一状态源）
@@ -392,22 +370,29 @@ class MainWindow(QMainWindow):
     def _apply_control_eligibility(self) -> None:
         """扫谱/调束入口启用与否由模型推导，页面不自行拼条件。"""
         can_control = self._model.can_control
-        for row, (label, key, _symbol) in enumerate(NAVIGATION):
-            if key not in {"scan", "tuning"}:
+        for page_key in ("scan", "tuning"):
+            row = self._row_of_key.get(page_key)
+            if row is None:
                 continue
             item = self.navigation.item(row)
             if can_control:
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEnabled)
-                item.setToolTip(label)
+                item.setToolTip(_PAGE_SPEC_BY_KEY[page_key].label)
             else:
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
                 item.setToolTip("仪器服务或关键 PV 未就绪，暂不可用")
         if self._workbench_page is not None:
             self._workbench_page.set_control_enabled(can_control)
         row = self.navigation.currentRow()
-        if not can_control and row in (3, 4):
-            self.navigation.setCurrentRow(1)
-            row = 1
+        scan_rows = {
+            self._row_of_key[key]
+            for key in ("scan", "tuning")
+            if key in self._row_of_key
+        }
+        if not can_control and row in scan_rows:
+            workbench_row = self._row_of_key.get("workbench", 1)
+            self.navigation.setCurrentRow(workbench_row)
+            row = workbench_row
         self._show_page(row)
 
     def _refresh_init_actions(self) -> None:
