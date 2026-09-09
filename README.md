@@ -126,11 +126,29 @@ packages/domain、contracts、spectrum、epics_adapter、optimizer
 .
 ├─ apps/                         # 可独立启动的应用进程
 │  ├─ desktop_client/            # PySide6 统一桌面客户端
-│  │  ├─ main.py                 # GUI 入口、主窗口、导航、主题/窗口偏好
-│  │  ├─ pages.py                # 工作台、扫谱、调束、设置及占位页面
-│  │  ├─ widgets.py              # 标题、面板、指标卡、曲线、服务状态等复用控件
-│  │  ├─ theme.py                # 浅/深色令牌、QSS 和 QPalette 应用逻辑
+│  │  ├─ main.py                 # GUI 入口、主窗口壳：侧栏/导航按页面注册表装配
+│  │  ├─ initialization.py       # 启动初始化页与后台服务检查/同步线程
+│  │  ├─ motion.py               # 页面过渡动画控制器（支持“减少动态效果”）
 │  │  ├─ nav_icons.py            # 使用 QPainter 绘制导航矢量图标
+│  │  ├─ pages/                  # 按侧边栏入口拆分的页面包（每页一个模块）
+│  │  │  ├─ __init__.py          # 聚合 PAGE_SPEC 注册顺序，兼容旧导入路径
+│  │  │  ├─ registry.py          # PageSpec 注册表与侧栏分区定义
+│  │  │  ├─ common.py            # 页面公共布局助手
+│  │  │  ├─ placeholder.py       # 通用占位页 PlaceholderPage
+│  │  │  ├─ workbench.py         # 工作台页（页面自带 PAGE_SPEC）
+│  │  │  ├─ samples.py           # 样品管理占位页
+│  │  │  ├─ scan.py              # 扫谱页
+│  │  │  ├─ tuning.py            # 自动调束页
+│  │  │  ├─ library.py           # 谱图库占位页
+│  │  │  ├─ analysis.py          # 谱图分析占位页
+│  │  │  ├─ sync.py              # 任务与同步占位页
+│  │  │  └─ settings.py          # 系统设置页
+│  │  ├─ spectrum_plot.py        # 谱图/收敛曲线实时绘图控件
+│  │  ├─ status_model.py         # 跨页面服务状态单一来源模型
+│  │  ├─ surfaces.py             # 自绘背景画布与玻璃卡片
+│  │  ├─ theme.py                # 浅/深色令牌、QSS 和 QPalette 应用逻辑
+│  │  ├─ ui_tokens.py            # 设计令牌（颜色/间距/圆角等）
+│  │  ├─ widgets.py              # 标题、面板、指标卡、服务状态等复用控件
 │  │  ├─ windows_chrome.py       # 预留的 Windows 原生标题栏着色工具
 │  │  └─ __init__.py             # Python 包标记
 │  ├─ instrument_service/        # 仅部署在授权操作电脑的控制服务
@@ -368,6 +386,12 @@ spectrum-client
 ## 11. 开发约定
 
 - 新的可启动进程放在 `apps/`；跨进程复用且不依赖 GUI 的能力放在 `packages/`。
+- 客户端页面按侧边栏入口拆分在 `apps/desktop_client/pages/`：每页一个模块，并在模块内
+  声明自己的 `PAGE_SPEC`（标题、图标、所属分区、构造方式）；新增/调整页面只需加入
+  `pages/__init__.py` 的聚合顺序列表，不修改 `main.py` 的装配逻辑。
+- 页面之间不相互 import 具体页面类，跨页跳转统一经主窗口信号完成；共享控件
+  （`widgets.py`、`surfaces.py`）与设计令牌（`theme.py`、`ui_tokens.py`）是跨页面公共层，
+  改动应视为公共变更并安排评审。
 - 公共数据结构优先定义在 `packages/contracts/`，客户端和服务端共享同一语义。
 - 设备操作必须经 `EpicsGateway` 抽象和仪器执行服务，不在页面事件中直接访问 PV。
 - 原始谱图与分析结果分开保存；分析操作不得覆盖原始数据。
