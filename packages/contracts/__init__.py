@@ -10,11 +10,21 @@ from .initialization import (
     SyncRecord,
     SyncSpectrum,
 )
+from .pv_mapping import (
+    PvMappingConfig,
+    PvMappingEntry,
+    PvMappingIssue,
+    PvMappingValidationError,
+)
 
 __all__ = [
     "PvHealthItem",
     "PvHealthResponse",
     "PvHealthSummary",
+    "PvMappingConfig",
+    "PvMappingEntry",
+    "PvMappingIssue",
+    "PvMappingValidationError",
     "ServiceStatus",
     "SyncChanges",
     "SyncManifest",

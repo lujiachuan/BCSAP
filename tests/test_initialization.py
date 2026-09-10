@@ -14,12 +14,14 @@ from apps.data_service.sync_catalog import (
 from apps.desktop_client.initialization import InitializationWorker, LocalDataCache
 from apps.instrument_service.app import create_app as create_instrument_app
 from apps.instrument_service.pv_health import check_pv_health, create_simulated_gateway
+from apps.instrument_service.pv_mapping import default_config
 from packages.spectrum import encode_spectrum, spectrum_checksum
 
 
 class InitializationApiTests(unittest.TestCase):
     def test_instrument_service_reports_all_controlled_pvs(self) -> None:
-        payload = check_pv_health(create_simulated_gateway())
+        config = default_config()
+        payload = check_pv_health(create_simulated_gateway(config), config)
 
         self.assertEqual(payload.status, "ready")
         self.assertEqual(payload.summary.connected, payload.summary.total)

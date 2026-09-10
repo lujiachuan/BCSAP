@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import random
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 
 from apps.desktop_client.pages.common import page_layout, primary_button
 from apps.desktop_client.pages.registry import PageSpec
+from apps.desktop_client.pv_mapping_api import PvMappingRequestThread, pv_by_signal
 from apps.desktop_client.spectrum_plot import SpectrumPlot
 from apps.desktop_client.widgets import MetricCard, PageHeading, Panel
 
@@ -37,20 +38,33 @@ from apps.desktop_client.widgets import MetricCard, PageHeading, Panel
 class TuningPage(QWidget):
     """F1 参数表、G1 收敛监控和 H1 前后对比的自动调束页面。"""
 
+    # 业务信号键 + 本地显示/边界数据。
+    # PV 名不写死在这里：按信号键从系统设置的受控 PV 映射取，改了映射本页跟着变。
     PARAMETERS = (
-        ("Q1 电流", "BL:Q1:ISET", "1.842 A", "1.60", "2.10", "0.01"),
-        ("Q2 电流", "BL:Q2:ISET", "-0.625 A", "-0.90", "-0.40", "0.01"),
-        ("Einzel 电压", "BL:EL:VSET", "3.20 kV", "2.80", "3.60", "0.02"),
-        ("X 偏转", "BL:STEER:X", "0.08 V", "-0.50", "0.50", "0.01"),
-        ("Y 偏转", "BL:STEER:Y", "-0.12 V", "-0.50", "0.50", "0.01"),
-        ("Source 电压", "BL:SRC:VSET", "12.4 kV", "11.5", "13.0", "0.05"),
+        ("quadrupole.q1.current", "Q1 电流", "1.842 A", "1.60", "2.10", "0.01"),
+        ("quadrupole.q2.current", "Q2 电流", "-0.625 A", "-0.90", "-0.40", "0.01"),
+        ("einzel.voltage", "Einzel 电压", "3.20 kV", "2.80", "3.60", "0.02"),
+        ("steerer.x", "X 偏转", "0.08 V", "-0.50", "0.50", "0.01"),
+        ("steerer.y", "Y 偏转", "-0.12 V", "-0.50", "0.50", "0.01"),
+        ("source.voltage", "Source 电压", "12.4 kV", "11.5", "13.0", "0.05"),
     )
+    # 映射不可用（服务未启动）时的回退显示，不参与任何写入。
+    FALLBACK_PVS = {
+        "quadrupole.q1.current": "BL:Q1:ISET",
+        "quadrupole.q2.current": "BL:Q2:ISET",
+        "einzel.voltage": "BL:EL:VSET",
+        "steerer.x": "BL:STEER:X",
+        "steerer.y": "BL:STEER:Y",
+        "source.voltage": "BL:SRC:VSET",
+    }
 
     def __init__(self) -> None:
         super().__init__()
         self._iteration = 0
         self._target_iterations = 40
         self._values: list[float] = []
+        self._pv_request = None
+        self._pvs_loaded = False
         self._timer = QTimer(self)
         self._timer.setInterval(180)
         self._timer.timeout.connect(self._next_iteration)
@@ -67,6 +81,34 @@ class TuningPage(QWidget):
         self.tabs.setTabEnabled(2, False)
         layout.addWidget(self.tabs, 1)
 
+    def showEvent(self, event) -> None:  # noqa: N802
+        """首次显示时按受控映射刷新 PV 列（系统设置里改过 PV 后本页跟着变）。"""
+        super().showEvent(event)
+        self._load_pvs()
+
+    def _load_pvs(self) -> None:
+        if self._pvs_loaded or (self._pv_request is not None and self._pv_request.isRunning()):
+            return
+        settings = QSettings("SpectrumPlatform", "DesktopClient")
+        base_url = str(settings.value("service/instrumentUrl", "http://127.0.0.1:8765"))
+        self._pv_request = PvMappingRequestThread(base_url, None, self)
+        self._pv_request.completed.connect(self._apply_pvs)
+        self._pv_request.start()
+
+    def _apply_pvs(self, result: dict) -> None:
+        """把映射里的 PV 名填进 PV 列；服务不可达时保留回退值。"""
+        if not result["ok"]:
+            return
+        mapping = pv_by_signal(result["config"])
+        if not mapping:
+            return
+        for row, (signal, *_rest) in enumerate(self.PARAMETERS):
+            pv = mapping.get(signal)
+            item = self.parameter_table.item(row, 6)
+            if pv and item is not None:
+                item.setText(pv)
+        self._pvs_loaded = True
+
     def _configuration_tab(self) -> QWidget:
         tab = QWidget()
         layout = QHBoxLayout(tab)
@@ -78,7 +120,7 @@ class TuningPage(QWidget):
         self.parameter_table.setHorizontalHeaderLabels(
             ("启用", "设备参数", "当前值", "下限", "上限", "步长", "PV")
         )
-        for row, values in enumerate(self.PARAMETERS):
+        for row, (signal, name, current, lower, upper, step) in enumerate(self.PARAMETERS):
             enabled = QTableWidgetItem()
             enabled.setFlags(
                 Qt.ItemFlag.ItemIsEnabled
@@ -87,10 +129,13 @@ class TuningPage(QWidget):
             )
             enabled.setCheckState(Qt.CheckState.Checked if row < 5 else Qt.CheckState.Unchecked)
             self.parameter_table.setItem(row, 0, enabled)
+            values = (name, current, lower, upper, step, self.FALLBACK_PVS.get(signal, ""))
             for column, value in enumerate(values, start=1):
                 item = QTableWidgetItem(value)
                 if column in (1, 2, 6):
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if column == 6:
+                    item.setToolTip(f"业务信号：{signal}")
                 self.parameter_table.setItem(row, column, item)
         header = self.parameter_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)

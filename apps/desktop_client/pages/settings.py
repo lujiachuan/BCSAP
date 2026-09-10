@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QSettings, QThread, Signal
+from PySide6.QtCore import QSettings, Qt, QThread, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -28,7 +29,8 @@ from PySide6.QtWidgets import (
 
 from apps.desktop_client.pages.common import page_layout
 from apps.desktop_client.pages.registry import PageSpec
-from apps.desktop_client.theme import theme_name
+from apps.desktop_client.pv_mapping_api import PvMappingRequestThread
+from apps.desktop_client.theme import current_palette, theme_name
 from apps.desktop_client.widgets import PageHeading, Panel
 
 # 系统设置页使用的默认服务地址（开发基线，对应 README 的启动方式）。
@@ -37,17 +39,15 @@ DEFAULT_SERVICE_URLS = {
     "instrument": "http://127.0.0.1:8765",
 }
 
-# PV 映射预览表（模拟阶段示例，与自动调束参数页一致）。
-# 方案文档 6.2：真实阶段由受控设备配置提供“业务信号 → PV”映射，
-# 执行服务启动时完整校验；运行中不允许普通用户随意输入任意 PV 名。
-PV_MAPPING = (
-    ("Q1 电流", "BL:Q1:ISET", "A", "设定与读回"),
-    ("Q2 电流", "BL:Q2:ISET", "A", "设定与读回"),
-    ("Einzel 电压", "BL:EL:VSET", "kV", "设定与读回"),
-    ("X 偏转", "BL:STEER:X", "V", "设定与读回"),
-    ("Y 偏转", "BL:STEER:Y", "V", "设定与读回"),
-    ("Source 电压", "BL:SRC:VSET", "kV", "设定与读回"),
+# 受控设备 PV 映射（业务信号 → 真实 EPICS PV）。
+# 方案文档 6.2：映射是执行服务持有的受控配置，客户端只通过 API 读写，
+# 不直接访问 IOC；保存由执行服务校验并立即生效。
+PV_GATEWAYS = (
+    ("模拟 EPICS（无 IOC 的开发/演示）", "simulated"),
+    ("真实 EPICS 通道访问（CA）", "channel-access"),
 )
+# 表格列：设备参数 / 业务信号 / PV 名称 / 单位 / 可写 / 必需
+PV_COLUMNS = ("设备参数", "业务信号", "PV 名称", "单位", "可写", "必需")
 
 LOG_LEVELS = (("调试", "debug"), ("信息", "info"), ("警告", "warning"), ("错误", "error"))
 
@@ -113,9 +113,12 @@ class SystemSettingsPage(QWidget):
         super().__init__()
         self._settings = QSettings("SpectrumPlatform", "DesktopClient")
         self._probe_thread: ConnectionProbeThread | None = None
+        self._pv_request: PvMappingRequestThread | None = None
+        self._pv_loaded = False
+        self._pv_config_version = 1
         layout = page_layout(self)
         layout.addWidget(
-            PageHeading("系统设置", "配置服务连接、查看 PV 映射、设定日志级别与外观。")
+            PageHeading("系统设置", "配置服务连接、编辑 PV 映射、设定日志级别与外观。")
         )
         section_names = ("服务与连接", "PV 映射", "日志与权限", "外观")
         self.settings_selector = QComboBox(objectName="settingsSelector")
@@ -163,9 +166,10 @@ class SystemSettingsPage(QWidget):
             self.settings_selector.setCurrentIndex(index)
 
     def showEvent(self, event) -> None:  # noqa: N802
-        """切到本页时把主题单选钮与当前主题同步。"""
+        """切到本页时同步主题单选钮，并在首次显示时拉取 PV 映射。"""
         super().showEvent(event)
         self._sync_theme_radio()
+        self._load_pv_mapping()
 
     def sync_theme_radio(self) -> None:
         """外部（侧栏按钮）切换主题后同步页内单选钮状态。"""
@@ -279,27 +283,236 @@ class SystemSettingsPage(QWidget):
         layout.setContentsMargins(0, 16, 0, 0)
         layout.setSpacing(14)
 
-        panel = Panel("业务信号 → PV 映射（示例）", "自动调束参数")
-        table = QTableWidget(len(PV_MAPPING), 4)
-        table.setHorizontalHeaderLabels(("设备参数", "PV 名称", "单位", "用途"))
-        for row, (name, pv, unit, usage) in enumerate(PV_MAPPING):
-            for column, value in enumerate((name, pv, unit, usage)):
-                table.setItem(row, column, QTableWidgetItem(value))
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        table.verticalHeader().setVisible(False)
-        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        table.setAlternatingRowColors(True)
-        panel.body.addWidget(table)
+        panel = Panel("业务信号 → PV 映射", "执行服务受控配置 · 保存后立即生效")
+        form = QFormLayout()
+        self.pv_gateway = QComboBox()
+        for display, key in PV_GATEWAYS:
+            self.pv_gateway.addItem(display, key)
+        self.pv_gateway.setToolTip(
+            "模拟模式不连任何设备；真实模式通过 Channel Access 读写现场 IOC。"
+        )
+        form.addRow("网关模式", self.pv_gateway)
+        self.pv_ca_lib_dir = QLineEdit()
+        self.pv_ca_lib_dir.setPlaceholderText(
+            "留空自动发现；也可填 ca.dll 所在目录"
+        )
+        form.addRow("CA 库目录", self.pv_ca_lib_dir)
+        panel.body.addLayout(form)
+
+        self.pv_table = QTableWidget(0, len(PV_COLUMNS))
+        self.pv_table.setHorizontalHeaderLabels(PV_COLUMNS)
+        header = self.pv_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.pv_table.verticalHeader().setVisible(False)
+        self.pv_table.setAlternatingRowColors(True)
+        self.pv_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.pv_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        panel.body.addWidget(self.pv_table)
+
+        actions = QHBoxLayout()
+        self.pv_feedback = QLabel("", objectName="mutedText")
+        self.pv_feedback.setWordWrap(True)
+        actions.addWidget(self.pv_feedback, 1)
+        add_row = QPushButton("新增行")
+        add_row.clicked.connect(self._add_pv_row)
+        remove_row = QPushButton("删除选中行")
+        remove_row.clicked.connect(self._remove_pv_rows)
+        reload_button = QPushButton("重新载入")
+        reload_button.clicked.connect(lambda: self._load_pv_mapping(force=True))
+        self.pv_save_button = QPushButton("保存映射", objectName="primaryButton")
+        self.pv_save_button.clicked.connect(self._save_pv_mapping)
+        for button in (add_row, remove_row, reload_button):
+            actions.addWidget(button)
+        actions.addWidget(self.pv_save_button)
+        panel.body.addLayout(actions)
+
         note = QLabel(
-            "说明：本表为模拟阶段的示例 PV，当前不会写入真实设备。按方案文档 6.2，"
-            "真实接入时由受控设备配置提供“业务信号 → PV”映射并在执行服务启动时完整校验；"
-            "运行中不允许普通用户随意输入任意 PV 名。扫谱采集 PV 清单待设备联调确定。"
+            "说明：这里的 PV 就是现场 IOC 上的真实 PV 名，保存后健康检查、调束与扫谱"
+            "都会按新映射执行；「可写」决定允许下发设定值，「必需」决定该 PV 掉线时"
+            "是否判定设备不可用。真实模式下写入仍受参数边界与设备联锁约束。"
         )
         note.setWordWrap(True)
         panel.body.addWidget(note)
         layout.addWidget(panel, 1)
         return tab
+
+    # ---- PV 映射：载入与渲染 ----
+
+    def _instrument_base_url(self) -> str:
+        """优先用界面上未保存的输入，其次用已保存的服务地址。"""
+        typed = self.instrument_url.text().strip()
+        if typed:
+            return typed
+        return str(
+            self._settings.value("service/instrumentUrl", DEFAULT_SERVICE_URLS["instrument"])
+        )
+
+    def _load_pv_mapping(self, force: bool = False) -> None:
+        """从执行服务拉取当前映射；默认只在首次显示时拉，避免覆盖未保存的编辑。"""
+        if self._pv_request is not None and self._pv_request.isRunning():
+            return
+        if self._pv_loaded and not force:
+            return
+        self._set_pv_feedback("idle", "正在读取 PV 映射…")
+        self._start_pv_request(payload=None)
+
+    def _start_pv_request(self, payload: dict | None) -> None:
+        self.pv_save_button.setEnabled(False)
+        self._pv_request = PvMappingRequestThread(self._instrument_base_url(), payload, self)
+        self._pv_request.completed.connect(self._finish_pv_request)
+        self._pv_request.finished.connect(self._release_pv_request)
+        self._pv_request.start()
+
+    def _release_pv_request(self) -> None:
+        self.pv_save_button.setEnabled(True)
+        if self._pv_request is not None:
+            self._pv_request.deleteLater()
+            self._pv_request = None
+
+    def _finish_pv_request(self, result: dict) -> None:
+        if not result["ok"]:
+            self._mark_pv_issues(result["issues"])
+            self._set_pv_feedback("error", result["message"])
+            return
+        self._render_pv_mapping(result["config"])
+        self._pv_loaded = True
+
+    def _render_pv_mapping(self, config: dict) -> None:
+        entries = config.get("entries", [])
+        self._pv_config_version = int(config.get("version", 1))
+        self.pv_table.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
+            self._set_pv_text(row, 0, entry.get("label", ""))
+            self._set_pv_text(row, 1, entry.get("signal", ""))
+            self._set_pv_text(row, 2, entry.get("pv", ""))
+            self._set_pv_text(row, 3, entry.get("unit", ""))
+            self._set_pv_flag(row, 4, bool(entry.get("writable", True)))
+            self._set_pv_flag(row, 5, bool(entry.get("required", True)))
+        for row in range(self.pv_table.rowCount()):
+            self._clear_pv_row_marks(row)
+        index = self.pv_gateway.findData(config.get("gateway", "simulated"))
+        if index >= 0:
+            self.pv_gateway.setCurrentIndex(index)
+        self.pv_ca_lib_dir.setText(str(config.get("ca_lib_dir", "")))
+        self._set_pv_feedback(
+            "good" if config.get("gateway") == "channel-access" else "idle",
+            f"已载入 {len(entries)} 条映射（网关：{self._pv_gateway_label()}）。",
+        )
+        self.pv_save_button.setEnabled(True)
+
+    def _pv_gateway_label(self) -> str:
+        return "真实 EPICS" if self.pv_gateway.currentData() == "channel-access" else "模拟"
+
+    # ---- PV 映射：表格增删改 ----
+
+    def _add_pv_row(self) -> None:
+        row = self.pv_table.rowCount()
+        self.pv_table.insertRow(row)
+        self._set_pv_text(row, 0, "新参数")
+        self._set_pv_text(row, 1, "")
+        self._set_pv_text(row, 2, "")
+        self._set_pv_text(row, 3, "")
+        self._set_pv_flag(row, 4, True)
+        self._set_pv_flag(row, 5, True)
+        self.pv_table.setCurrentCell(row, 1)
+        self.pv_table.editItem(self.pv_table.item(row, 1))
+
+    def _remove_pv_rows(self) -> None:
+        rows = sorted({index.row() for index in self.pv_table.selectedIndexes()})
+        if not rows:
+            self._set_pv_feedback("error", "请先在表格中选择要删除的行。")
+            return
+        for row in reversed(rows):
+            self.pv_table.removeRow(row)
+        self._set_pv_feedback("idle", f"已删除 {len(rows)} 行，点击“保存映射”生效。")
+
+    def _save_pv_mapping(self) -> None:
+        self._clear_all_pv_marks()
+        payload = self._collect_pv_mapping()
+        self._set_pv_feedback("idle", "正在保存…")
+        self._start_pv_request(payload=payload)
+
+    def _collect_pv_mapping(self) -> dict:
+        entries = []
+        for row in range(self.pv_table.rowCount()):
+            entries.append(
+                {
+                    "label": self._pv_text(row, 0),
+                    "signal": self._pv_text(row, 1),
+                    "pv": self._pv_text(row, 2),
+                    "unit": self._pv_text(row, 3),
+                    "writable": self._pv_flag(row, 4),
+                    "required": self._pv_flag(row, 5),
+                }
+            )
+        return {
+            "version": self._pv_config_version,
+            "gateway": self.pv_gateway.currentData(),
+            "ca_lib_dir": self.pv_ca_lib_dir.text().strip(),
+            "entries": entries,
+        }
+
+    # ---- PV 映射：单元格读写与标红 ----
+
+    def _pv_text(self, row: int, column: int) -> str:
+        item = self.pv_table.item(row, column)
+        return item.text().strip() if item is not None else ""
+
+    def _set_pv_text(self, row: int, column: int, value: str) -> None:
+        self.pv_table.setItem(row, column, QTableWidgetItem(value))
+
+    def _pv_flag(self, row: int, column: int) -> bool:
+        item = self.pv_table.item(row, column)
+        return item is not None and item.checkState() == Qt.CheckState.Checked
+
+    def _set_pv_flag(self, row: int, column: int, checked: bool) -> None:
+        item = QTableWidgetItem()
+        item.setFlags(
+            Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsSelectable
+            | Qt.ItemFlag.ItemIsUserCheckable
+        )
+        item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        self.pv_table.setItem(row, column, item)
+
+    def _mark_pv_issues(self, issues: list) -> None:
+        """按校验结果逐行标红；整体性问题（index<0）只显示在提示里。"""
+        self._clear_all_pv_marks()
+        fields = {name: index for index, name in enumerate(("label", "signal", "pv", "unit"))}
+        brush = QColor(current_palette()["dangerBg"])
+        messages: list[str] = []
+        for issue in issues:
+            row = int(issue.get("index", -1))
+            field = str(issue.get("field", ""))
+            message = str(issue.get("message", ""))
+            messages.append(f"第 {row + 1} 行：{message}" if row >= 0 else message)
+            if row < 0 or field not in fields:
+                continue
+            item = self.pv_table.item(row, fields[field])
+            if item is not None:
+                item.setBackground(brush)
+                item.setToolTip(message)
+        self._set_pv_feedback("error", " ".join(messages))
+
+    def _clear_all_pv_marks(self) -> None:
+        for row in range(self.pv_table.rowCount()):
+            self._clear_pv_row_marks(row)
+
+    def _clear_pv_row_marks(self, row: int) -> None:
+        for column in range(self.pv_table.columnCount()):
+            item = self.pv_table.item(row, column)
+            if item is not None:
+                item.setBackground(Qt.GlobalColor.transparent)
+                item.setToolTip("")
+
+    def _set_pv_feedback(self, state: str, message: str) -> None:
+        self.pv_feedback.setText(message)
+        self.pv_feedback.setProperty("state", state)
+        self.pv_feedback.style().unpolish(self.pv_feedback)
+        self.pv_feedback.style().polish(self.pv_feedback)
 
     # ---------- 日志与权限 ----------
 
