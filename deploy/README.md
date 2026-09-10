@@ -19,7 +19,27 @@
 
 ## 2. 构建可执行程序（PyInstaller）
 
-前置：已按 README §7 建好 `.venv` 并安装对应依赖；构建脚本会自动补装 PyInstaller（首次需联网）。
+### 2.1 一键打包（推荐）
+
+**双击 `deploy\packaging\build-all.cmd`** 即可：脚本会自动补建 `.venv`（需要本机装 Python 3.12）、安装依赖与 PyInstaller，
+然后依次构建客户端、仪器服务、数据服务，组装操作电脑整包，并生成分发用 zip 压缩包，最后打开 `dist` 目录。
+
+```text
+dist/
+├─ SpectrumPlatform-Operator\          # 操作/检索电脑同一份，拷这个文件夹（或其 zip）
+│  ├─ spectrum-client\spectrum-client.exe
+│  └─ spectrum-instrument-service\spectrum-instrument-service.exe
+├─ SpectrumPlatform-Operator.zip       # 分发压缩包（含顶层目录）
+├─ spectrum-client.zip                 # 仅客户端（可选的精简分发）
+├─ spectrum-data-service\...           # 服务器端（配合 PostgreSQL）
+└─ spectrum-data-service.zip
+```
+
+可选参数：`build-all.cmd /nozip`（跳过压缩）、`build-all.cmd /nopause`（结束不暂停，供自动化调用）、
+`build-all.cmd /dry`（只打印将要执行的步骤，不实际构建）。
+首次运行需要联网（下载依赖），之后可离线重复打包。全流程约 6 分钟（含三个程序打包与压缩）。
+
+### 2.2 手动分步构建
 
 ```powershell
 # 在仓库根目录执行
@@ -31,6 +51,7 @@
 #     dist\SpectrumPlatform-Operator\
 #     ├─ spectrum-client\spectrum-client.exe
 #     └─ spectrum-instrument-service\spectrum-instrument-service.exe
+.\deploy\packaging\build.ps1 -Target release     # = operator-package + data-service + 全部 zip
 ```
 
 产物（onedir 文件夹版，需整体分发，不能只拷 exe）：
@@ -46,9 +67,11 @@ dist/SpectrumPlatform-Operator/                     # 操作电脑整包（见�
 `dist\SpectrumPlatform-Operator\` 整个文件夹拷到操作电脑，双击其中的
 `spectrum-client\spectrum-client.exe`。客户端启动时探测
 `http://127.0.0.1:8765/control/v1/health/live`，不可达就自动以隐藏窗口
-拉起同目录的 `spectrum-instrument-service.exe`，就绪后才进入主界面；
-纯检索电脑只拷 `dist\spectrum-client\`（没有服务文件夹，客户端不会尝试
-拉起任何东西）。退出策略由 QSettings 键 `instrument/stopServiceOnExit`
+拉起同目录的 `spectrum-instrument-service.exe`，就绪后才进入主界面。
+**检索/分析电脑用同一份整包即可**（不必单独裁剪）：客户端同样会拉起本机服务，
+但该机连不到控制网 → PV 健康检查失败 → 扫谱/调束入口自动禁用；
+`spectrum-client.zip` 只是可选的精简分发形态。
+退出策略由 QSettings 键 `instrument/stopServiceOnExit`
 控制（默认 `true`＝关界面带走服务，适合骨架阶段；接真实扫谱后建议改为
 `false` 并改用 NSSM/任务计划常驻）。开发/测试可用环境变量
 `SPECTRUM_INSTRUMENT_EXE` 覆盖服务 exe 路径。
