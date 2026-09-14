@@ -113,6 +113,36 @@ def role_for(signal: str, writable: bool) -> str:
     raise ValueError(f"无法归类信号角色，请在 device_profiles.role_for 中补充规则：{signal}")
 
 
+# 可作为自动调束**变量**的设定量：真正改变束流的那几类连续量。
+# 磁铁的 ``.current_rate_setpoint`` 是**保护参数**（变化速率上限），不是被优化量：
+# 把它当变量去"优化"，优化器会去调变化快慢，既没物理意义、又会让设备运动变得不可预测。
+_TUNABLE_SETPOINT_SUFFIXES = (
+    ".flow_setpoint",
+    ".power_setpoint",
+    ".power_5k_setpoint",
+    ".voltage_setpoint",
+    ".current_setpoint",
+)
+_NOT_TUNABLE_SUFFIXES = (".current_rate_setpoint",)
+# 可作为调束**目标**的量：只有束流测量（法拉第杯）。气压、电压回读这类只读量
+# 不该出现在"最大化目标"下拉框里。
+_BEAM_TARGET_SUFFIXES = (".beam_current",)
+
+
+def tunable_for(signal: str, role: str) -> bool:
+    """该设定量是否允许作为自动调束的可调变量（默认不允许）。"""
+    if role != "setpoint":
+        return False
+    if signal.endswith(_NOT_TUNABLE_SUFFIXES):
+        return False
+    return signal.endswith(_TUNABLE_SETPOINT_SUFFIXES)
+
+
+def beam_target_for(signal: str) -> bool:
+    """该只读量是否可作为调束目标（束流测量）。"""
+    return signal.endswith(_BEAM_TARGET_SUFFIXES)
+
+
 def _build_entries() -> list[PvMappingEntry]:
     entries: list[PvMappingEntry] = []
 
@@ -256,6 +286,7 @@ def _build_entries() -> list[PvMappingEntry]:
                pv=f"{prefix}:CurrentSet", unit="A", writable=True, required=False,
                group=GROUP_MAGNET,
                readback_signal=f"magnet.m{n}.current_readback",
+               rate_signal=f"magnet.m{n}.current_rate_setpoint",
                min_value=0.0, max_value=MAG_CURRENT_MAX,
                max_step=100.0, max_rate=50.0, settle_tol=0.5, settle_timeout=60.0),
             _e(signal=f"magnet.m{n}.current_rate_setpoint",
@@ -293,9 +324,22 @@ def _build_entries() -> list[PvMappingEntry]:
 
 
 def _with_roles(entries: list[PvMappingEntry]) -> tuple[PvMappingEntry, ...]:
-    """给每条映射补上 role。"""
+    """给每条映射补上 role 与**调束用途标记**。
+
+    标记同样是**按命名规则推导**而不是逐条手写：128 条里有一半是循环生成的，
+    漏标一条的后果是界面上少一个可调参数、或者把不该优化的量（磁铁速率）列进去。
+    规则本身受 ``tests/test_signal_io.py`` 的用例保护。
+    """
     return tuple(
-        entry.model_copy(update={"role": role_for(entry.signal, entry.writable)})
+        entry.model_copy(
+            update={
+                "role": role_for(entry.signal, entry.writable),
+                "tunable": tunable_for(
+                    entry.signal, role_for(entry.signal, entry.writable)
+                ),
+                "beam_target": beam_target_for(entry.signal),
+            }
+        )
         for entry in entries
     )
 

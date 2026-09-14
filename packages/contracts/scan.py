@@ -20,8 +20,13 @@ class ScanAxis(BaseModel):
 
     成组扫描（如四路磁铁一起走）时 ``setpoint_signals`` 有多项，
     每点把这些信号写到同一个目标值，而 ``readback_signal`` 取其中一路
-    的实际回读作为该点的坐标——成组时各路回读应当一致，不一致本身就是
-    值得记录的现象（见 ``ScanPoint.coordinate_spread``）。
+    的实际回读作为该点的坐标。
+
+    **每一路的到位判定不用这个字段**：执行服务按每条设定信号在 PV 映射里的
+    ``readback_signal`` 逐路等稳定（没有配回读的条目退化为读它自己的 PV），
+    只要有一路没进容差就不算到位——只看 ``readback_signal`` 会把"第一台到位、
+    其余卡住"记成好点。各路实际回读见 ``ScanPoint.readback_values`` 与
+    ``coordinate_spread``。
     """
 
     model_config = ConfigDict(strict=True)
@@ -31,6 +36,53 @@ class ScanAxis(BaseModel):
     readback_signal: str
     # 可选：把坐标换算成质量（u）的多项式系数 a0..a3，仅用于展示与导出
     mass_coefficients: list[float] = []
+
+
+class RetractSpec(BaseModel):
+    """扫描收尾（回落）参数：把磁场退回一个安全值再结束任务。
+
+    回落属于**设备安全收尾**，由执行服务在完成前执行：先写各路速率、再写各路
+    电流、逐路等回读到位，全部到位才算完成。放在客户端做会有两个后果——
+    客户端退出/崩溃就不回落；只写第一路会让其余磁铁停在扫描结束时的电流上。
+    """
+
+    model_config = ConfigDict(strict=True)
+
+    current_a: float
+    # 回落速率（单位/秒）；写进映射里配的 rate_signal，没有配就只按 max_step 分步
+    rate_a_s: float | None = None
+    # 完成后是否自动回落；False 表示只由操作员手动触发
+    auto: bool = True
+
+    @field_validator("current_a", "rate_a_s", mode="before")
+    @classmethod
+    def _coerce_number(cls, value: object) -> object:
+        if value is None or isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return float(value)
+        return value
+
+
+class MagnetRetractRequest(BaseModel):
+    """手动成组回落请求（与扫描收尾走同一套服务端逻辑）。"""
+
+    model_config = ConfigDict(strict=True)
+
+    setpoint_signals: list[str]
+    current_a: float
+    rate_a_s: float | None = None
+    timeout_s: float = 60.0
+
+
+class MagnetRetractResponse(BaseModel):
+    """成组回落结果：逐路实际回读 + 是否全部到位。"""
+
+    model_config = ConfigDict(strict=True)
+
+    ok: bool
+    message: str
+    applied: dict[str, float] = {}
 
 
 class ScanRunRequest(BaseModel):
@@ -52,6 +104,8 @@ class ScanRunRequest(BaseModel):
     settle_timeout_s: float = 20.0
     # 回读未稳定时的处理："record" 记下该点并标注质量；"fail" 直接判定任务失败
     on_unsettled: str = "record"
+    # 扫描收尾回落；None 表示不回落（旧客户端行为不变）
+    retract: RetractSpec | None = None
 
     @field_validator("start", "stop", "step", "dwell_s", mode="before")
     @classmethod
@@ -95,6 +149,8 @@ class ScanPoint(BaseModel):
     at: str
     # 成组扫描时各路回读的最大差值；单路扫描恒为 0
     coordinate_spread: float = 0.0
+    # 每一路回读信号的实际读数（键为回读信号名）；单路扫描也记，便于事后核对
+    readback_values: dict[str, float] = {}
     detail: str | None = None
     # 是否进入谱图（质量不合格的点不进 x/y 数组，但保留在点列表里可追溯）
     included: bool = True

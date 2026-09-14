@@ -6,8 +6,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from fastapi import HTTPException
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from fastapi import HTTPException
+from PySide6.QtCore import QSettings
+
+from apps.desktop_client.pages import SystemSettingsPage
 from apps.instrument_service import pv_mapping
 from apps.instrument_service.app import create_app
 from apps.instrument_service.runtime import InstrumentRuntime
@@ -164,6 +168,30 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(leftovers, [])
 
 
+    def test_rate_signal_must_exist_and_be_writable(self) -> None:
+        """速率配错不会当场报错，只会在成组回落时静默不下发速率——必须拦住。"""
+        missing = config_with(
+            entry().model_copy(update={"rate_signal": "magnet.m1.current_rate_setpoint"})
+        )
+        issues = pv_mapping.validate_config(missing)
+
+        self.assertIn((0, "rate_signal"), {(i.index, i.field) for i in issues})
+        self.assertIn("不在映射里", issues[0].message)
+
+        readonly = config_with(
+            entry().model_copy(update={"rate_signal": "steerer.x"}),
+            entry(signal="steerer.x", label="X 偏转", pv="BL:STEER:X", writable=False),
+        )
+        issues = pv_mapping.validate_config(readonly)
+
+        self.assertIn((0, "rate_signal"), {(i.index, i.field) for i in issues})
+        self.assertIn("不可写", " ".join(i.message for i in issues))
+
+    def test_default_config_rate_signals_are_valid(self) -> None:
+        """真实设备档案里的 rate_signal 必须指向存在且可写的信号。"""
+        self.assertEqual(pv_mapping.validate_config(pv_mapping.default_config()), [])
+
+
 class MappingApiTests(unittest.TestCase):
     """接口层测试：PUT/GET 与健康检查的联动。
 
@@ -248,6 +276,111 @@ class MappingApiTests(unittest.TestCase):
             [item.signal for item in health.items],
             ["quadrupole.q1.current", "steerer.x"],
         )
+
+
+class SettingsPageRoundTripTests(unittest.TestCase):
+    """设置页「保存映射」的整链回归：真实默认映射走一遍表格，安全字段不能丢。
+
+    报告 §7.1 把这条列为 P0 正确性问题：表格只显示 6 个常用字段，其余安全字段
+    （分组/角色/回读配对/边界/最大单步/最大速率/稳定判据）必须按行合并回去。
+    这里跑**真实默认映射**（128 条）而不是手写两条，避免只覆盖到某一类字段。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self._directory = tempfile.TemporaryDirectory()
+        self._previous = {
+            key: os.environ.get(key)
+            for key in ("SPECTRUM_PV_MAPPING", "EPICS_CA_ADDR_LIST", "EPICS_CA_AUTO_ADDR_LIST")
+        }
+        os.environ["SPECTRUM_PV_MAPPING"] = str(
+            Path(self._directory.name) / "pv_mapping.json"
+        )
+        os.environ["EPICS_CA_ADDR_LIST"] = "127.0.0.1"
+        os.environ["EPICS_CA_AUTO_ADDR_LIST"] = "NO"
+        self.runtime = InstrumentRuntime(pv_mapping.default_config())
+        self.app_instance = create_app(self.runtime)
+        self.get_mapping = route_endpoint(
+            self.app_instance, "/control/v1/pv-mapping", "GET"
+        )
+        self.put_mapping = route_endpoint(
+            self.app_instance, "/control/v1/pv-mapping", "PUT"
+        )
+
+    def tearDown(self) -> None:
+        self.runtime.close()
+        for key, value in self._previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self._directory.cleanup()
+
+    def make_page(self) -> SystemSettingsPage:
+        settings = QSettings(
+            str(Path(self._directory.name) / "settings.ini"),
+            QSettings.Format.IniFormat,
+        )
+        return SystemSettingsPage(settings)
+
+    def test_saving_the_untouched_mapping_changes_nothing(self) -> None:
+        """操作员啥都不改就点保存：落盘结果必须与加载前**逐字段**一致。"""
+        original = pv_mapping.default_config()
+        page = self.make_page()
+        page._render_pv_mapping(original.model_dump())
+
+        self.put_mapping(PvMappingConfig.model_validate(page._collect_pv_mapping()))
+
+        saved = self.get_mapping()
+        self.assertEqual(len(saved.entries), len(original.entries))
+        for before, after in zip(original.entries, saved.entries):
+            self.assertEqual(after, before, before.signal)
+
+    def test_safety_fields_survive_editing_a_visible_field(self) -> None:
+        original = pv_mapping.default_config()
+        page = self.make_page()
+        page._render_pv_mapping(original.model_dump())
+        page._set_pv_text(0, 2, "Part1:Flow_W:CS200A:Setpoint")
+
+        self.put_mapping(PvMappingConfig.model_validate(page._collect_pv_mapping()))
+
+        saved = self.get_mapping()
+        self.assertEqual(saved.entries[0].pv, "Part1:Flow_W:CS200A:Setpoint")
+        self.assertEqual(saved.entries[0].max_step, original.entries[0].max_step)
+        self.assertEqual(saved.entries[0].settle_tol, original.entries[0].settle_tol)
+        self.assertEqual(saved.entries[0].group, original.entries[0].group)
+        self.assertEqual(saved.entries[0].role, original.entries[0].role)
+
+    def test_service_does_not_backfill_missing_safety_fields(self) -> None:
+        """确认服务端不会替客户端兜底：只发 6 个字段时安全参数确实会消失。
+
+        这条是上面两个用例存在的理由——如果哪天服务端改成"缺字段就沿用旧值"，
+        这里会失败，提醒可以把合并逻辑简化掉。
+        """
+        original = pv_mapping.default_config()
+        trimmed = {
+            "version": original.version,
+            "entries": [
+                {
+                    key: value
+                    for key, value in item.model_dump().items()
+                    if key in ("label", "signal", "pv", "unit", "writable", "required")
+                }
+                for item in original.entries
+            ],
+        }
+
+        self.put_mapping(PvMappingConfig.model_validate(trimmed))
+
+        saved = self.get_mapping()
+        self.assertEqual(saved.entries[0].max_step, None)
+        self.assertEqual(saved.entries[0].group, "")
+        self.assertNotEqual(saved, original)
 
 
 if __name__ == "__main__":

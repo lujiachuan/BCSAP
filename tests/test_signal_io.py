@@ -6,6 +6,8 @@
 
 import unittest
 
+from fastapi import HTTPException
+
 from apps.instrument_service import pv_mapping
 from apps.instrument_service.app import create_app
 from apps.instrument_service.pv_health import create_simulated_gateway
@@ -356,6 +358,83 @@ class SignalApiTests(unittest.TestCase):
 
     def test_read_endpoint_with_empty_list_returns_all(self) -> None:
         self.assertEqual(len(self.read(SignalSnapshotRequest()).readings), 2)
+
+    def test_read_endpoint_reports_unknown_signal_as_400(self) -> None:
+        """名字写错要能定位：以前是未捕获异常 → 调用方只看到 HTTP 500。"""
+        with self.assertRaises(HTTPException) as caught:
+            self.read(SignalSnapshotRequest(signals=["gas.ar.flow_setpiont"]))
+
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("gas.ar.flow_setpiont", str(caught.exception.detail))
+
+    def test_readback_works_on_a_cold_gateway(self) -> None:
+        """冷启动的第一次回读必须能成功。
+
+        真实 CA 网关要先建连才算可用；``readback()``/``wait_settled()`` 如果绕过
+        ``_ensure_connected``，冷启动时第一次回读必然失败——调束取启动前快照就会
+        被误判成"读不到"并拒绝启动（真机实测踩到过）。
+        """
+
+        class ColdUntilConnected:
+            """连接之前一律拒绝读（模仿真实 CA 网关的冷启动行为）。"""
+
+            def __init__(self, inner):
+                self._inner = inner
+                self._connected = False
+                self.reads = 0
+
+            def connect(self) -> bool:
+                self._connected = True
+                return True
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def read(self, signal):
+                self.reads += 1
+                if not self._connected:
+                    raise OSError("尚未建立连接")
+                return self._inner.read(signal)
+
+        gateway = ColdUntilConnected(create_simulated_gateway(self.config))
+        signals = SignalWriteService(gateway, self.config, sleep=lambda _s: None)
+        # 这份映射里设定条目没有配 readback_signal，回读会退化为读它自己的 PV
+        entry = next(e for e in self.config.entries if e.writable)
+
+        value = signals.readback(entry)
+
+        self.assertIsNotNone(value, "冷启动第一次回读就失败说明没走建连路径")
+        self.assertTrue(gateway.reads, "确实经过了一次读")
+        self.assertEqual(value, float(gateway.read(entry.signal).value))
+
+    def test_wait_settled_works_on_a_cold_gateway(self) -> None:
+        class ColdUntilConnected:
+            def __init__(self, inner):
+                self._inner = inner
+                self._connected = False
+
+            def connect(self) -> bool:
+                self._connected = True
+                return True
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def read(self, signal):
+                if not self._connected:
+                    raise OSError("尚未建立连接")
+                return self._inner.read(signal)
+
+        inner = create_simulated_gateway(self.config)
+        entry = next(e for e in self.config.entries if e.writable)
+        target = float(inner.read(entry.signal).value)
+        gateway = ColdUntilConnected(inner)
+        signals = SignalWriteService(gateway, self.config, sleep=lambda _s: None)
+
+        settled, value = signals.wait_settled(entry, target, timeout=0.2)
+
+        self.assertTrue(settled, "等稳定也必须能走冷启动路径")
+        self.assertEqual(value, target)
 
     def test_write_endpoint_applies_valid_value(self) -> None:
         result = self.write(

@@ -46,6 +46,10 @@ class PvMappingEntry(BaseModel):
     # ---- 分组与回读配对 ----
     group: str = ""
     readback_signal: str = ""
+    # ---- 变化速率信号的配对（如磁铁 ``CurrentRateSet``）----
+    # 为空表示该设备没有独立的速率设定信号；成组回落时靠它把速率真正下发下去，
+    # 而不是把速率只写在界面提示里。
+    rate_signal: str = ""
 
     # ---- 信号角色：决定界面用什么控件呈现，也供扫描/调束区分设定与测量 ----
     #   "setpoint" 连续设定值（Spinbox + 写入 + 步进）
@@ -53,6 +57,13 @@ class PvMappingEntry(BaseModel):
     #   "pulse"    一次性触发，写 1 后由设备自行复位（启动/停止/复位/灭弧）
     #   "readback" 只读测量值
     role: str = ""
+
+    # ---- 调束用途标记 ----
+    # **默认都不参与**：能写不等于适合当优化变量（磁铁速率、模式量都不是），
+    # 能读也不等于能当目标（气压、电压回读不是束流）。设备档案按命名规则显式标记，
+    # 界面只呈现被标记过的量，避免"凡是可写的都列成变量"。
+    tunable: bool = False
+    beam_target: bool = False
 
     # ---- 执行层写入校验参数（None = 该项不校验）----
     min_value: float | None = None

@@ -53,10 +53,15 @@ class SignalWriteService:
         config: PvMappingConfig,
         *,
         sleep=time.sleep,
+        read_only: bool = False,
     ) -> None:
         self._gateway = gateway
         self._config = config
         self._sleep = sleep
+        # 全局只读部署模式（改造报告 §4.2）：由部署参数启用，**在执行层统一拒绝所有写入**。
+        # 放在这里是刻意的——所有写路径（单点、成组、成组回落、扫谱斜坡、调束下发）
+        # 都经过 write()，一个检查点就能覆盖全平台，不会漏掉某条新加的写路径。
+        self._read_only = bool(read_only)
         self._lock = RLock()
         # ChannelAccessGateway 的 read/write 不会自己建连：没先 connect() 时
         # 读会返回「网关尚未连接」。服务里原本只有健康检查会 connect，
@@ -137,7 +142,19 @@ class SignalWriteService:
 
     def read_value(self, signal: str) -> float | None:
         """读单个信号的当前值；读不到返回 None（不抛）。"""
-        return self._read_entry(self.entry(signal)).value
+        return self._read_signal(signal)
+
+    def _read_signal(self, signal: str) -> float | None:
+        """读一路现场值，并**确保连接已建立**。
+
+        必须走 ``_read_entry``：它内部会 ``_ensure_connected()``。真实 CA 网关在
+        冷启动时第一次访问要建连，绕过它的直读会**必然失败一次**——调束取启动前
+        快照时就会被误判成"读不到"并拒绝启动（实测踩到过：紧接着手工读同一路是好的）。
+        """
+        try:
+            return self._read_entry(self.entry(signal)).value
+        except Exception:  # noqa: BLE001  单路读失败按「读不到」处理，不打断调用方
+            return None
 
     # ------------------------------------------------------------------
     # 写入
@@ -148,6 +165,25 @@ class SignalWriteService:
         同 ``command_id`` 的重复请求返回首次结果，不重复下发设备写命令。
         """
         entry = self.entry(request.signal)
+
+        if self._read_only:
+            # 拒绝在**校验之前**：只读部署下连"这个值是否合法"也不必回答，
+            # 免得调用方以为"参数对了就能写"。
+            return SignalWriteResult(
+                signal=entry.signal,
+                pv=entry.pv,
+                unit=entry.unit,
+                requested=request.value,
+                accepted=False,
+                previous=None,
+                ramp_steps=[],
+                reason=(
+                    "全局只读模式：本执行服务按部署参数禁用了所有写入"
+                    "（去掉只读参数并重启服务后才能下发）"
+                ),
+                device_state_unknown=False,
+                finished_at=_now(),
+            )
 
         if request.command_id:
             with self._lock:
@@ -305,12 +341,11 @@ class SignalWriteService:
     # 回读与稳定判据
     # ------------------------------------------------------------------
     def readback(self, entry: PvMappingEntry) -> float | None:
-        """读回条目对应的实际值（优先 readback_signal，未配置则读自身）。"""
-        target = entry.readback_signal or entry.signal
-        try:
-            return float(self._gateway.read(target).value)
-        except Exception:  # noqa: BLE001  回读失败不应把已成功的写入判为失败
-            return None
+        """读回条目对应的实际值（优先 readback_signal，未配置则读自身）。
+
+        经由 ``_read_signal`` 读，带建连保证——直读网关在冷启动时会失败一次。
+        """
+        return self._read_signal(entry.readback_signal or entry.signal)
 
     def wait_settled(
         self,
@@ -341,10 +376,8 @@ class SignalWriteService:
         source = readback_signal or entry.readback_signal or entry.signal
 
         def current() -> float | None:
-            try:
-                return float(self._gateway.read(source).value)
-            except Exception:  # noqa: BLE001  回读失败按「未知」处理
-                return None
+            # 同样经由 _read_signal：等稳定这条路径在冷启动时也必须是准的
+            return self._read_signal(source)
 
         if tolerance is None:
             return True, current()

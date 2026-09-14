@@ -6,26 +6,35 @@ from packages.contracts import (
     PvMappingConfig,
     PvMappingValidationError,
     ServiceStatus,
+    SignalBatchWriteRequest,
+    SignalBatchWriteResponse,
     SignalSnapshot,
     SignalSnapshotRequest,
     SignalWriteRequest,
     SignalWriteResult,
 )
 from packages.contracts.scan import (
+    MagnetRetractRequest,
+    MagnetRetractResponse,
     ScanPointsResponse,
     ScanRunRequest,
     ScanRunStatus,
 )
 from packages.contracts.tuning import (
+    TuningCatalog,
+    TuningFinalizeRequest,
+    TuningFinalizeResult,
     TuningIterationsResponse,
     TuningRunRequest,
     TuningRunStatus,
 )
 
-from . import pv_mapping
+from . import pv_mapping, tuning_catalog
+from .device_locks import DeviceBusy
 from .runtime import InstrumentRuntime
 from .scan_service import ScanError
 from .scan_store import StoreUnavailable
+from .signal_io import WriteRejected
 from .tuning_service import TuningError
 
 
@@ -41,11 +50,16 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
     @app.get("/control/v1/status", response_model=ServiceStatus)
     def get_status() -> ServiceStatus:
         config = state.config
+        read_only = state.read_only
+        detail = f"真实 EPICS 通道访问；PV 映射 {len(config.entries)} 条"
+        if read_only:
+            detail += "；**全局只读模式**（部署参数启用，所有写入被拒绝）"
         return ServiceStatus(
             service="instrument-service",
             status="ready",
             version=app.version,
-            detail=f"真实 EPICS 通道访问；PV 映射 {len(config.entries)} 条",
+            detail=detail,
+            read_only=read_only,
         )
 
     @app.get("/control/v1/health/live", response_model=ServiceStatus)
@@ -66,8 +80,15 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
 
         单个信号读失败只把该项标为未连接，不影响其余读数——界面可以照常
         显示其余实时值。
+
+        **但请求了映射里不存在的信号名要明确报 400**：以前这里未捕获异常，
+        调用方只看到"HTTP 500"，完全不知道是哪个信号名写错了（导出/快照这类
+        一次读几十路的场景很容易踩到）。
         """
-        return state.signals.read_snapshot(request.signals)
+        try:
+            return state.signals.read_snapshot(request.signals)
+        except WriteRejected as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/control/v1/signals/write", response_model=SignalWriteResult)
     def post_signals_write(request: SignalWriteRequest) -> SignalWriteResult:
@@ -81,6 +102,56 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
         """
         return state.signals.write(request)
 
+    @app.post("/control/v1/signals/write-batch", response_model=SignalBatchWriteResponse)
+    def post_signals_write_batch(
+        request: SignalBatchWriteRequest,
+    ) -> SignalBatchWriteResponse:
+        """成组写入（磁铁 1+2 / 3+4 / 1~4 这类一起下发的动作）。
+
+        ``atomic=true`` 时先整批干跑校验，任何一项不合格就整批不下发——
+        界面循环调单点接口会留下"前两台动了、后两台没动"的中间状态。
+        执行途中的失败逐路返回，不合并成一句"失败"。
+        """
+        return state.write_batch(
+            request.writes, atomic=request.atomic, note=request.note
+        )
+
+    # ------------------------------------------------------------------
+    # 调束可选项（目标白名单 / 变量白名单 / 束线上游关系）
+    # ------------------------------------------------------------------
+    @app.get("/control/v1/tuning/catalog", response_model=TuningCatalog)
+    def get_tuning_catalog() -> TuningCatalog:
+        """按**当前**映射与束线拓扑给出可选目标与变量。"""
+        return tuning_catalog.build_catalog(state.config)
+
+    # ------------------------------------------------------------------
+    # 成组回落（与扫谱收尾同一套服务端逻辑）
+    # ------------------------------------------------------------------
+    @app.post("/control/v1/magnets/retract", response_model=MagnetRetractResponse)
+    def post_magnet_retract(request: MagnetRetractRequest) -> MagnetRetractResponse:
+        """把一组磁铁退到安全值：逐路写速率、逐路写电流、逐路等回读到到位。
+
+        设备组被别人（扫谱/调束）占用时返回 409，不做"绕过锁偷偷写"的处理：
+        回落本身是安全动作，但和别人的任务抢同一台设备只会制造未知状态。
+
+        全局只读部署下不单开 400：每一路写都被执行层拒掉，逐路的理由原样回到
+        ``ok=false`` 的 ``message`` 里（与单点/成组写入「200 + reason」同一口径）。
+        """
+        try:
+            outcome = state.retract_magnets(
+                request.setpoint_signals,
+                request.current_a,
+                request.rate_a_s,
+                timeout_s=request.timeout_s,
+            )
+        except DeviceBusy as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except WriteRejected as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return MagnetRetractResponse(
+            ok=outcome.ok, message=outcome.message, applied=outcome.applied
+        )
+
     # ------------------------------------------------------------------
     # 扫谱任务（架构文档 6.4 / 6.5）
     # ------------------------------------------------------------------
@@ -91,6 +162,16 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
         参数或映射有问题返回 400；同时只允许一个扫谱任务，重复启动返回 409。
         启动即返回初始状态，进度由 GET 状态/点端点轮询。
         """
+        if state.read_only:
+            # 与其让每一步都在写入处被拒（"跑到一半才知道"，还可能留下半截状态），
+            # 不如在启动阶段就说清：只读部署下扫谱这件事本身不成立
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "全局只读模式：本执行服务按部署参数禁用了所有写入，扫谱无法执行。"
+                    "需要扫谱请去掉只读参数并重启服务。"
+                ),
+            )
         try:
             return state.scan.start(request)
         except StoreUnavailable as exc:
@@ -151,6 +232,14 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
         ``awaiting_confirmation`` 与候选参数，必须调 ``/approve`` 才会写设备。
         其它模式返回 400，连续自动写入需另行通过安全评审。
         """
+        if state.read_only:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "全局只读模式：本执行服务按部署参数禁用了所有写入，调束无法执行。"
+                    "需要调束请去掉只读参数并重启服务。"
+                ),
+            )
         try:
             return state.tuning.start(request)
         except TuningError as exc:
@@ -205,6 +294,25 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
         except TuningError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post(
+        "/control/v1/tuning/runs/{run_id}/finalize",
+        response_model=TuningFinalizeResult,
+    )
+    def post_tuning_finalize(
+        run_id: str, request: TuningFinalizeRequest
+    ) -> TuningFinalizeResult:
+        """结束后的设备处置：应用最优参数 / 恢复启动前参数 / 回安全值。
+
+        三种动作都写设备，必须 ``confirm=true``；任务没结束、或处于恢复待确认状态
+        （设备实际状态未知）时一律拒绝。设备组被别的任务占用时返回 409。
+        """
+        try:
+            return state.tuning.finalize(run_id, request.action, confirm=request.confirm)
+        except TuningError as exc:
+            detail = str(exc)
+            code = 409 if "设备组当前不可用" in detail else 400
+            raise HTTPException(status_code=code, detail=detail) from exc
+
     @app.get("/control/v1/pv-mapping", response_model=PvMappingConfig)
     def get_pv_mapping() -> PvMappingConfig:
         return state.config
@@ -215,6 +323,16 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
 
         校验失败返回 400 + 逐行问题清单，客户端按行标红。
         """
+        if state.read_only:
+            # 映射决定"谁能写、写到多少"——只读部署下改它等于绕过只读本身，
+            # 所以这里按写操作拒绝，而不是当成普通配置读写放行
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "全局只读模式：本执行服务按部署参数禁用了所有写入，PV 映射不可修改。"
+                    "需要改映射请去掉只读参数并重启服务。"
+                ),
+            )
         issues = pv_mapping.validate_config(config)
         if issues:
             payload = PvMappingValidationError(

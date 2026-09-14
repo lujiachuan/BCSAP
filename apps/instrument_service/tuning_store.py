@@ -17,7 +17,11 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from packages.contracts.tuning import TuningIteration
+from packages.contracts.tuning import (
+    TuningFinalizeResult,
+    TuningIteration,
+    TuningRecovery,
+)
 
 from .scan_store import default_store_dir
 
@@ -36,7 +40,13 @@ CREATE TABLE IF NOT EXISTS tuning_runs (
     best_objective REAL,
     message       TEXT,
     created_at    TEXT NOT NULL,
-    finished_at   TEXT
+    finished_at   TEXT,
+    -- 启动前快照（各路实际回读）与目标基线；回退审计记录
+    snapshot_json TEXT,
+    baseline_objective REAL,
+    recovery_json TEXT,
+    -- 结束后的处置动作结果（应用最优/恢复初始/回安全值）
+    finalize_json TEXT
 );
 CREATE TABLE IF NOT EXISTS tuning_iterations (
     run_id     TEXT NOT NULL,
@@ -49,9 +59,21 @@ CREATE TABLE IF NOT EXISTS tuning_iterations (
     quality    TEXT NOT NULL,
     detail     TEXT,
     at         TEXT NOT NULL,
+    stage      TEXT,
     PRIMARY KEY (run_id, iteration)
 );
 """
+
+# 建表语句对已存在的表无效，现场已有老库，新增列必须显式补（幂等）
+MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("tuning_runs", "snapshot_json", "TEXT"),
+    ("tuning_runs", "baseline_objective", "REAL"),
+    ("tuning_runs", "recovery_json", "TEXT"),
+    ("tuning_runs", "finalize_json", "TEXT"),
+    # 每一轮属于哪个阶段（逐参数/联合）：老库里的历史轮次没有这一列，读出来是 NULL，
+    # 按"当时不知道"呈现，不猜成联合
+    ("tuning_iterations", "stage", "TEXT"),
+)
 
 
 class TuningStore:
@@ -63,6 +85,19 @@ class TuningStore:
         self._db_path = self.directory / "tuning_spool.sqlite3"
         with self._session() as connection:
             connection.executescript(SCHEMA)
+            self._migrate(connection)
+
+    @staticmethod
+    def _migrate(connection: sqlite3.Connection) -> None:
+        """给现场已有库补新增列（幂等）：删库重建会丢掉还没上传的调束记录。"""
+        for table, column, column_type in MIGRATIONS:
+            existing = {
+                row["name"] for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            if column not in existing:
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"
+                )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._db_path, timeout=10.0)
@@ -131,13 +166,40 @@ class TuningStore:
                 (finished_at, run_id),
             )
 
+    def set_snapshot(
+        self, run_id: str, snapshot: dict[str, float], baseline: float | None
+    ) -> None:
+        """保存启动前快照与目标基线：回退要靠它，复盘也要靠它。"""
+        with self._session() as connection:
+            connection.execute(
+                "UPDATE tuning_runs SET snapshot_json = ?, baseline_objective = ?"
+                " WHERE run_id = ?",
+                (json.dumps(snapshot, ensure_ascii=False), baseline, run_id),
+            )
+
+    def set_recovery(self, run_id: str, recovery: TuningRecovery) -> None:
+        """保存束流丢失保护的执行记录（原因、是否成功、逐路实际回读）。"""
+        with self._session() as connection:
+            connection.execute(
+                "UPDATE tuning_runs SET recovery_json = ? WHERE run_id = ?",
+                (recovery.model_dump_json(), run_id),
+            )
+
+    def set_finalize(self, run_id: str, result: TuningFinalizeResult) -> None:
+        """保存结束后处置动作的结果：事后要能回答"最后把设备放到了哪"。"""
+        with self._session() as connection:
+            connection.execute(
+                "UPDATE tuning_runs SET finalize_json = ? WHERE run_id = ?",
+                (result.model_dump_json(), run_id),
+            )
+
     def append_iteration(self, run_id: str, iteration: TuningIteration) -> None:
         with self._session() as connection:
             connection.execute(
                 "INSERT OR REPLACE INTO tuning_iterations"
                 " (run_id, iteration, proposed_json, applied_json, readback_json,"
-                "  target, objective, quality, detail, at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "  target, objective, quality, detail, at, stage)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     iteration.iteration,
@@ -149,6 +211,7 @@ class TuningStore:
                     iteration.quality,
                     iteration.detail,
                     iteration.at,
+                    iteration.stage,
                 ),
             )
 
@@ -171,6 +234,7 @@ class TuningStore:
                 quality=str(row["quality"]),
                 detail=row["detail"],
                 at=str(row["at"]),
+                stage=row["stage"],
             )
             for row in rows
         ]

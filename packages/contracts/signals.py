@@ -109,3 +109,46 @@ class SignalWriteResult(BaseModel):
     # 「是否已执行未知」，此类失败不能当成「设备没动」，也不能自动重试。
     device_state_unknown: bool = False
     finished_at: str
+
+
+class SignalBatchWriteRequest(BaseModel):
+    """成组写入请求（一次下发一组信号，如磁铁 1+2 / 3+4 / 1~4）。
+
+    **为什么必须由执行服务成批做**：界面循环调单点写接口时，第三台失败就会留下
+    "前两台已经动了、后两台还在原位"的部分成功状态——磁场不均匀比整体不动更危险，
+    而且没有地方记录"这一批本来是一起下的"（改造报告 §4.2）。
+
+    ``atomic=True``：先对**全部**成员做一次干跑校验（边界/单步/速率/可写），
+    任何一项不过就整批不下发，一次都不写设备。
+    """
+
+    model_config = ConfigDict(strict=True)
+
+    writes: list[SignalWriteRequest]
+    atomic: bool = True
+    # 成组动作的说明，写进结果消息与日志，便于现场复盘"这次一起下的是什么"
+    note: str = ""
+
+
+class SignalBatchWriteResponse(BaseModel):
+    """成组写入结果：逐路明细 + 明确的整体结论。
+
+    三种结局要分得清：
+    * ``ok=True`` —— 全部受理并写入；
+    * ``ok=False`` 且 ``nothing_written=True`` —— **整批都没写**（原子校验没过，
+      或设备组被占）；
+    * ``ok=False`` 但有部分 ``accepted`` —— 执行途中失败（设备异常），
+      ``results`` 里逐路标明谁成功、谁状态未知。
+    """
+
+    model_config = ConfigDict(strict=True)
+
+    ok: bool
+    message: str
+    requested: int
+    accepted: int
+    rejected: int
+    results: list[SignalWriteResult] = []
+    locked_groups: list[str] = []
+    # 整批都没写时为 True（原子校验阶段或抢锁阶段就挡住了），界面据此措辞
+    nothing_written: bool = False

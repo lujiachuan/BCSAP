@@ -53,9 +53,17 @@ CREATE TABLE IF NOT EXISTS scan_points (
     spread     REAL NOT NULL DEFAULT 0,
     detail     TEXT,
     at         TEXT NOT NULL,
+    -- 成组扫描时每一路回读信号的实际读数（JSON 对象：回读信号名 → 值）
+    readbacks_json TEXT,
     PRIMARY KEY (run_id, idx)
 );
 """
+
+# 建表语句里的列对**已存在**的表无效，现场 %LOCALAPPDATA% 下已有老 spool 库，
+# 所以新增列必须显式补。表名/列名都是本文件里的常量，不做用户输入拼接。
+MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("scan_points", "readbacks_json", "TEXT"),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +101,7 @@ class ScanStore:
             self._db_path = self.directory / "scan_spool.sqlite3"
             with self._session() as connection:
                 connection.executescript(SCHEMA)
+                self._migrate(connection)
         except OSError as exc:
             # 裸 PermissionError 冒到界面上毫无线索：现场需要知道是哪个目录、
             # 以及怎么改。暂存目录不可写时扫描无法安全保存，宁可明确拒绝。
@@ -105,6 +114,22 @@ class ScanStore:
         connection = sqlite3.connect(self._db_path, timeout=10.0)
         connection.row_factory = sqlite3.Row
         return connection
+
+    @staticmethod
+    def _migrate(connection: sqlite3.Connection) -> None:
+        """给现场已有的库补新增列（幂等：已存在就跳过）。
+
+        ``CREATE TABLE IF NOT EXISTS`` 对已存在的表什么都不做，所以新列只能这样补。
+        直接删库重建等于丢掉现场还没上传的谱图，不能这么干。
+        """
+        for table, column, column_type in MIGRATIONS:
+            existing = {
+                row["name"] for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            if column not in existing:
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"
+                )
 
     @contextmanager
     def _session(self) -> Iterator[sqlite3.Connection]:
@@ -154,11 +179,13 @@ class ScanStore:
             connection.execute(
                 "INSERT OR REPLACE INTO scan_points"
                 " (run_id, idx, target, coordinate, signal, quality, included,"
-                "  spread, detail, at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "  spread, detail, at, readbacks_json)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (run_id, point.index, point.target, point.coordinate, point.signal,
                  point.quality, 1 if point.included else 0, point.coordinate_spread,
-                 point.detail, point.at),
+                 point.detail, point.at,
+                 json.dumps(point.readback_values, ensure_ascii=False)
+                 if point.readback_values else None),
             )
 
     # ------------------------------------------------------------------

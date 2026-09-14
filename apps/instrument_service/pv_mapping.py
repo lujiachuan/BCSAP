@@ -180,6 +180,7 @@ def validate_config(config: PvMappingConfig) -> list[PvMappingIssue]:
 
     seen_signals: dict[str, int] = {}
     seen_pvs: dict[str, int] = {}
+    by_signal = {entry.signal: entry for entry in config.entries}
     for index, entry in enumerate(config.entries):
         if not _SIGNAL_PATTERN.match(entry.signal):
             issues.append(
@@ -227,6 +228,27 @@ def validate_config(config: PvMappingConfig) -> list[PvMappingIssue]:
             issues.append(
                 PvMappingIssue(index=index, field="label", message="设备参数名不能为空")
             )
+
+        # 变化速率配对：配了就必须指向本配置里存在且可写的信号。写错了不会报错，
+        # 只会在成组回落时静默不下发速率——那种"看着做了、其实没做"最难查。
+        if entry.rate_signal:
+            target = by_signal.get(entry.rate_signal)
+            if target is None:
+                issues.append(
+                    PvMappingIssue(
+                        index=index,
+                        field="rate_signal",
+                        message=f"速率信号不在映射里：{entry.rate_signal}",
+                    )
+                )
+            elif not target.writable:
+                issues.append(
+                    PvMappingIssue(
+                        index=index,
+                        field="rate_signal",
+                        message=f"速率信号不可写：{entry.rate_signal}",
+                    )
+                )
 
     return issues
 

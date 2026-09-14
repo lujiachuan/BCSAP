@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import time
 import unittest
@@ -21,6 +22,7 @@ from apps.instrument_service.signal_io import SignalWriteService
 from packages.contracts import (
     PvMappingConfig,
     PvMappingEntry,
+    RetractSpec,
     ScanAxis,
     ScanRunRequest,
 )
@@ -74,6 +76,47 @@ def axis(signals: list[str] | None = None) -> ScanAxis:
     return ScanAxis(
         label="磁铁1 电流",
         setpoint_signals=signals or ["magnet.m1.current_setpoint"],
+        readback_signal="magnet.m1.current_readback",
+    )
+
+
+MAGNETS = (1, 2, 3, 4)
+
+
+def build_group_config() -> PvMappingConfig:
+    """四台磁铁成组扫描：每台都有**自己的**回读、速率与稳定判据。"""
+    entries: list[PvMappingEntry] = []
+    for n in MAGNETS:
+        entries += [
+            entry(
+                f"magnet.m{n}.current_setpoint", f"BD:DipoleMagnet:{n:02d}:CurrentSet", "A",
+                readback_signal=f"magnet.m{n}.current_readback",
+                rate_signal=f"magnet.m{n}.current_rate_setpoint",
+                min_value=0.0, max_value=600.0, max_step=100.0,
+                settle_tol=0.5, settle_timeout=1.0,
+            ),
+            entry(
+                f"magnet.m{n}.current_rate_setpoint", f"BD:DipoleMagnet:{n:02d}:CurrentRateSet",
+                "A/s", min_value=0.0, max_value=10.0, max_step=1.0,
+            ),
+            entry(
+                f"magnet.m{n}.current_readback", f"BD:DipoleMagnet:{n:02d}:CurrentMonitor",
+                "A", writable=False, role="readback",
+            ),
+        ]
+    entries.append(
+        entry(
+            "detector.fc1.beam_current", "BD:FC:01:BeamCurrent", "nA",
+            writable=False, group="束流探测", role="readback",
+        )
+    )
+    return PvMappingConfig(version=1, entries=entries)
+
+
+def group_axis() -> ScanAxis:
+    return ScanAxis(
+        label="磁铁1~4 同步",
+        setpoint_signals=[f"magnet.m{n}.current_setpoint" for n in MAGNETS],
         readback_signal="magnet.m1.current_readback",
     )
 
@@ -387,6 +430,333 @@ class ScanServiceTests(unittest.TestCase):
 
         with self.assertRaises(ScanError):
             service.acknowledge_recovery(finished.run_id)
+
+    # ---------------- 成组扫描：逐路判到位 ----------------
+    def group_request(self, **overrides: object) -> ScanRunRequest:
+        base = {
+            "axis": group_axis(),
+            "detector_signal": "detector.fc1.beam_current",
+            "start": 100.0,
+            "stop": 120.0,
+            "step": 10.0,
+            "dwell_s": 0.0,
+            "samples_per_point": 1,
+            "settle_timeout_s": 0.05,
+            "on_unsettled": "record",
+        }
+        base.update(overrides)
+        return ScanRunRequest(**base)  # type: ignore[arg-type]
+
+    def build_group(self):
+        """四台磁铁成组，但只有 m1 的模拟电源跟随设定——其余三台卡在原值。
+
+        这是"第一台到位、其余没跟上"的现场形态：只看第一路回读的实现会把它
+        记成好点（坐标、偏差、质量全部来自第一台）。
+        """
+        service, signals = self.build(build_group_config())
+        signals._gateway._coupling = {
+            "magnet.m1.current_setpoint": "magnet.m1.current_readback"
+        }
+        return service, signals
+
+    def test_group_scan_fails_when_any_magnet_does_not_settle(self) -> None:
+        service, _ = self.build_group()
+
+        status = self.wait(
+            service, service.start(self.group_request(on_unsettled="fail")).run_id
+        )
+
+        self.assertEqual(status.state, "failed")
+        self.assertIn("magnet.m2.current_readback", status.message)
+
+    def test_group_scan_marks_the_point_unsettled_and_names_the_channel(self) -> None:
+        service, _ = self.build_group()
+
+        status = self.wait(service, service.start(self.group_request()).run_id)
+
+        point = service.points(status.run_id).points[0]
+        self.assertEqual(point.quality, "unsettled")
+        self.assertIn("未进入容差", point.detail)
+        self.assertIn("magnet.m2.current_readback", point.detail)
+
+    def test_group_scan_records_every_readback_and_a_real_spread(self) -> None:
+        """偏差必须来自各路**实际回读**；以前这里读的是设定信号，恒为 0。"""
+        service, _ = self.build_group()
+
+        status = self.wait(service, service.start(self.group_request()).run_id)
+
+        point = service.points(status.run_id).points[0]
+        self.assertEqual(
+            sorted(point.readback_values),
+            [f"magnet.m{n}.current_readback" for n in MAGNETS],
+        )
+        self.assertEqual(point.readback_values["magnet.m1.current_readback"], 100.0)
+        self.assertGreater(point.coordinate_spread, 0.0)
+        # 坐标仍取扫描轴指定的那一路
+        self.assertEqual(point.coordinate, 100.0)
+
+    def test_group_scan_persists_every_readback(self) -> None:
+        service, _ = self.build_group()
+
+        status = self.wait(service, service.start(self.group_request()).run_id)
+
+        row = self.store.load_points(status.run_id)[0]
+        stored = json.loads(row["readbacks_json"])
+        self.assertEqual(len(stored), len(MAGNETS))
+        self.assertIn("magnet.m4.current_readback", stored)
+
+    def test_group_axis_needs_a_tolerance_on_every_channel(self) -> None:
+        """任一路缺稳定判据就必须拒绝启动：缺判据的那一路等于不检查。
+
+        以前只校验"某一路有判据"（any），于是第二路起可以完全没有判据，
+        却仍然逐个点记成 ok。
+        """
+        config = build_group_config()
+        entries = [
+            item.model_copy(update={"settle_tol": None})
+            if item.signal == "magnet.m3.current_setpoint"
+            else item
+            for item in config.entries
+        ]
+        service, _ = self.build(PvMappingConfig(version=1, entries=entries))
+
+        with self.assertRaises(ScanError) as caught:
+            service.start(self.group_request(settle_timeout_s=1.0))
+
+        self.assertIn("magnet.m3.current_setpoint", str(caught.exception))
+
+    def test_prepare_probes_every_readback(self) -> None:
+        """某一路回读不可达时必须在写任何设定值之前就判失败。"""
+        service, signals = self.build_group()
+        before = signals._gateway.read("magnet.m1.current_setpoint").value
+        signals._gateway._values.pop("magnet.m3.current_readback")
+
+        status = self.wait(service, service.start(self.group_request()).run_id)
+
+        self.assertEqual(status.state, "failed")
+        self.assertIn("magnet.m3.current_readback", status.message)
+        self.assertEqual(
+            signals._gateway.read("magnet.m1.current_setpoint").value, before
+        )
+
+    # ---------------- 完成后回落（服务端安全收尾） ----------------
+    def test_completed_run_retracts_every_magnet_and_writes_the_rate_first(self) -> None:
+        """回落要把速率和电流都下发到**每一台**磁铁，且速率先于电流。"""
+        service, signals = self.build(build_group_config())
+        calls: list[tuple[str, float]] = []
+        original_write = signals._gateway.write
+
+        def recording_write(signal, value, command_id):
+            calls.append((signal, float(value)))
+            return original_write(signal, value, command_id)
+
+        signals._gateway.write = recording_write
+
+        status = self.wait(
+            service,
+            service.start(
+                self.group_request(
+                    retract=RetractSpec(current_a=0.0, rate_a_s=2.0)
+                )
+            ).run_id,
+        )
+
+        self.assertEqual(status.state, "completed")
+        rates = [s for s, _v in calls if s.endswith("current_rate_setpoint")]
+        self.assertEqual(
+            sorted(rates),
+            sorted(f"magnet.m{n}.current_rate_setpoint" for n in MAGNETS),
+        )
+        # 每一台都收到了回落电流 0（扫描目标是 100/110/120，不会混进去）
+        retract_writes = [
+            index
+            for index, (signal, value) in enumerate(calls)
+            if signal.endswith("current_setpoint") and value == 0.0
+        ]
+        self.assertEqual(len(retract_writes), len(MAGNETS))
+        # 速率必须先于同一次回落的电流写下去
+        rate_indexes = [
+            index for index, (signal, _value) in enumerate(calls)
+            if signal.endswith("current_rate_setpoint")
+        ]
+        self.assertLess(max(rate_indexes), min(retract_writes))
+        self.assertIn("已回落到 0", status.message)
+        for n in MAGNETS:
+            self.assertEqual(
+                signals._gateway.read(f"magnet.m{n}.current_readback").value, 0.0
+            )
+
+    def test_retract_runs_without_any_client_polling(self) -> None:
+        """客户端退出/崩溃都不该影响回落：回落由服务端线程自己完成。"""
+        service, signals = self.build(build_group_config())
+
+        run_id = service.start(
+            self.group_request(retract=RetractSpec(current_a=0.0, rate_a_s=2.0))
+        ).run_id
+        # 只等线程真正结束，不读状态、不轮询点
+        service.wait_idle(20.0)
+
+        self.assertEqual(service.status(run_id).state, "completed")
+        for n in MAGNETS:
+            self.assertEqual(
+                signals._gateway.read(f"magnet.m{n}.current_readback").value, 0.0
+            )
+
+    def test_retract_not_settling_keeps_the_device_locked(self) -> None:
+        """回落没到位 = 设备可能停在半路：必须保留锁并要求人工确认。"""
+        service, signals = self.build(build_group_config())
+        # 只让 m1 跟随：电流写下去后 m2~m4 的回读不动，回落等不到位
+        signals._gateway._coupling = {
+            "magnet.m1.current_setpoint": "magnet.m1.current_readback"
+        }
+
+        status = self.wait(
+            service,
+            service.start(
+                self.group_request(retract=RetractSpec(current_a=0.0, rate_a_s=2.0))
+            ).run_id,
+        )
+
+        self.assertEqual(status.state, "recovery_required")
+        self.assertIn("回落", status.message)
+        self.assertNotEqual(self.locks.held(), {})
+        # 数据已经落盘：谱图不该因为回落失败而消失
+        self.assertIsNotNone(status.spectrum_id)
+
+    def test_without_a_retract_spec_nothing_is_written_after_the_scan(self) -> None:
+        service, signals = self.build(build_group_config())
+        calls: list[str] = []
+        original_write = signals._gateway.write
+
+        def recording_write(signal, value, command_id):
+            calls.append(signal)
+            return original_write(signal, value, command_id)
+
+        signals._gateway.write = recording_write
+
+        status = self.wait(
+            service, service.start(self.group_request(samples_per_point=1)).run_id
+        )
+
+        self.assertEqual(status.state, "completed")
+        self.assertFalse([s for s in calls if s.endswith("CurrentRateSet")])
+
+    def test_retract_can_be_disabled_per_run(self) -> None:
+        service, signals = self.build(build_group_config())
+
+        status = self.wait(
+            service,
+            service.start(
+                self.group_request(
+                    retract=RetractSpec(current_a=0.0, rate_a_s=2.0, auto=False)
+                )
+            ).run_id,
+        )
+
+        self.assertEqual(status.state, "completed")
+        # 没回落：最后一点的目标值仍留在设备上
+        self.assertEqual(
+            signals._gateway.read("magnet.m1.current_readback").value, 120.0
+        )
+
+    # ---------------- 手动成组回落（走运行时，与端点同一入口） ----------------
+    def test_runtime_retract_writes_every_magnet_and_waits_for_readback(self) -> None:
+        runtime = InstrumentRuntime(
+            build_group_config(),
+            gateway_factory=create_simulated_gateway,
+            store=self.store,
+        )
+        try:
+            outcome = runtime.retract_magnets(
+                [f"magnet.m{n}.current_setpoint" for n in MAGNETS], 0.0, 2.0, timeout_s=1.0
+            )
+            self.assertTrue(outcome.ok, outcome.message)
+            self.assertEqual(len(outcome.applied), len(MAGNETS))
+            for n in MAGNETS:
+                self.assertEqual(
+                    runtime.gateway().read(f"magnet.m{n}.current_readback").value, 0.0
+                )
+        finally:
+            runtime.close()
+
+    def test_runtime_retract_is_refused_while_a_task_holds_the_magnets(self) -> None:
+        """别人占着磁铁组时不许偷写：回落也是设备动作，不能绕过设备锁。"""
+        runtime = InstrumentRuntime(
+            build_group_config(),
+            gateway_factory=create_simulated_gateway,
+            store=self.store,
+        )
+        try:
+            runtime.locks.acquire({"磁铁电源"}, owner="scan-1")
+
+            with self.assertRaises(DeviceBusy):
+                runtime.retract_magnets(
+                    [f"magnet.m{n}.current_setpoint" for n in MAGNETS], 0.0, 2.0
+                )
+        finally:
+            runtime.close()
+
+    # ---------------- 终态发布顺序 ----------------
+    def test_terminal_state_is_in_the_store_before_status_publishes_it(self) -> None:
+        """终态必须"先入库、后发布内存"。
+
+        写库的这一刻内存状态还不该是 completed——反过来就会出现"内存已完成、
+        库里还是 completing"的窗口（2026-09-14 的
+        ``test_points_are_persisted_in_store`` 就撞在这个窗口上）。
+        """
+        service, _ = self.build()
+        original_set_state = self.store.set_state
+        observed: list[str] = []
+
+        def probing_set_state(run_id: str, state: str) -> None:
+            if state == "completed":
+                observed.append(service.status(run_id).state)
+            original_set_state(run_id, state)
+
+        self.store.set_state = probing_set_state  # type: ignore[method-assign]
+
+        status = self.wait(service, service.start(self.request()).run_id)
+
+        self.assertEqual(status.state, "completed")
+        self.assertEqual(observed, ["completing"])
+
+    def test_store_failure_still_publishes_the_terminal_state(self) -> None:
+        """写库失败不能让任务永远停在非终态：内存终态照发、且说明不一致。"""
+        service, _ = self.build()
+        original_set_state = self.store.set_state
+
+        def failing_set_state(run_id: str, state: str) -> None:
+            if state == "completed":
+                raise OSError("磁盘已满")
+            original_set_state(run_id, state)
+
+        self.store.set_state = failing_set_state  # type: ignore[method-assign]
+
+        status = self.wait(service, service.start(self.request()).run_id)
+
+        self.assertEqual(status.state, "completed")
+        self.assertIn("数据库状态未更新", status.message)
+        self.assertEqual(self.locks.held(), {})
+
+    def test_aborted_run_also_stores_the_state_before_publishing_it(self) -> None:
+        service, _ = self.build()
+        original_set_state = self.store.set_state
+        observed: list[str] = []
+
+        def probing_set_state(run_id: str, state: str) -> None:
+            if state == "aborted":
+                observed.append(service.status(run_id).state)
+            original_set_state(run_id, state)
+
+        self.store.set_state = probing_set_state  # type: ignore[method-assign]
+        started = service.start(
+            self.request(start=0.0, stop=500.0, step=1.0, dwell_s=0.01)
+        )
+        service.stop(started.run_id)
+        status = self.wait(service, started.run_id)
+
+        if status.state == "aborted":
+            self.assertEqual(observed, ["running"])
 
     # ---------------- 停止 ----------------
     def test_stop_moves_run_to_aborted(self) -> None:
