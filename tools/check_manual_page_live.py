@@ -134,15 +134,27 @@ def main() -> int:
           not hidden,
           f"{len(page._frames)} 张" if not hidden else f"没显示：{hidden}")
 
-    # 顶栏吃掉的分组不再占画布，其余每组都该有一张卡片
+    # 顶栏吃掉的分组不再占画布，其余每组都该有一张卡片；
+    # 另有趋势卡片与磁铁成组卡片这两个"非分组卡片"
     group_count = len({str(e.get("group") or "未分组") for e in page._entries})
-    expected_cards = group_count - (1 if page.topbar.readouts else 0) + (
-        1 if page.trend_panel is not None else 0
+    expected_cards = (
+        group_count
+        - (1 if page.topbar.readouts else 0)
+        + (1 if page.trend_panel is not None else 0)
+        + (1 if page.magnet_group_panel is not None else 0)
     )
     check("卡片数与分组数对得上",
           len(page._frames) == expected_cards,
           f"{len(page._frames)} 张 / 期望 {expected_cards}"
           f"（共 {group_count} 组，顶栏收走 {len(page.topbar.readouts)} 路）")
+    check("成组设定卡片存在（磁铁 1+2 / 3+4 / 1~4）",
+          page.magnet_group_panel is not None
+          and page.magnet_group_panel.group_combo.count() == 3,
+          str(
+            page.magnet_group_panel.group_combo.count()
+            if page.magnet_group_panel is not None
+            else None
+          ))
 
     # 每列的默认高度要放得进一屏，否则"少了一张卡片"其实是滚下去了
     column_heights: dict[int, int] = {}

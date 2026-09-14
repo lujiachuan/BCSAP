@@ -6,6 +6,9 @@
 重点验证两件事：
 1. 候选必须**等人确认**才会写设备（第一版不允许连续自动写入）；
 2. 每轮记录里建议值、实际下发值、实际回读值是分开的。
+
+另外验证调束配置的保存与恢复（改造报告 §8.9 P2.3）：自检把配置写到 ``build/`` 下，
+免得覆盖操作员本机真正保存的那一份。
 """
 
 from __future__ import annotations
@@ -20,11 +23,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# 自检用的调束配置落点：与操作员的真实配置分开（默认在 %LOCALAPPDATA% 下）
+CONFIG_PATH = ROOT / "build" / "check_tuning_config.json"
+os.environ["SPECTRUM_TUNING_CONFIG"] = str(CONFIG_PATH)
 
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from apps.desktop_client import instrument_api  # noqa: E402
+from apps.desktop_client.pages import tuning as tuning_module  # noqa: E402
 from apps.desktop_client.pages.tuning import TuningPage  # noqa: E402
 
 BASE = "http://127.0.0.1:8765"
@@ -62,6 +69,43 @@ def get_iterations(run_id: str) -> list[dict]:
         return json.loads(r.read().decode("utf-8"))["iterations"]
 
 
+TERMINAL_TUNING_STATES = {"completed", "aborted", "failed", "recovery_required"}
+
+
+def release_run(page) -> None:  # noqa: ANN001
+    """把自检留下的调束任务收尾，释放设备组。
+
+    **「等待确认」是占着设备的**（设备正处在半优化状态），所以自检中途失败退出时
+    必须自己收尾：否则下一次自检或扫谱会被 ``设备组不可用`` 挡住，看起来像"服务坏了"。
+    先停止，若落入 ``recovery_required`` 再人工确认一次。
+    """
+    run_id = getattr(page, "_run_id", None)
+    if not run_id:
+        return
+    try:
+        status = get_run(run_id)
+    except Exception:  # noqa: BLE001  收尾路径不该再抛异常
+        return
+    if status.get("state") in TERMINAL_TUNING_STATES and not status.get("locked_groups"):
+        return
+    try:
+        if status.get("state") not in TERMINAL_TUNING_STATES:
+            instrument_api.request_tuning_stop(run_id)
+        for _ in range(100):
+            status = get_run(run_id)
+            if status.get("state") in TERMINAL_TUNING_STATES:
+                break
+            time.sleep(0.05)
+        if status.get("state") == "recovery_required":
+            instrument_api.request_tuning_acknowledge(run_id, note="在线自检收尾")
+        for _ in range(100):
+            if not get_run(run_id).get("locked_groups"):
+                break
+            time.sleep(0.05)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [warn] 自检收尾未完成：{exc}", flush=True)
+
+
 def main() -> int:
     app = QApplication.instance() or QApplication([])
     page = TuningPage()
@@ -69,7 +113,19 @@ def main() -> int:
     # 这里改成记录，既避免挂死，也能把"为什么被拒"打印出来。
     complaints: list[str] = []
     page._complain = lambda message: complaints.append(message)  # type: ignore[method-assign]
+    return run_checks(app, page, complaints)
 
+
+def run_checks(app: QApplication, page: TuningPage, complaints: list[str]) -> int:
+    try:
+        return _checks(app, page, complaints)
+    finally:
+        # 自检无论怎么退出都要把任务收尾：等待确认中的任务一直占着设备组，
+        # 会把后续的扫谱/调束都挡在"设备组不可用"外面。
+        release_run(page)
+
+
+def _checks(app: QApplication, page: TuningPage, complaints: list[str]) -> int:
     check("页面从执行服务载入可调参数",
           pump(app, lambda: bool(page._rows), 25),
           f"{len(page._rows)} 行")
@@ -88,6 +144,36 @@ def main() -> int:
     row["high"].setValue(200.0)
     page.iterations_spin.setValue(2)
     page.settle_spin.setValue(10.0)
+
+    # 调束配置的保存与恢复（改造报告 §8.9 P2.3）：存到 build/ 下的自检文件，
+    # 再新开一个页面，看界面是不是真的回到这一套。
+    CONFIG_PATH.unlink(missing_ok=True)
+    page.save_tuning_config()
+    check("保存调束配置写出文件", CONFIG_PATH.exists(), str(CONFIG_PATH))
+    saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8")) if CONFIG_PATH.exists() else {}
+    check("配置里记下了勾选与范围",
+          any(v["signal"] == MAGNET and v.get("enabled") and v.get("low") == 150.0
+              and v.get("high") == 200.0 for v in saved.get("variables") or []),
+          f"max_iterations={saved.get('max_iterations')} "
+          f"strategy={saved.get('strategy')}")
+    fresh = TuningPage()
+    fresh._complain = lambda message: complaints.append(message)  # type: ignore[method-assign]
+    try:
+        restored_rows = pump(app, lambda: bool(fresh._rows), 25)
+        fresh_row = next(
+            (r for r in fresh._rows if r["entry"]["signal"] == MAGNET), None
+        )
+        check("新开的页面载回了上次配置",
+              restored_rows and fresh_row is not None
+              and fresh_row["check"].checkState() == Qt.CheckState.Checked
+              and fresh_row["low"].value() == 150.0
+              and fresh_row["high"].value() == 200.0
+              and fresh.iterations_spin.value() == 2
+              and fresh.settle_spin.value() == 10.0,
+              fresh.config_note.text()[:80])
+        check("载入后界面说明了来源", "已载入调束配置" in fresh.config_note.text())
+    finally:
+        fresh.deleteLater()
 
     before = json.loads(
         urllib.request.urlopen(
@@ -114,6 +200,10 @@ def main() -> int:
         check("没有触发参数校验拒绝", not complaints, "；".join(complaints))
         check("提交的模式固定为 confirm", captured.get("mode") == "confirm",
               str(captured.get("mode")))
+        check("高级参数随任务下发（噪声/种子）",
+              captured.get("noise") == page.noise_spin.value()
+              and captured.get("seed") == page.seed_spin.value(),
+              f"noise={captured.get('noise')} seed={captured.get('seed')}")
         check("启动后进入等待确认",
               pump(app, lambda: page._state == "awaiting_confirmation", 30),
               f"state={page._state}")
@@ -191,6 +281,52 @@ def main() -> int:
           f"{status.get('algorithm')}/{status.get('algorithm_version')} seed={status.get('seed')}")
     check("完成后不再占用设备组", status.get("locked_groups") == [],
           str(status.get("locked_groups")))
+
+    # ---- 辅助分析：响应曲线 / 建议 / 日志（改造报告 §8.9 P2.4）----
+    check("每轮都记下了所属阶段",
+          all(it.get("stage") for it in get_iterations(run_id)),
+          str([it.get("stage") for it in get_iterations(run_id)]))
+
+    choices = [page.plot_choice.itemData(i) for i in range(page.plot_choice.count())]
+    check("曲线下拉里有收敛 + 本次用到的变量",
+          choices[:1] == [""] and MAGNET in choices, str(choices[:3]))
+
+    index = page.plot_choice.findData(MAGNET)
+    page.plot_choice.setCurrentIndex(index)
+    xs, ys = page.tuning_plot.raw_data()
+    check("切到该变量后画的是响应曲线（x = 实际回读）",
+          index > 0 and len(xs) >= 2 and list(xs) == sorted(xs),
+          f"x={[round(float(v), 2) for v in xs]} y={[round(float(v), 3) for v in ys]}")
+    check("响应曲线写明了采样点数与最优点",
+          "已采样 2 点" in page.response_note.text()
+          and "最优目标" in page.response_note.text(),
+          page.response_note.text()[:90])
+
+    log_text = page.log_view.toPlainText()
+    check("日志区一轮一行且四列齐全",
+          "第 1 轮" in log_text and "第 2 轮" in log_text
+          and "建议" in log_text and "下发" in log_text
+          and "回读" in log_text and "共 2 轮" in log_text,
+          log_text.splitlines()[1][:70] if len(log_text.splitlines()) > 1 else log_text[:70])
+
+    export_path = CONFIG_PATH.with_name("check_tuning_log.jsonl")
+    export_path.unlink(missing_ok=True)
+    tuning_module.QFileDialog.getSaveFileName = staticmethod(  # type: ignore[assignment]
+        lambda *a, **k: (str(export_path), "")
+    )
+    page.export_tuning_log()
+    exported = (
+        [json.loads(line) for line in export_path.read_text(encoding="utf-8").splitlines()]
+        if export_path.exists()
+        else []
+    )
+    check("导出日志写出 JSONL（meta + 每轮 + end）",
+          bool(exported)
+          and exported[0].get("event") == "meta"
+          and exported[0].get("run_id") == run_id
+          and exported[-1].get("event") == "end"
+          and exported[-1].get("iterations") == 2,
+          f"{len(exported)} 行，末行 state={exported[-1].get('state') if exported else '—'}")
 
     page.deleteLater()
 

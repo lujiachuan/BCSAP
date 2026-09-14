@@ -343,6 +343,30 @@ spectrum-data-service
 spectrum-client
 ```
 
+### 部署参数（环境变量）
+
+执行服务的两个部署参数都在**启动方式**里给，不放进能被接口改写的配置字段：
+
+| 变量 | 作用 | 说明 |
+| --- | --- | --- |
+| `SPECTRUM_READ_ONLY` | 全局只读模式（`1`/`true`/`yes`/`on`） | 整台服务禁止一切写入：单点/成组/回落一律被拒并说明原因，扫谱与调束**启动即 400**，`PUT /control/v1/pv-mapping` 也 400（映射决定写入边界，只读下改它等于绕过只读）。客户端会把该标记显示在启动检查里，并压住手动/扫谱/调束/设置页的写入入口。读取链路不受影响。默认关闭 |
+| `SPECTRUM_SCAN_STORE` | 扫谱与调束的本地暂存目录 | 默认在用户数据目录下；服务起不来并提示"暂存目录不可写"时用它换一个落点 |
+
+只读部署长这样（端口与在线实例分开，便于同时在线的联调实例不受影响）：
+
+```powershell
+$env:SPECTRUM_READ_ONLY = "1"
+$env:EPICS_CA_ADDR_LIST = "127.0.0.1"    # 本地联调只连模拟 IOC
+$env:EPICS_CA_AUTO_ADDR_LIST = "NO"
+.\.venv\Scripts\python.exe -m apps.instrument_service.main
+```
+
+起好之后可用自检脚本确认"确实写不进去、读取正常"：
+
+```powershell
+.\.venv\Scripts\python.exe tools\check_read_only_live.py http://127.0.0.1:8765
+```
+
 ### 服务检查地址
 
 | 地址 | 说明 | 当前预期 |

@@ -52,6 +52,23 @@ def get_run(run_id: str) -> dict:
         return json.loads(r.read().decode("utf-8"))
 
 
+def read_signals(signals: list[str]) -> dict[str, dict]:
+    """直接问执行服务读一次现场值（自检只看设备真实状态，不信界面文案）。"""
+    body = json.dumps({"signals": signals}).encode()
+    request = urllib.request.Request(
+        BASE + "/control/v1/signals/read", data=body, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as r:
+        payload = json.loads(r.read().decode("utf-8"))
+    return {item["signal"]: item for item in payload.get("readings", [])}
+
+
+def read_signal(signal: str) -> float | None:
+    item = read_signals([signal]).get(signal) or {}
+    return None if item.get("value") is None else float(item["value"])
+
+
 def main() -> int:
     app = QApplication.instance() or QApplication([])
     page = ScanPage()
@@ -94,6 +111,22 @@ def main() -> int:
           len(page._points) == status["completed_points"],
           f"界面 {len(page._points)} / 服务端 {status['completed_points']}")
     check("进度条到 100%", page.progress.value() == 100, f"{page.progress.value()}%")
+
+    # ---- 回落（文档 6.6）：请求里带参数、由服务端执行、界面如实转述 ----
+    request = page._build_request()
+    check("扫描请求带上了回落参数",
+          (request.get("retract") or {}).get("current_a") == page.retract_current.value()
+          and (request.get("retract") or {}).get("auto") is True,
+          str(request.get("retract")))
+    check("服务端回落结论被转述到状态条（不是客户端自己宣布）",
+          "回落" in page.retract_status.text(), page.retract_status.text())
+    magnet_now = read_signal("magnet.m1.current_readback")
+    check("回落真的执行了：磁铁回读 == 回落电流",
+          magnet_now is not None and abs(magnet_now - page.retract_current.value()) <= 0.5,
+          f"回读 {magnet_now} / 目标 {page.retract_current.value()}")
+    check("导出内容里记下了逐路回读",
+          bool(page._points and page._points[0].get("readback_values")),
+          str(page._points[0].get("readback_values") if page._points else None))
 
     # 横坐标必须是设备实际回读值（模拟 IOC 已把回读耦合到设定，故应等于目标）
     included = [p for p in page._points if p.get("included")]
