@@ -663,6 +663,66 @@ class ExportWriteTests(_PageHarness):
         # 回落速率是另一回事：它真的进契约、真的生效，必须照常记录
         self.assertEqual(scan["samples_per_point"], self.page.samples.value())
 
+
+class CondenseLengthTests(_PageHarness):
+    """冷凝管长度：原 demo 由 LabVIEW 给，平台没有对应信号，改由界面手填。
+
+    关键是"没填就是没填"——不能用 0 或别的数字冒充一段实测工况（报告 §8.8 第 4 条）。
+    """
+
+    def export(self, length: str = "") -> dict:
+        target = self._temp_path(".json")
+        self._choose(target)
+        self.page._points = [point(0, 100.0)]
+        self.page.condense_length_edit.setText(length)
+        self._stub("request_read", lambda *a, **k: _FakeThread())
+
+        self.page._export("json")
+        self.page._on_export_snapshot({"ok": True, "payload": {"readings": []}})
+
+        return json.loads(target.read_text(encoding="utf-8"))
+
+    def test_empty_length_keeps_the_placeholder_in_the_name(self) -> None:
+        document = self.export()
+
+        self.assertTrue(document["name"].endswith("-cm"), document["name"])
+        self.assertIsNone(document["scan"]["condense_length_cm"])
+
+    def test_filled_length_goes_into_the_name_and_the_record(self) -> None:
+        document = self.export("12.5")
+
+        self.assertTrue(document["name"].endswith("12.5cm"), document["name"])
+        self.assertEqual(document["scan"]["condense_length_cm"], 12.5)
+
+    def test_length_source_is_recorded_next_to_the_value(self) -> None:
+        """手填值必须带着来源：否则事后会被当成实测工况。"""
+        document = self.export("20")
+
+        self.assertIn("手填", document["scan"]["condense_length_source"])
+        self.assertTrue(
+            any("condense_length_cm" in note for note in document["unavailable"]["not_migrated"])
+        )
+
+    def test_labview_length_stays_null(self) -> None:
+        """LabVIEW 那条链路仍然没接：labview 段不能因为手填了就凭空有值。"""
+        document = self.export("20")
+
+        self.assertIsNone(document["labview"]["condense_length_cm"])
+
+    def test_partial_input_does_not_break_the_export(self) -> None:
+        """校验器允许"-"这类中间态：解析不出数字就按没填处理，而不是抛异常。"""
+        document = self.export("-")
+
+        self.assertTrue(document["name"].endswith("-cm"), document["name"])
+        self.assertIsNone(document["scan"]["condense_length_cm"])
+
+    def test_zero_is_treated_as_not_filled(self) -> None:
+        """0 cm 冷凝管不存在：宁可当没填，也不要写一个物理上不可能的工况。"""
+        document = self.export("0")
+
+        self.assertTrue(document["name"].endswith("-cm"), document["name"])
+        self.assertIsNone(document["scan"]["condense_length_cm"])
+
     def test_failed_snapshot_read_still_exports_the_points(self) -> None:
         """设备没连上不该让现场丢掉一场扫描：点照常导出，缺的字段写 null + 原因。"""
         target = self._temp_path(".json")

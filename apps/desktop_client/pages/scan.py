@@ -21,6 +21,7 @@ import json
 from datetime import datetime
 
 from PySide6.QtCore import QTimer
+from PySide6.QtGui import QDoubleValidator
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -325,6 +326,19 @@ class ScanPage(QWidget):
         self.index_edit.setRange(0, 9999)
         self.index_edit.setValue(1)
         row2.addWidget(self._field("序号", self.index_edit))
+
+        # 冷凝管长度：原 demo 由 LabVIEW 算好推过来，平台没有这条数据链路，
+        # 但它是文件名与实验记录里的一段工况——所以给一个手填框：**填了就写进去，
+        # 没填就还是 `-cm` 占位**，绝不用零或别的数字冒充（改造报告 §8.8 第 4 条）。
+        self.condense_length_edit = QLineEdit()
+        self.condense_length_edit.setMaximumWidth(90)
+        self.condense_length_edit.setPlaceholderText("未填")
+        self.condense_length_edit.setValidator(QDoubleValidator(0.0, 1e6, 2, self))
+        self.condense_length_edit.setToolTip(
+            "冷凝管长度（cm）：写进默认文件名与导出记录。平台没有对应信号，"
+            "留空则文件名里用 -cm 占位（不会用 0 或别的数字冒充）"
+        )
+        row2.addWidget(self._field("冷凝管长度 cm", self.condense_length_edit))
 
         # X 轴显示：电流 / 质量（单选，贴近 demo 心智）
         x_axis_box = QWidget()
@@ -979,18 +993,34 @@ class ScanPage(QWidget):
     # ------------------------------------------------------------------
     # 数据导出
     # ------------------------------------------------------------------
+    def _condense_length_cm(self) -> float | None:
+        """界面上手填的冷凝管长度；没填返回 None（文件名里就是 ``-cm`` 占位）。
+
+        校验器挡住非法字符，但 `QLineEdit` 允许"只输入了减号"这类中间态，所以这里
+        再解析一次：解析不出数字就当作没填，而不是让导出抛异常。
+        """
+        text = self.condense_length_edit.text().strip()
+        if not text:
+            return None
+        try:
+            value = float(text)
+        except ValueError:
+            return None
+        return value if value > 0 else None
+
     def _default_name(self, readings: dict[str, dict] | None = None) -> str:
         """按 demo 命名：元素-序号-Ar流量-He流量-气压Pa-功率W-长度cm。
 
         取不到的值用 ``-`` 占位：名字是给人看的，不能因为某一路没连上或现场没配
-        就抛异常、让整场数据导不出来。condense length 平台上没有对应信号（见
-        ``_collect_payload`` 的 unavailable），所以这一段恒为占位。
+        就抛异常、让整场数据导不出来。长度这一段的来源与其他值不同——平台没有对应
+        信号，取的是扫谱页手填框，**没填就是占位**（见 §8.8 第 4 条）。
         """
         readings = readings or {}
         ar = _reading_value(readings, "gas.ar.flow_setpoint")
         he = _reading_value(readings, "gas.he.flow_setpoint")
         pressure = _reading_value(readings, "vacuum.chamber_pressure")
         power = _reading_value(readings, "sputter.power_setpoint")
+        length = self._condense_length_cm()
         parts = [
             self.element_edit.text().strip() or "Ar",
             f"{int(self.index_edit.value()):03d}",
@@ -1000,7 +1030,7 @@ class ScanPage(QWidget):
             # 气压是 ~1 Pa 量级的细调参数，1 位小数会让两次不同的工况撞成同一个名字
             f"{pressure:.2f}Pa" if pressure is not None else "-Pa",
             f"{power:.0f}W" if power is not None else "-W",
-            "-cm",
+            f"{length:g}cm" if length is not None else "-cm",
         ]
         return _safe_filename("-".join(parts))
 
@@ -1033,6 +1063,12 @@ class ScanPage(QWidget):
                 "samples_per_point": self.samples.value(),
                 "mass_coefficients": coefficients,
                 "x_axis": "mass" if self._use_mass_axis() else "current",
+                # 冷凝管长度：平台无对应信号，值是**操作员手填**的（没填就是 null）。
+                # 来源必须跟着值一起写，否则事后会把一个手填数当成实测工况。
+                "condense_length_cm": self._condense_length_cm(),
+                "condense_length_source": (
+                    "扫谱页手填（平台无对应信号；原 demo 由 LabVIEW 计算）"
+                ),
             },
             "retract": {
                 "current_a": self.retract_current.value(),
@@ -1068,7 +1104,8 @@ class ScanPage(QWidget):
                 "not_migrated": [
                     "labview.source / labview.latest_value / labview.point_count："
                     "原 demo 由 LabVIEW 推送，平台未迁移该数据链路",
-                    "labview.condense_length_cm：原 demo 由 LabVIEW 计算，平台无对应信号",
+                    "labview.condense_length_cm：原 demo 由 LabVIEW 计算；平台无对应信号，"
+                    "本次导出取的是 scan.condense_length_cm（扫谱页手填，未填则 null）",
                 ],
             },
             "points": self._points,
