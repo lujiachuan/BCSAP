@@ -118,6 +118,30 @@ def main() -> int:
     def message() -> str:
         return page.status_label.text()
 
+    def submit(row, signal: str, value: float) -> None:
+        """提交一次写入，并把消息区先清空。
+
+        不清空的话 ``pump`` 可能被**上一次**留下的文案立刻满足（"已下发" / "被拒绝"
+        都还在），于是后面的断言实际是在看旧结果。实测踩到过一次：越界写入之后紧接着
+        的斜坡写入断言偶发失败——两次写入的结果与消息区是异步先后到达的，
+        断言点落在哪个中间态取决于调度。
+        """
+        page.topbar.set_message("", "idle")
+        page.write_signal(row, signal, value)
+
+    def settled_not_error(timeout: float = 10.0) -> bool:
+        """等这一行不再是"被拒标红"。
+
+        断言写得比这更窄会偶发误报：回读一旦进容差，这一行会显示 ``good``（≈ 已稳定），
+        而"还没到位"时是 ``warn``/空——三种都是**标红已清掉**的正常结局。
+        实测：写 320 之后有时那一帧正好读到 320，状态就是 ``good``。
+        """
+        return pump(
+            app,
+            lambda: row.readback_label.property("state") != "error",
+            timeout,
+        )
+
     # ---- 版式：单页三列，不按设备组分页签 ----
     panels = [
         sum(1 for i in range(column.count()) if column.itemAt(i).widget() is not None)
@@ -244,13 +268,13 @@ def main() -> int:
     editor.spin.setValue(0.0)
 
     # ---- 正常写入 ----
-    page.write_signal(row, SIGNAL, 120.0)
+    submit(row, SIGNAL, 120.0)
     pump(app, lambda: "已下发" in message() or "拒绝" in message())
     check("页面提交写入后显示成功", "已下发" in message(), message())
     check("IOC 真的变成了 120", read_ioc(SIGNAL) == 120.0, str(read_ioc(SIGNAL)))
 
     # ---- 越界写入：回显服务端原因，且设备不动 ----
-    page.write_signal(row, SIGNAL, 600.0)
+    submit(row, SIGNAL, 600.0)
     pump(app, lambda: "拒绝" in message() or "已下发" in message())
     check("越界写入回显拒绝原因（带设备 + 量名）",
           "被拒绝" in message() and "上限" in message() and "流量设定" in message(),
@@ -260,11 +284,14 @@ def main() -> int:
     check("被拒后 IOC 未变", read_ioc(SIGNAL) == 120.0, str(read_ioc(SIGNAL)))
 
     # ---- 斜坡：大变化应被拆步并标注步数 ----
-    page.write_signal(row, SIGNAL, 320.0)
+    submit(row, SIGNAL, 320.0)
     pump(app, lambda: "斜坡" in message() or "拒绝" in message())
     check("大变化按斜坡分步并在消息区标注步数", "斜坡" in message(), message())
     check("斜坡后 IOC = 320", read_ioc(SIGNAL) == 320.0, str(read_ioc(SIGNAL)))
-    check("新一次下发清掉上一次的标红", row.readback_label.property("state") in ("", "warn"),
+    # 标红由"重新下发"清掉：清掉之后这一行可能是 good（≈ 已稳定）/ warn（≠ 还没到位）
+    # / 空，**只要不是 error 就说明标红没了**
+    settled_not_error()
+    check("新一次下发清掉上一次的标红", row.readback_label.property("state") != "error",
           str(row.readback_label.property("state")))
 
     # ---- 趋势：快照推进滚动缓冲，趋势卡片跟着动 ----
@@ -319,9 +346,15 @@ def main() -> int:
         on.click()
         pump(app, lambda: "已下发" in message() or "拒绝" in message())
         check("点「开」把输出开关写成 1", read_ioc(SWITCH) == 1.0, str(read_ioc(SWITCH)))
-        check("按钮选中态跟随实际回读",
-              (on.isChecked() and not off.isChecked()) or "拒绝" in message(),
-              f"开={on.isChecked()} 关={off.isChecked()}")
+        # 按钮选中态是**按回读值**刷新的（每个轮询周期一次），点完立刻断言会撞上"回读还没回来"
+        # 那一帧。等它跟随到位（或服务端明确拒绝）再断言。
+        followed = pump(
+            app,
+            lambda: (on.isChecked() and not off.isChecked()) or "拒绝" in message(),
+            10,
+        )
+        check("按钮选中态跟随实际回读", followed,
+              f"开={on.isChecked()} 关={off.isChecked()} msg={message()[:40]!r}")
         off.click()
         pump(app, lambda: "已下发" in message() or "拒绝" in message())
         print(f"  已复位 {SWITCH} = {read_ioc(SWITCH)}")

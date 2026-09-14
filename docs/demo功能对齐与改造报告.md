@@ -534,13 +534,15 @@ $env:QT_QPA_PLATFORM='offscreen'
 
 ### 8.2 仍需补充的验证
 
-- 设置页修改普通 PV 字段后，安全元数据必须原样保留。
-- 成组扫描四路实际回读的稳定与偏差测试。
-- 成组回落的速率、电流、到位和部分失败测试。
-- 调束启动前快照、束流丢失、自动回退和回退失败测试。
-- 应用最优、恢复初始、回安全值的端到端测试。
-- LabVIEW 数据断流、乱序、重复、批次切换和重连测试。
-- JSON/TXT 导出的字段、原始电流、文件名和设备快照一致性测试。
+> **本轮收尾状态（2026-09-14 第四轮补记）**：下面 7 条除最后一条（LabVIEW 断流/乱序/重连）外都已补齐，逐条对应到具体用例与实测；LabVIEW 那条要等接入（§8.6 第 6 行）才有对象可测。
+
+- 设置页修改普通 PV 字段后，安全元数据必须原样保留。→ `tests/test_settings_page.py::PvMappingSafetyFieldTests`（6 例）+ `tests/test_pv_mapping.py::SettingsPageRoundTripTests`（3 例，跑真实 128 条映射逐字段比对）
+- 成组扫描四路实际回读的稳定与偏差测试。→ `tests/test_scan_service.py` 逐路到位用例（含"四路全都没动却仍记 ok"的反例）+ 在线自检：`已回落到 0，4 路回读已到位`、每点 `readback_values` 四路齐
+- 成组回落的速率、电流、到位和部分失败测试。→ `tests/test_scan_service.py` + `tests/test_signal_batch.py`；在线自检 `check_scan_page_live.py` 4 项回落断言（含"任一路没到位就报失败"）
+- 调束启动前快照、束流丢失、自动回退和回退失败测试。→ `tests/test_tuning_guard.py`（12 例）；在线实测：磁铁 210 A → 触发保护 → 回退记录 `ok=true`、实测回读回 210.0、设备锁交还
+- 应用最优、恢复初始、回安全值的端到端测试。→ `tests/test_tuning_finalize.py`（13 例）；在线实测 190/0/200 A 三条路径 + `confirm=false`→400 + 被占组→409
+- LabVIEW 数据断流、乱序、重复、批次切换和重连测试。→ **未做**：接入尚未开始（§8.6 第 6 行），先有链路再谈断流测试
+- JSON/TXT 导出的字段、原始电流、文件名和设备快照一致性测试。→ `tests/test_scan_page.py::ExportWriteTests`（含 `test_txt_keeps_raw_current_and_beam_when_mass_is_selected`、`test_json_file_uses_the_demo_default_name_and_keeps_the_snapshot`、`test_export_records_no_fake_scan_rate`）；在线实测导出 `Ar-001-Ar0-He0.00-0.98Pa-50W--cm.json` 含 `acquisition` / `device_snapshot`（52 路）
 
 ### 8.3 本轮 P0 改造与验证记录（2026-09-14）
 
@@ -558,7 +560,7 @@ $env:QT_QPA_PLATFORM='offscreen'
 | 证据 | 命令 | 结果 |
 |---|---|---|
 | 全量单测 | `$env:QT_QPA_PLATFORM="offscreen"; $env:QT_QPA_FONTDIR="C:\Windows\Fonts"; .\.venv\Scripts\python.exe -m pytest tests -q` | **444 passed, 236 subtests** |
-| 静态检查 | `.\.venv\Scripts\python.exe -m ruff check apps packages tests tools` | 只剩 6 条**既有**违规（`packages/spectrum/codec.py` I001、`test_instrument_supervisor.py` E501、`analyze_fpga_bitfiles.py`×2、`contrast_audit.py`、`ui_snapshot.py`），本轮改动 0 新增 |
+| 静态检查 | `.\.venv\Scripts\python.exe -m ruff check apps packages tests tools` | 只剩 **5 条既有**违规（`packages/spectrum/codec.py` I001、`test_instrument_supervisor.py` E501、`analyze_fpga_bitfiles.py`×2、`contrast_audit.py`），本轮改动 0 新增（原先第 6 条 `tools/ui_snapshot.py` 的 E402 已随该工具的修复消掉，见 §8.10） |
 | 四个在线自检 + 对比度 | `tools/check_signal_chain.py` / `check_manual_page_live.py` / `check_scan_page_live.py` / `check_tuning_page_live.py` / `contrast_audit.py` | 全通过；对比度 40 项 0 失败 |
 | 成组扫描逐路回读（真实 CA + 模拟 IOC） | 对 8765 起一次 `磁铁1~4 同步` 扫描（带回落） | 3 点全 `quality=ok`，每点 `readback_values` 四路齐全；终态消息 `完成，已保存 3 点；已回落到 0，4 路回读已到位`；回落完成后四路回读均为 0 |
 | 手动回落端点 | `POST /control/v1/magnets/retract`（退到 30 A 再回 0） | 两次 `ok=true`，`applied` 四路都在 30.0 / 0.0 |
@@ -618,7 +620,7 @@ $env:QT_QPA_PLATFORM='offscreen'
 1. ~~**扫谱页的"扫描速率"仍是死输入**：`_build_request()` 发的 `rate_a_s` 不在 `ScanRunRequest` 契约里，真正生效的是映射里磁铁的 `max_rate` 与分步逻辑。要么删掉该输入框，要么在契约里加"点间斜坡速率覆盖"。~~ **（本轮已按"删掉"处理：输入框删除，导出的 `scan.rate_a_s` 由"界面上的数字"改成 `null` + `rate_source` 说明真正决定斜坡的是映射里的 `max_rate`——留一个改了不生效的控件、或把一个没生效的数字写进实验记录，都比没有更糟。回归见 `tests/test_scan_page.py::ExportWriteTests::test_export_records_no_fake_scan_rate`。点间速率覆盖仍可作为后续契约项，但要有明确使用场景再开）**
 2. **手动回落的并发口径**：`POST /control/v1/magnets/retract` 会持磁铁设备组锁（扫谱/调束抢不到），但普通 `signals/write` 不加锁——也就是说"另一个页面正在写同一台磁铁"与"回落"可以同时在飞，最终由回落的等回读超时如实报 `ok=false` 收场。客户端**故意**没有用写串行锁把回落锁住（回落最长等 120 s，锁住会挡住操作员的应急动作）。
 3. **TXT 列变多**：新增 `quality` 列（选 Mass 时还有 `mass_u`）。现场若有按两列解析的脚本需要同步改；表头已带列名。
-4. **condense length 仍无来源**：文件名里恒为 `-cm` 占位；要真正填上需要现场 PV 或界面手填框。
+4. ~~**condense length 仍无来源**：文件名里恒为 `-cm` 占位；要真正填上需要现场 PV 或界面手填框。~~ **（本轮按"界面手填框"处理：扫谱页命名行新增「冷凝管长度 cm」输入，填了就写进默认文件名与 `scan.condense_length_cm`，**没填仍是 `-cm` 占位**；`0`、只输入 `-` 这类中间态一律按"没填"处理——宁可留占位，也不要写一个物理上不可能或没填完的工况。手填值必须带来源：导出里同时写 `scan.condense_length_source`，`labview.condense_length_cm` 仍是 `null`（那条链路没接），免得事后把手填数当成实测值。回归 `tests/test_scan_page.py::CondenseLengthTests`（6 例）**
 5. **文件名取值口径**：Ar/He 取 `flow_setpoint`、功率取 `sputter.power_setpoint`、气压取 `vacuum.chamber_pressure`（只有回读一路），精度 Ar 0 位 / He 2 位 / 气压 2 位。是否与现场记录习惯一致需确认。
 
 ---
@@ -654,6 +656,31 @@ $env:QT_QPA_PLATFORM='offscreen'
 - **分析全部在客户端算，服务端只补了一条"事实"**：响应曲线、建议、日志都只依赖已落盘的轮次记录，所以客户端算（规则随现场经验改，改一次就能用；也不再给服务端加一套"结论接口"）。唯一往服务端加的是**每轮所属阶段**——那个信息只存在于运行内存里，不落盘就等于永久丢失，而事后复盘分不清"哪几轮是逐参数、哪几轮是联合"时，日志和曲线都会读错。
 - **不照搬原 demo 的"初始采样数"**：平台的第一个候选固定取范围中心（`packages/optimizer/bayes.py`：比随机点更容易被现场接受、也便于复现），根本没有"随机初始撒点"这件事。给一个**不受任何代码影响**的输入框只会让人以为改了它就换了行为——要更随机地探索，用观测噪声与随机种子。这一项如实记成"平台不做"，而不是补一个假开关。
 - **建议只提示、只触发一次，也不写"最优在范围外"这种结论**：贴边不等于最优在范围外，停滞也不等于到了物理上限。文案写成「看到什么 + 建议查什么」，把判断留给操作员；每条规则只出现一次，免得每轮刷屏把真正的新信息淹掉。
+
+---
+
+### 8.10 顺带修掉的工具与自检缺陷（2026-09-14 第四轮）
+
+`docs/手动控制页目标电流趋势与界面优化调研.md` 的 O7 记着"最复杂的一页没有截图回归"，而真去跑那个工具时发现它**已经拍不出正确画面**：
+
+| 缺陷 | 现象（实测） | 修法 |
+|---|---|---|
+| 侧栏行号写死 | 侧栏后来加了「样品管理 / 谱图分析 / 任务与同步」，工具里写死的 `scan: 3 / tuning: 4 / library: 6 / settings: 9` 全部错位 → **调束监控与调束结果两张图拍成了同一个页面，PNG 字节完全一致**（`md5` 相同才发现，肉眼看列表完全看不出来） | 切页改用页面注册表的 key（`window._navigate_to`）；`snap()` 在抓图前**核对当前页**，拍错页直接报错退出 |
+| 依赖页面内部合成函数 | `scan._signal(value)` 已随"平台自己算谱"的写法一起删掉 → 工具第一步就 `AttributeError` | 工具自带合成质谱（几个高斯峰 + 固定种子噪声），不依赖页面内部实现 |
+| 调束页控件名过期 | `_target_iterations` / `tuning_progress` / `result_card` / `apply_status` / `reviewed_checkbox` 都不存在了 | 改按当前控件驱动：`_apply_status` + `_on_iterations` 喂合成轮次，监控页会带上收敛曲线、过程建议、日志与响应曲线下拉；结果页带参数变化表与三种设备处置 |
+| 截图不可复现 / 会碰现场 | 页面构造时会真发读信号与拉映射请求，画面取决于现场服务状态；调束页还会自动载入操作员本机保存的配置 | 客户端联网入口全部换成**不会完成的假线程**；`SPECTRUM_TUNING_CONFIG` 指向临时文件 |
+| 手动页没有截图 | 9 个快照点里没有手动页（O7） | 新增 `_09_manual`（浅/深各一张），用**真实 128 路映射**铺满卡片再喂合成回读 |
+
+验证（可复现）：`.\.venv\Scripts\python.exe tools\ui_snapshot.py --out build\ui_snap` → 20 张（浅/深各 10），工具自己比对哈希并打印 `[ok] 20 张截图互不相同`；`ruff check tools` 干净。**注意**：仓库 `docs/ui-review-snapshots/` 下的 18 张是 UI 改造的历史基线，不要用新工具覆盖它们（要对比就换 `--tag`）。
+
+**另外修掉两处在线自检的"瞬时采样"误报**（`tools/check_manual_page_live.py`，连续跑 5 次才稳定复现）：
+
+| 误报 | 原因（实测取证） | 修法 |
+|---|---|---|
+| 「新一次下发清掉上一次的标红」偶发失败 | 断言只接受 `state ∈ {"", "warn"}`——但回读一旦进容差，这一行会显示 `good`（≈ 已稳定）。写 320 之后那一帧正好读到 320 时就是 `good`。**产品行为是对的**：临时脚本连跑 8 轮，每轮 `rejected_flag=False`，终态是 `""` 或 `good`，从没停在 `error` | 断言改成"**不是 error**"（三种状态都代表标红已清掉），并等到状态稳定再断言 |
+| 「按钮选中态跟随实际回读」偶发失败 | 按钮选中态按**回读值**每个轮询周期刷一次，点完立刻断言会撞上"回读还没回来"那一帧 | 改成等待其跟随到位（或服务端明确拒绝），有界 10 s |
+
+顺手把这两处依赖的"消息区文案"改成先清空再提交：不清空时 `pump` 可能被**上一次**留下的"已下发/被拒绝"立刻满足，断言实际看的是旧结果。
 
 ---
 
