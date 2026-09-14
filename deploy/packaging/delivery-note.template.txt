@@ -1,0 +1,37 @@
+谱图与束流控制平台 · 交付包说明
+======================================
+版本：{{VERSION}}      打包时间：{{DATE}}
+
+一、怎么启动
+  双击 spectrum-client\spectrum-client.exe 。
+  客户端会自动以隐藏窗口拉起同目录的 spectrum-instrument-service.exe（监听 127.0.0.1:8765），
+  服务就绪后才进入主界面；关闭界面时是否停掉该服务由设置 instrument/stopServiceOnExit 决定（默认停止）。
+
+  注意：onedir 目录必须整体拷贝，不能只拷 exe 文件。
+
+二、首次配置（每台机器一次）
+  打开“系统设置 → 服务连接”，把“数据服务地址”改成服务器地址，例如 http://<服务器IP>:8000；
+  “仪器执行地址”保持 http://127.0.0.1:8765 不要改。
+
+  检索/分析电脑用同一份包即可：该机连不到控制网时 PV 健康检查会失败，扫谱与自动调束入口自动禁用。
+
+三、EPICS 连接（仅控制电脑需要）
+  程序通过 ctypes 直接调用 EPICS base 的 ca.dll，不依赖 pip 安装的 pyepics/caproto。
+  若 ca.dll 不在默认位置，请设置系统环境变量后重启客户端：
+
+      SPECTRUM_CA_LIB_DIR = ca.dll 所在目录        （例如 D:\epics\base\bin\windows-x64）
+      或  EPICS_BASE      = EPICS base 根目录      （程序会自动推导 bin\<arch>）
+
+  验证：浏览器打开 http://127.0.0.1:8765/control/v1/pvs/health
+        status = ready 表示受控 PV 全部连通；unavailable 表示连不上 IOC（或未设置上述变量）。
+
+四、常见问题
+  * 数据服务显示不可达：检查服务器地址、端口（默认 8000）与防火墙放行。
+  * PV 全部未连接：确认本机在控制网内、IOC 在线，并已按第三节设置 ca.dll 路径。
+  * 想让仪器服务开机常驻（不随界面退出）：见仓库 deploy\README.md 的 NSSM 章节。
+  * 界面提示扫谱/调束不可用：说明仪器服务或关键 PV 未就绪，先看“系统设置”与服务状态栏。
+
+五、相关文档
+  README.md                        环境安装与启动
+  docs\部署矩阵与环境初始化.md      三台机器各装什么、地址怎么配
+  docs\系统架构图与组件说明.md      架构图与组件职责

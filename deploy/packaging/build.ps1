@@ -144,6 +144,21 @@ function Compress-Directory {
     New-ZipArchive -SourceDir $SourceDir -ZipPath ($SourceDir + '.zip')
 }
 
+function Write-DeliveryNote {
+    param([string]$PackageDir)
+    # The template is a separate UTF-8 file on purpose: this script stays ASCII-only
+    # so Windows PowerShell 5.1 parses it correctly, while the note keeps Chinese text.
+    $template = Join-Path $PackagingDir 'delivery-note.template.txt'
+    if (-not (Test-Path $template)) { return }
+    $note = Get-Content -Raw -Encoding UTF8 $template
+    $note = $note.Replace('{{VERSION}}', (Get-ProjectVersion))
+    $note = $note.Replace('{{DATE}}', (Get-Date -Format 'yyyy-MM-dd HH:mm'))
+    $target = Join-Path $PackageDir 'README-DEPLOY.txt'
+    Set-Content -Path $target -Value $note -Encoding UTF8
+    Write-Host "    delivery note: $target"
+    Copy-Item -Force $target (Join-Path $DistPath 'README-DEPLOY.txt')
+}
+
 function New-OperatorPackage {
     Invoke-OneBuild 'client'
     Invoke-OneBuild 'instrument-service'
@@ -154,6 +169,7 @@ function New-OperatorPackage {
     New-Item -ItemType Directory -Path $AssemblyDir | Out-Null
     Copy-Item -Recurse $ClientSrc (Join-Path $AssemblyDir 'spectrum-client')
     Copy-Item -Recurse $ServiceSrc (Join-Path $AssemblyDir 'spectrum-instrument-service')
+    Write-DeliveryNote -PackageDir $AssemblyDir
     Write-Host ""
     Write-Host "    operator package: $AssemblyDir"
     return $AssemblyDir
@@ -203,6 +219,17 @@ if ($Target -eq 'release') {
     Write-Step "Release summary"
     Get-ChildItem $DistPath -Filter '*.zip' | ForEach-Object {
         Write-Host ("    dist\{0}   {1:N1} MB" -f $_.Name, ($_.Length / 1MB))
+    }
+    Write-Host "    dist\README-DEPLOY.txt     (ship this note with the package)"
+
+    # EPICS ca.dll is loaded at runtime via ctypes; tell the operator where it comes from.
+    $caVars = @('SPECTRUM_CA_LIB_DIR', 'EPICS_CA_LIB_DIR', 'EPICS_BASE') |
+        Where-Object { [Environment]::GetEnvironmentVariable($_) }
+    if ($caVars) {
+        Write-Host "    EPICS hint: $($caVars -join ', ') is set on this machine; target PCs configure their own."
+    } else {
+        Write-Host "    EPICS hint: no ca.dll path configured here - target control PCs set"
+        Write-Host "                SPECTRUM_CA_LIB_DIR or EPICS_BASE (see README-DEPLOY.txt)."
     }
 } elseif ($Target -eq 'operator-package') {
     $AssemblyDir = New-OperatorPackage
