@@ -193,6 +193,11 @@ packages/domain、contracts、spectrum、epics_adapter、optimizer
 │  └─ 平台架构与技术选型方案.md  # 技术选型、部署拓扑、存储、安全与风险依据
 ├─ deploy/
 │  └─ README.md                  # 未来安装包、服务和数据库部署资源说明
+├─ sim/                          # 本地模拟 EPICS IOC（无真实设备时联调用）
+│  ├─ ioc.db                     # 模拟 PV 数据库，与默认 PV 映射一一对应
+│  ├─ start-ioc.cmd              # 一键启动模拟 IOC
+│  ├─ sim_check.py               # 无头自检：起 IOC → 走执行服务链路 → 逐项断言
+│  └─ README.md                  # 用法、CA 库注意事项与已知限制
 ├─ migrations/
 │  └─ README.md                  # 未来 Alembic 数据库迁移规则
 ├─ tools/
@@ -233,7 +238,9 @@ packages/domain、contracts、spectrum、epics_adapter、optimizer
 
 `main.py` 使用 `QSettings("SpectrumPlatform", "DesktopClient")` 保存主题、窗口位置、最大化状态、侧栏状态和最后访问页面等本机偏好。`Ctrl+B` 可收起或展开侧栏。
 
-客户端启动后会在后台依次检查仪器执行服务、受控 PV 和数据服务。仪器服务或关键 PV 不可用时，扫谱与自动调束入口保持禁用；数据服务可达时，客户端使用同步游标把中央目录和谱图增量镜像到用户级 `client_cache`。本地镜像使用 SQLite 保存目录，以经过 SHA-256 和格式校验的 NPZ 文件保存谱图，不与仪器执行服务的待上传暂存区混用。
+客户端启动后会在后台依次检查仪器执行服务、受控 PV 和数据服务。仪器服务或关键 PV 不可用时，扫谱与自动调束入口保持禁用；数据服务可达时，客户端使用同步游标把中央目录和谱图增量镜像到本地。本地镜像使用 SQLite 保存目录，以经过 SHA-256 和格式校验的 NPZ 文件保存谱图，不与仪器执行服务的待上传暂存区混用。
+
+本地镜像目录在「系统设置 → 服务与连接 → 本地数据目录」里配置（填绝对路径，保存时会自动创建并检查可写，另有浏览/打开目录/用默认目录），默认值是 `%LOCALAPPDATA%\SpectrumPlatform\client_cache`；也可用环境变量 `SPECTRUM_CLIENT_CACHE` 覆盖，或用 `QSettings` 键 `sync/cacheRoot` 指定。换目录不会删除旧目录内容，新目录在下次同步（重启客户端，或点「同步中央数据」右侧的重试）时生效。初始化页的同步步骤会显示当前目标目录；数据服务不可达时该步骤显示「已跳过」并给出重试入口。
 
 ## 6. 技术栈与依赖分组
 
@@ -381,7 +388,17 @@ spectrum-client
 .\.venv\Scripts\python.exe -m ruff check .
 ```
 
-现有测试不连接 PostgreSQL 或真实 EPICS，因此适合在普通开发电脑上运行。真实设备联调需要单独的现场测试计划，不能用模拟测试结果代替安全和时序验收。
+现有测试不连接 PostgreSQL 或真实束线设备，因此适合在普通开发电脑上运行。其中
+`tests/test_channel_access.py` 会起一个**本地模拟 IOC** 验证真实 Channel Access 读写
+（固定只连 `127.0.0.1`）；本机没有 `softIoc.exe` 或可加载的 `ca.dll` 时该组测试自动跳过。
+
+想手动跑一遍完整的模拟链路（客户端 → 执行服务 → CA → IOC），见 `sim/README.md`：
+
+```powershell
+.\.venv\Scripts\python.exe sim\sim_check.py
+```
+
+真实设备联调需要单独的现场测试计划，不能用模拟测试结果代替安全和时序验收。
 
 ## 11. 开发约定
 
@@ -399,7 +416,7 @@ spectrum-client
 - 修改谱图二进制结构时必须升级格式版本，并考虑旧数据兼容策略。
 - `demo/` 只用于理解旧需求和迁移经过验证的算法，不允许新应用直接依赖旧 Tkinter 界面。
 - 数据库模式变更最终应通过 `migrations/` 中的 Alembic 迁移完成，客户端不得自行升级数据库。
-- PV 映射是执行服务持有的受控配置：客户端只通过 `/control/v1/pv-mapping` 读写，页面不得直接访问 IOC，也不得自行落盘映射。写入真实 PV 仍需通过参数边界与设备联锁。
+- PV 映射是执行服务持有的受控配置：客户端只通过 `/control/v1/pv-mapping` 读写，页面不得直接访问 IOC，也不得自行落盘映射。设备访问统一走真实 EPICS 通道访问，没有模拟/真实模式开关；没有 IOC 时健康检查如实报未连接，开发联调请起 `sim/` 下的模拟 IOC。写入真实 PV 仍需通过参数边界与设备联锁。
 
 ## 12. 后续实施路线
 
