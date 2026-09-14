@@ -25,24 +25,35 @@ from . import pv_mapping
 
 
 def create_gateway(config: PvMappingConfig) -> EpicsGateway:
-    """按配置的网关模式创建网关。
+    """按受控映射创建真实 EPICS Channel Access 网关。
 
-    ``channel-access`` 为真实 EPICS 通道访问；``simulated`` 为内存模拟实现，
-    供无 IOC 的开发机与自动化测试使用。
+    设备访问只有这一条路径：没有可用 IOC 时健康检查会如实报未连接，不会退化成模拟。
+    开发/联调请起 ``sim/`` 下的本地模拟 IOC。
+
+    ``ca.dll`` 的定位由 ``packages.epics_adapter`` 自动完成（环境变量
+    ``SPECTRUM_CA_LIB_DIR`` 可覆盖）；加载失败的原因会逐项写进健康明细。
     """
-    if config.gateway == "channel-access":
-        return ChannelAccessGateway(
-            paths={entry.signal: entry.pv for entry in config.entries},
-            units={entry.signal: entry.unit for entry in config.entries},
-            lib_dir=config.ca_lib_dir or None,
-        )
-    return SimulatedEpicsGateway(pv_mapping.simulated_seed_values(config))
+    return ChannelAccessGateway(
+        paths={entry.signal: entry.pv for entry in config.entries},
+        units={entry.signal: entry.unit for entry in config.entries},
+    )
 
 
 def create_simulated_gateway(config: PvMappingConfig | None = None) -> SimulatedEpicsGateway:
-    """按映射创建模拟网关（测试与演示用）。"""
+    """按映射创建模拟网关（测试与演示用）。
+
+    同时按映射里的 ``readback_signal`` 建立「设定 → 回读」耦合，让模拟设备
+    表现得像一个真的会跟随的电源，而不是一张扁平键值表。
+    """
     target = config or pv_mapping.default_config()
-    return SimulatedEpicsGateway(pv_mapping.simulated_seed_values(target))
+    coupling = {
+        entry.signal: entry.readback_signal
+        for entry in target.entries
+        if entry.readback_signal
+    }
+    return SimulatedEpicsGateway(
+        pv_mapping.simulated_seed_values(target), coupling=coupling
+    )
 
 
 def check_pv_health(
@@ -106,7 +117,7 @@ def check_pv_health(
     return PvHealthResponse(
         status=status,
         checked_at=datetime.now(UTC).isoformat(),
-        config_version=f"{config.gateway}:{len(config.entries)}",
+        config_version=f"pv-mapping:{len(config.entries)}",
         summary=PvHealthSummary(
             total=len(items),
             connected=connected_count,

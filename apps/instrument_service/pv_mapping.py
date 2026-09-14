@@ -7,8 +7,8 @@
 * 客户端通过 ``/control/v1/pv-mapping`` 读写，不直接碰文件；
 * 落盘为 JSON，位置可用 ``SPECTRUM_PV_MAPPING`` 覆盖（默认用户配置目录）。
 
-安全边界：允许配置任意 PV 是现场接入的硬需求，但写入真实设备仍受
-「网关模式 + 只读判定 + 业务参数边界」三重约束，见 README 的说明。
+安全边界：允许配置任意 PV 是现场接入的硬需求。设备访问统一走真实 Channel Access，
+落库/写入仍受「只读判定 + 业务参数边界」约束，见 README 的说明。
 """
 
 from __future__ import annotations
@@ -25,6 +25,8 @@ from packages.contracts import (
     PvMappingIssue,
 )
 
+from . import device_profiles
+
 CONFIG_VERSION = 1
 
 # 业务信号键：小写点分，供执行服务内部引用，落库、日志、审计都用它。
@@ -32,8 +34,9 @@ _SIGNAL_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)*$")
 # EPICS PV 名：允许字母数字与 : . - _ [ ] $ + < >，禁止空白与空串。
 _PV_PATTERN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_:.\-\[\]$+<>]*$")
 
-# 现场接入前的默认映射（与历史 CONTROLLED_SIGNALS 一致，补上中文显示名）。
-DEFAULT_ENTRIES: tuple[PvMappingEntry, ...] = (
+# 历史默认映射（简明束线 BL:*）：保留供回退与对照，已不再是默认设备。
+# 真正的默认设备是团簇离子源与磁电双聚焦，清单见 device_profiles.py。
+LEGACY_ENTRIES: tuple[PvMappingEntry, ...] = (
     PvMappingEntry(
         signal="quadrupole.q1.current",
         label="Q1 电流",
@@ -105,12 +108,8 @@ DEFAULT_SIMULATED_VALUES: dict[str, float] = {
 
 
 def default_config() -> PvMappingConfig:
-    return PvMappingConfig(
-        version=CONFIG_VERSION,
-        gateway="simulated",
-        ca_lib_dir="",
-        entries=list(DEFAULT_ENTRIES),
-    )
+    """默认设备配置：团簇离子源与磁电双聚焦（清单见 ``device_profiles``）。"""
+    return device_profiles.default_config()
 
 
 def config_path() -> Path:
@@ -124,7 +123,11 @@ def config_path() -> Path:
 
 
 def load_config() -> PvMappingConfig:
-    """读取配置；文件不存在或损坏时回退默认值（不抛异常，保证服务可启动）。"""
+    """读取配置；文件不存在、损坏或没有可用条目时回退默认值（不抛异常，保证服务可启动）。
+
+    空条目清单也算不可用：设备服务没有任何 PV 时健康检查会报
+    「ready / 0 项」，那是个误导性的状态，不如回退到默认映射（与损坏文件同等对待）。
+    """
     path = config_path()
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -133,9 +136,12 @@ def load_config() -> PvMappingConfig:
     except (OSError, json.JSONDecodeError):
         return default_config()
     try:
-        return PvMappingConfig.model_validate(raw)
+        config = PvMappingConfig.model_validate(raw)
     except Exception:  # noqa: BLE001  历史/手改坏文件一律回退默认值
         return default_config()
+    if not config.entries:
+        return default_config()
+    return config
 
 
 def save_config(config: PvMappingConfig) -> Path:
@@ -222,27 +228,17 @@ def validate_config(config: PvMappingConfig) -> list[PvMappingIssue]:
                 PvMappingIssue(index=index, field="label", message="设备参数名不能为空")
             )
 
-    if config.gateway == "channel-access" and config.ca_lib_dir:
-        candidate = Path(config.ca_lib_dir)
-        directory = candidate.parent if candidate.suffix.lower() == ".dll" else candidate
-        if not (directory / "ca.dll").is_file():
-            issues.append(
-                PvMappingIssue(
-                    index=-1,
-                    field="ca_lib_dir",
-                    message=f"指定目录下没有 ca.dll：{directory}",
-                )
-            )
-
     return issues
 
 
 def simulated_seed_values(config: PvMappingConfig) -> dict[str, tuple[float, str]]:
-    """把映射翻译成模拟网关需要的 ``{signal: (初值, 单位)}``。"""
+    """把映射翻译成模拟网关需要的 ``{signal: (初值, 单位)}``。
+
+    初值优先取当前设备配置档（团簇源的现场观测值），未覆盖的信号回退 0.0。
+    """
+    seeds = dict(DEFAULT_SIMULATED_VALUES)
+    seeds.update(device_profiles.SIMULATED_VALUES)
     return {
-        entry.signal: (
-            DEFAULT_SIMULATED_VALUES.get(entry.signal, 0.0),
-            entry.unit,
-        )
+        entry.signal: (seeds.get(entry.signal, 0.0), entry.unit)
         for entry in config.entries
     }

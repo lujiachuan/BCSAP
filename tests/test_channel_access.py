@@ -7,8 +7,9 @@
 
 两者缺一时整组跳过，因此在没有 EPICS 的机器上不会失败。
 
-安全说明：测试固定把 ``EPICS_CA_ADDR_LIST`` 指向 127.0.0.1，只连本地测试 IOC，
-不会碰到任何真实束线设备。
+安全说明：测试把 ``EPICS_CA_ADDR_LIST`` 指向 127.0.0.1，且用**独立的 CA 服务
+端口**（``TEST_CA_PORT``），因此既不会碰到任何真实束线设备，也不会误连开发机上
+已经跑着的模拟 IOC。
 """
 
 from __future__ import annotations
@@ -30,6 +31,11 @@ PV_Q1 = "BL:Q1:ISET"
 PV_Q2 = "BL:Q2:ISET"
 PV_DET = "BL:DET:CURRENT"
 PV_MISSING = "BL:NO:SUCH:PV"
+
+# 测试专用 CA 服务端口。**不能沿用默认 5064**：开发机上常常已经跑着一个模拟
+# IOC（``sim/ioc.db``，提供的是 Part1:*/BD:* 记录）。两者共用端口时，本测试会
+# 静默连到那个 IOC 上，然后因为找不到 BL:* 记录而报出一堆与代码无关的失败。
+TEST_CA_PORT = "5164"
 
 # 记录初始值，用于断言读到的是 IOC 里的真值而不是默认值
 Q1_INITIAL = 1.842
@@ -97,14 +103,22 @@ class ChannelAccessIntegrationTests(unittest.TestCase):
 
         cls._env_backup = {
             key: os.environ.get(key)
-            for key in ("EPICS_CA_ADDR_LIST", "EPICS_CA_AUTO_ADDR_LIST")
+            for key in (
+                "EPICS_CA_ADDR_LIST",
+                "EPICS_CA_AUTO_ADDR_LIST",
+                "EPICS_CA_SERVER_PORT",
+            )
         }
         os.environ["EPICS_CA_ADDR_LIST"] = "127.0.0.1"
         os.environ["EPICS_CA_AUTO_ADDR_LIST"] = "NO"
+        # 客户端与服务端在同一个进程环境里，设一次即可：子进程 IOC 用它绑定，
+        # 本进程的 CA 客户端用它作为搜索目标端口。
+        os.environ["EPICS_CA_SERVER_PORT"] = TEST_CA_PORT
 
-        # softIoc 一旦读到 stdin EOF 就退出，必须持有它的 stdin 管道
+        # softIoc 一旦读到 stdin EOF 就退出，必须持有它的 stdin 管道；
+        # 同时加 -S 不起交互 shell，避免依赖 stdin 存活。
         cls.ioc = subprocess.Popen(
-            [str(SOFT_IOC), "-d", str(db_path)],
+            [str(SOFT_IOC), "-S", "-d", str(db_path)],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -114,6 +128,31 @@ class ChannelAccessIntegrationTests(unittest.TestCase):
             cls._restore_env()
             cls._directory.cleanup()
             raise unittest.SkipTest("本地 softIoc 启动后立即退出")
+        cls._require_test_ioc()
+
+    @classmethod
+    def _require_test_ioc(cls) -> None:
+        """确认连到的确实是本测试自己起的 IOC，否则带原因跳过而不是报假失败。"""
+        try:
+            gateway = ChannelAccessGateway(
+                paths={"q1": PV_Q1}, units={"q1": "A"}, connect_timeout=5.0
+            )
+            gateway.connect()
+        except ConnectionError as exc:
+            raise unittest.SkipTest(f"本机没有可加载的 ca.dll：{exc}") from exc
+        try:
+            reading = gateway.read("q1")
+        except Exception as exc:  # noqa: BLE001  连不上就是环境问题，跳过
+            raise unittest.SkipTest(
+                f"测试 IOC 不可达（CA 端口 {TEST_CA_PORT}）：{exc}"
+            ) from exc
+        finally:
+            gateway.close()
+        if not reading.connected:
+            raise unittest.SkipTest(
+                f"CA 端口 {TEST_CA_PORT} 上读不到 {PV_Q1}："
+                "该端口可能已被其它 IOC 占用，测试无法隔离运行"
+            )
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -200,11 +239,9 @@ class ChannelAccessIntegrationTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             gateway.read("not.configured")
 
-    def test_health_check_in_channel_access_mode(self) -> None:
+    def test_health_check_reports_per_pv_state(self) -> None:
         config = PvMappingConfig(
             version=1,
-            gateway="channel-access",
-            ca_lib_dir="",
             entries=[
                 PvMappingEntry(
                     signal="quadrupole.q1.current",
@@ -248,7 +285,6 @@ class ChannelAccessIntegrationTests(unittest.TestCase):
 
         updated = original.model_copy(
             update={
-                "gateway": "channel-access",
                 "entries": [
                     PvMappingEntry(
                         signal="quadrupole.q1.current",

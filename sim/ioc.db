@@ -1,0 +1,1203 @@
+# Simulated beamline IOC for local development and wiring checks.
+#
+# GENERATED FILE -- do not edit by hand.
+# Regenerate with:  .\.venv\Scripts\python.exe tools\generate_sim_ioc.py
+# Source of truth:  apps/instrument_service/device_profiles.py
+#   (CLUSTER_SOURCE_ENTRIES = application default mapping,
+#    SIM_ONLY_ENTRIES      = real-PV ledger extras covered by the sim IOC only)
+#
+# The PV set mirrors the full demo ledger (demo/argon_tuning/argon_tuning/):
+# gas / sputter / vacuum / ion optics / DW array / BD high voltage / magnets /
+# Faraday cups from the PV ledger, plus the MSScan & MS:Scanz records deployed
+# on the mass-scan IOC. Pointing the service at this IOC turns every health-check
+# item green and every ledger PV addressable via caget/caput without editing config.
+#
+# Record types model the device honestly:
+#   ao    = writable setpoint   (mapping entry writable=True)
+#   ai    = read-only reading   (mapping entry writable=False)
+#   calc  = readback that mirrors its setpoint (so the simulated device
+#           actually follows what you write; without this every scan point
+#           would be judged "not settled" and the scan flow would be
+#           impossible to exercise locally)
+#
+# DRVH/DRVL are deliberately NOT set: if this IOC clamped out-of-range writes,
+# a wiring test could not tell whether a bad value was stopped by the
+# application's execution layer or by the IOC. The application must reject it.
+#
+# Comments are kept ASCII on purpose: EPICS dbLoadRecords is not guaranteed to
+# handle non-ASCII bytes. Chinese labels live in device_profiles.py.
+
+# --- gas.ar.flow_setpoint | writable allowed 0..500 ---
+record(ao, "Part1:Flow_W:CS200A:Setpoint") {
+    field(DESC, "gas.ar.flow_setpoint")
+    field(VAL,  "100")
+    field(EGU,  "sccm")
+    field(PREC, "6")
+}
+
+# --- gas.ar.flow_readback | mirrors gas.ar.flow_setpoint ---
+record(calc, "Part1:Flow_R:CS200A:InstantSCCM") {
+    field(DESC, "gas.ar.flow_readback")
+    field(INPA, "Part1:Flow_W:CS200A:Setpoint CP")
+    field(CALC, "A")
+    field(EGU,  "sccm")
+    field(PREC, "6")
+}
+
+# --- gas.ar.mode | writable allowed 0..2 ---
+record(ao, "Part1:Valve_CMD:CS200A:Mode") {
+    field(DESC, "gas.ar.mode")
+    field(VAL,  "1")
+    field(PREC, "6")
+}
+
+# --- gas.he.flow_setpoint | writable allowed 0..500 ---
+record(ao, "Part1:Flow_W:CS200A02:Setpoint") {
+    field(DESC, "gas.he.flow_setpoint")
+    field(VAL,  "0")
+    field(EGU,  "sccm")
+    field(PREC, "6")
+}
+
+# --- gas.he.flow_readback | mirrors gas.he.flow_setpoint ---
+record(calc, "Part1:Flow_R:CS200A02:InstantSCCM") {
+    field(DESC, "gas.he.flow_readback")
+    field(INPA, "Part1:Flow_W:CS200A02:Setpoint CP")
+    field(CALC, "A")
+    field(EGU,  "sccm")
+    field(PREC, "6")
+}
+
+# --- gas.he.mode | writable allowed 0..2 ---
+record(ao, "Part1:Valve_CMD:CS200A02:Mode") {
+    field(DESC, "gas.he.mode")
+    field(VAL,  "1")
+    field(PREC, "6")
+}
+
+# --- sputter.power_setpoint | writable allowed 0..500 ---
+record(ao, "Part1:JSPow:Pwr-S") {
+    field(DESC, "sputter.power_setpoint")
+    field(VAL,  "50")
+    field(EGU,  "W")
+    field(PREC, "6")
+}
+
+# --- sputter.power_5k_setpoint | writable allowed 0..5000 ---
+record(ao, "Part1:JSPow:Pwr-S5K") {
+    field(DESC, "sputter.power_5k_setpoint")
+    field(VAL,  "0")
+    field(EGU,  "W")
+    field(PREC, "6")
+}
+
+# --- sputter.power_enable | writable allowed 0..1 ---
+record(ao, "Part1:JSPow:Power-Sel") {
+    field(DESC, "sputter.power_enable")
+    field(VAL,  "1")
+    field(PREC, "6")
+}
+
+# --- sputter.arc_clear | writable allowed 0..1 ---
+record(ao, "Part1:JSPow:ArcClear-S") {
+    field(DESC, "sputter.arc_clear")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- sputter.power_readback | mirrors sputter.power_setpoint ---
+record(calc, "Part1:JSPow:Pwr-R") {
+    field(DESC, "sputter.power_readback")
+    field(INPA, "Part1:JSPow:Pwr-S CP")
+    field(CALC, "A")
+    field(EGU,  "W")
+    field(PREC, "6")
+}
+
+# --- sputter.arc_rate_readback | read-only ---
+record(ai, "Part1:JSPow:ArcRate-R") {
+    field(DESC, "sputter.arc_rate_readback")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- vacuum.chamber_pressure | read-only ---
+record(ai, "Part1:Sputtering") {
+    field(DESC, "vacuum.chamber_pressure")
+    field(VAL,  "0.9765")
+    field(EGU,  "Pa")
+    field(PREC, "6")
+}
+
+# --- ion_optics.focus.voltage_setpoint | writable allowed 0..5100 ---
+record(ao, "Part1:JM_POWER:03:SET_VOL") {
+    field(DESC, "ion_optics.focus.voltage_setpoint")
+    field(VAL,  "3000")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- ion_optics.focus.output_enable | writable allowed 0..1 ---
+record(ao, "Part1:JM_POWER:03:OutPut") {
+    field(DESC, "ion_optics.focus.output_enable")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- ion_optics.focus.voltage_readback | mirrors ion_optics.focus.voltage_setpoint ---
+record(calc, "Part1:JM_POWER:03:MEAS_VOL") {
+    field(DESC, "ion_optics.focus.voltage_readback")
+    field(INPA, "Part1:JM_POWER:03:SET_VOL CP")
+    field(CALC, "A")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- ion_optics.focus.current_readback | read-only ---
+record(ai, "Part1:JM_POWER:03:MEAS_CUR") {
+    field(DESC, "ion_optics.focus.current_readback")
+    field(VAL,  "0")
+    field(EGU,  "A")
+    field(PREC, "6")
+}
+
+# --- ion_optics.drift.voltage_setpoint | writable allowed 0..5100 ---
+record(ao, "Part1:JM_POWER:04:SET_VOL") {
+    field(DESC, "ion_optics.drift.voltage_setpoint")
+    field(VAL,  "5038")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- ion_optics.drift.output_enable | writable allowed 0..1 ---
+record(ao, "Part1:JM_POWER:04:OutPut") {
+    field(DESC, "ion_optics.drift.output_enable")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- ion_optics.drift.voltage_readback | mirrors ion_optics.drift.voltage_setpoint ---
+record(calc, "Part1:JM_POWER:04:MEAS_VOL") {
+    field(DESC, "ion_optics.drift.voltage_readback")
+    field(INPA, "Part1:JM_POWER:04:SET_VOL CP")
+    field(CALC, "A")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- ion_optics.drift.current_readback | read-only ---
+record(ai, "Part1:JM_POWER:04:MEAS_CUR") {
+    field(DESC, "ion_optics.drift.current_readback")
+    field(VAL,  "0")
+    field(EGU,  "A")
+    field(PREC, "6")
+}
+
+# --- ion_optics.jm01.voltage_readback | read-only ---
+record(ai, "Part1:JM_POWER:01:MEAS_VOL") {
+    field(DESC, "ion_optics.jm01.voltage_readback")
+    field(VAL,  "0")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- ion_optics.jm01.current_readback | read-only ---
+record(ai, "Part1:JM_POWER:01:MEAS_CUR") {
+    field(DESC, "ion_optics.jm01.current_readback")
+    field(VAL,  "0")
+    field(EGU,  "A")
+    field(PREC, "6")
+}
+
+# --- ion_optics.jm07.voltage_readback | read-only ---
+record(ai, "Part1:JM_POWER:07:MEAS_VOL") {
+    field(DESC, "ion_optics.jm07.voltage_readback")
+    field(VAL,  "0")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- ion_optics.jm07.current_readback | read-only ---
+record(ai, "Part1:JM_POWER:07:MEAS_CUR") {
+    field(DESC, "ion_optics.jm07.current_readback")
+    field(VAL,  "0")
+    field(EGU,  "A")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw01.voltage_setpoint | writable allowed 0..200 ---
+record(ao, "Part1:DW:Voltage_Set1") {
+    field(DESC, "hv_array.dw01.voltage_setpoint")
+    field(VAL,  "9")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw01.switch | writable allowed 0..1 ---
+record(ao, "Part1:DW:Voltage_Switch1") {
+    field(DESC, "hv_array.dw01.switch")
+    field(VAL,  "1")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw01.voltage_readback | mirrors hv_array.dw01.voltage_setpoint ---
+record(calc, "Part1:DW:Voltage_Read1") {
+    field(DESC, "hv_array.dw01.voltage_readback")
+    field(INPA, "Part1:DW:Voltage_Set1 CP")
+    field(CALC, "A")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw01.current_readback | read-only ---
+record(ai, "Part1:DW:Current_Read1") {
+    field(DESC, "hv_array.dw01.current_readback")
+    field(VAL,  "0")
+    field(EGU,  "mA")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw02.voltage_setpoint | writable allowed 0..2500 ---
+record(ao, "Part1:DW:Voltage_Set2") {
+    field(DESC, "hv_array.dw02.voltage_setpoint")
+    field(VAL,  "300")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw02.switch | writable allowed 0..1 ---
+record(ao, "Part1:DW:Voltage_Switch2") {
+    field(DESC, "hv_array.dw02.switch")
+    field(VAL,  "1")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw02.voltage_readback | mirrors hv_array.dw02.voltage_setpoint ---
+record(calc, "Part1:DW:Voltage_Read2") {
+    field(DESC, "hv_array.dw02.voltage_readback")
+    field(INPA, "Part1:DW:Voltage_Set2 CP")
+    field(CALC, "A")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw02.current_readback | read-only ---
+record(ai, "Part1:DW:Current_Read2") {
+    field(DESC, "hv_array.dw02.current_readback")
+    field(VAL,  "0")
+    field(EGU,  "mA")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw03.voltage_setpoint | writable allowed 0..2500 ---
+record(ao, "Part1:DW:Voltage_Set3") {
+    field(DESC, "hv_array.dw03.voltage_setpoint")
+    field(VAL,  "1180")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw03.switch | writable allowed 0..1 ---
+record(ao, "Part1:DW:Voltage_Switch3") {
+    field(DESC, "hv_array.dw03.switch")
+    field(VAL,  "1")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw03.voltage_readback | mirrors hv_array.dw03.voltage_setpoint ---
+record(calc, "Part1:DW:Voltage_Read3") {
+    field(DESC, "hv_array.dw03.voltage_readback")
+    field(INPA, "Part1:DW:Voltage_Set3 CP")
+    field(CALC, "A")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw03.current_readback | read-only ---
+record(ai, "Part1:DW:Current_Read3") {
+    field(DESC, "hv_array.dw03.current_readback")
+    field(VAL,  "0")
+    field(EGU,  "mA")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw04.voltage_setpoint | writable allowed 0..5100 ---
+record(ao, "Part1:DW:Voltage_Set4") {
+    field(DESC, "hv_array.dw04.voltage_setpoint")
+    field(VAL,  "0")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw04.switch | writable allowed 0..1 ---
+record(ao, "Part1:DW:Voltage_Switch4") {
+    field(DESC, "hv_array.dw04.switch")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw04.voltage_readback | mirrors hv_array.dw04.voltage_setpoint ---
+record(calc, "Part1:DW:Voltage_Read4") {
+    field(DESC, "hv_array.dw04.voltage_readback")
+    field(INPA, "Part1:DW:Voltage_Set4 CP")
+    field(CALC, "A")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw04.current_readback | read-only ---
+record(ai, "Part1:DW:Current_Read4") {
+    field(DESC, "hv_array.dw04.current_readback")
+    field(VAL,  "0")
+    field(EGU,  "mA")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw05.voltage_setpoint | writable allowed 0..5100 ---
+record(ao, "Part1:DW:Voltage_Set5") {
+    field(DESC, "hv_array.dw05.voltage_setpoint")
+    field(VAL,  "0")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw05.switch | writable allowed 0..1 ---
+record(ao, "Part1:DW:Voltage_Switch5") {
+    field(DESC, "hv_array.dw05.switch")
+    field(VAL,  "1")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw05.voltage_readback | mirrors hv_array.dw05.voltage_setpoint ---
+record(calc, "Part1:DW:Voltage_Read5") {
+    field(DESC, "hv_array.dw05.voltage_readback")
+    field(INPA, "Part1:DW:Voltage_Set5 CP")
+    field(CALC, "A")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw05.current_readback | read-only ---
+record(ai, "Part1:DW:Current_Read5") {
+    field(DESC, "hv_array.dw05.current_readback")
+    field(VAL,  "0")
+    field(EGU,  "mA")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw06.voltage_setpoint | writable allowed 0..5100 ---
+record(ao, "Part1:DW:Voltage_Set6") {
+    field(DESC, "hv_array.dw06.voltage_setpoint")
+    field(VAL,  "0")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw06.switch | writable allowed 0..1 ---
+record(ao, "Part1:DW:Voltage_Switch6") {
+    field(DESC, "hv_array.dw06.switch")
+    field(VAL,  "1")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw06.voltage_readback | mirrors hv_array.dw06.voltage_setpoint ---
+record(calc, "Part1:DW:Voltage_Read6") {
+    field(DESC, "hv_array.dw06.voltage_readback")
+    field(INPA, "Part1:DW:Voltage_Set6 CP")
+    field(CALC, "A")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw06.current_readback | read-only ---
+record(ai, "Part1:DW:Current_Read6") {
+    field(DESC, "hv_array.dw06.current_readback")
+    field(VAL,  "0")
+    field(EGU,  "mA")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw07.voltage_setpoint | writable allowed 0..5100 ---
+record(ao, "Part1:DW:Voltage_Set7") {
+    field(DESC, "hv_array.dw07.voltage_setpoint")
+    field(VAL,  "0")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw07.switch | writable allowed 0..1 ---
+record(ao, "Part1:DW:Voltage_Switch7") {
+    field(DESC, "hv_array.dw07.switch")
+    field(VAL,  "1")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw07.voltage_readback | mirrors hv_array.dw07.voltage_setpoint ---
+record(calc, "Part1:DW:Voltage_Read7") {
+    field(DESC, "hv_array.dw07.voltage_readback")
+    field(INPA, "Part1:DW:Voltage_Set7 CP")
+    field(CALC, "A")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw07.current_readback | read-only ---
+record(ai, "Part1:DW:Current_Read7") {
+    field(DESC, "hv_array.dw07.current_readback")
+    field(VAL,  "0")
+    field(EGU,  "mA")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw08.voltage_setpoint | writable allowed 0..5100 ---
+record(ao, "Part1:DW:Voltage_Set8") {
+    field(DESC, "hv_array.dw08.voltage_setpoint")
+    field(VAL,  "0")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw08.switch | writable allowed 0..1 ---
+record(ao, "Part1:DW:Voltage_Switch8") {
+    field(DESC, "hv_array.dw08.switch")
+    field(VAL,  "1")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw08.voltage_readback | mirrors hv_array.dw08.voltage_setpoint ---
+record(calc, "Part1:DW:Voltage_Read8") {
+    field(DESC, "hv_array.dw08.voltage_readback")
+    field(INPA, "Part1:DW:Voltage_Set8 CP")
+    field(CALC, "A")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw08.current_readback | read-only ---
+record(ai, "Part1:DW:Current_Read8") {
+    field(DESC, "hv_array.dw08.current_readback")
+    field(VAL,  "0")
+    field(EGU,  "mA")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw09.voltage_setpoint | writable allowed 0..5100 ---
+record(ao, "Part1:DW:Voltage_Set9") {
+    field(DESC, "hv_array.dw09.voltage_setpoint")
+    field(VAL,  "0")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw09.switch | writable allowed 0..1 ---
+record(ao, "Part1:DW:Voltage_Switch9") {
+    field(DESC, "hv_array.dw09.switch")
+    field(VAL,  "1")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw09.voltage_readback | mirrors hv_array.dw09.voltage_setpoint ---
+record(calc, "Part1:DW:Voltage_Read9") {
+    field(DESC, "hv_array.dw09.voltage_readback")
+    field(INPA, "Part1:DW:Voltage_Set9 CP")
+    field(CALC, "A")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw09.current_readback | read-only ---
+record(ai, "Part1:DW:Current_Read9") {
+    field(DESC, "hv_array.dw09.current_readback")
+    field(VAL,  "0")
+    field(EGU,  "mA")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw10.voltage_setpoint | writable allowed 0..5100 ---
+record(ao, "Part1:DW:Voltage_Set10") {
+    field(DESC, "hv_array.dw10.voltage_setpoint")
+    field(VAL,  "0")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw10.switch | writable allowed 0..1 ---
+record(ao, "Part1:DW:Voltage_Switch10") {
+    field(DESC, "hv_array.dw10.switch")
+    field(VAL,  "1")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw10.voltage_readback | mirrors hv_array.dw10.voltage_setpoint ---
+record(calc, "Part1:DW:Voltage_Read10") {
+    field(DESC, "hv_array.dw10.voltage_readback")
+    field(INPA, "Part1:DW:Voltage_Set10 CP")
+    field(CALC, "A")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw10.current_readback | read-only ---
+record(ai, "Part1:DW:Current_Read10") {
+    field(DESC, "hv_array.dw10.current_readback")
+    field(VAL,  "0")
+    field(EGU,  "mA")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw11.voltage_setpoint | writable allowed 0..5100 ---
+record(ao, "Part1:DW:Voltage_Set11") {
+    field(DESC, "hv_array.dw11.voltage_setpoint")
+    field(VAL,  "0")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw11.switch | writable allowed 0..1 ---
+record(ao, "Part1:DW:Voltage_Switch11") {
+    field(DESC, "hv_array.dw11.switch")
+    field(VAL,  "1")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw11.voltage_readback | mirrors hv_array.dw11.voltage_setpoint ---
+record(calc, "Part1:DW:Voltage_Read11") {
+    field(DESC, "hv_array.dw11.voltage_readback")
+    field(INPA, "Part1:DW:Voltage_Set11 CP")
+    field(CALC, "A")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw11.current_readback | read-only ---
+record(ai, "Part1:DW:Current_Read11") {
+    field(DESC, "hv_array.dw11.current_readback")
+    field(VAL,  "0")
+    field(EGU,  "mA")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw12.voltage_setpoint | writable allowed 0..5100 ---
+record(ao, "Part1:DW:Voltage_Set12") {
+    field(DESC, "hv_array.dw12.voltage_setpoint")
+    field(VAL,  "0")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw12.switch | writable allowed 0..1 ---
+record(ao, "Part1:DW:Voltage_Switch12") {
+    field(DESC, "hv_array.dw12.switch")
+    field(VAL,  "1")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw12.voltage_readback | mirrors hv_array.dw12.voltage_setpoint ---
+record(calc, "Part1:DW:Voltage_Read12") {
+    field(DESC, "hv_array.dw12.voltage_readback")
+    field(INPA, "Part1:DW:Voltage_Set12 CP")
+    field(CALC, "A")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw12.current_readback | read-only ---
+record(ai, "Part1:DW:Current_Read12") {
+    field(DESC, "hv_array.dw12.current_readback")
+    field(VAL,  "0")
+    field(EGU,  "mA")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw13.voltage_setpoint | writable allowed 0..5100 ---
+record(ao, "Part1:DW:Voltage_Set13") {
+    field(DESC, "hv_array.dw13.voltage_setpoint")
+    field(VAL,  "3800")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw13.switch | writable allowed 0..1 ---
+record(ao, "Part1:DW:Voltage_Switch13") {
+    field(DESC, "hv_array.dw13.switch")
+    field(VAL,  "1")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw13.voltage_readback | mirrors hv_array.dw13.voltage_setpoint ---
+record(calc, "Part1:DW:Voltage_Read13") {
+    field(DESC, "hv_array.dw13.voltage_readback")
+    field(INPA, "Part1:DW:Voltage_Set13 CP")
+    field(CALC, "A")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_array.dw13.current_readback | read-only ---
+record(ai, "Part1:DW:Current_Read13") {
+    field(DESC, "hv_array.dw13.current_readback")
+    field(VAL,  "0")
+    field(EGU,  "mA")
+    field(PREC, "6")
+}
+
+# --- hv_bd.cylinder1.voltage_setpoint | writable allowed 0..22000 ---
+record(ao, "BD:FocusThreecyLinderHV:01:HVSet") {
+    field(DESC, "hv_bd.cylinder1.voltage_setpoint")
+    field(VAL,  "19600")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_bd.cylinder1.output_enable | writable allowed 0..1 ---
+record(ao, "BD:FocusThreecyLinderHV:01:OutEnable") {
+    field(DESC, "hv_bd.cylinder1.output_enable")
+    field(VAL,  "1")
+    field(PREC, "6")
+}
+
+# --- hv_bd.cylinder1.voltage_readback | mirrors hv_bd.cylinder1.voltage_setpoint ---
+record(calc, "BD:FocusThreecyLinderHV:01:HVMonitor") {
+    field(DESC, "hv_bd.cylinder1.voltage_readback")
+    field(INPA, "BD:FocusThreecyLinderHV:01:HVSet CP")
+    field(CALC, "A")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_bd.cylinder1.current_readback | read-only ---
+record(ai, "BD:FocusThreecyLinderHV:01:CurrentMonitor") {
+    field(DESC, "hv_bd.cylinder1.current_readback")
+    field(VAL,  "0.00029")
+    field(EGU,  "mA")
+    field(PREC, "6")
+}
+
+# --- hv_bd.cylinder2.voltage_setpoint | writable allowed 0..22000 ---
+record(ao, "BD:FocusThreecyLinderHV:02:HVSet") {
+    field(DESC, "hv_bd.cylinder2.voltage_setpoint")
+    field(VAL,  "15500")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_bd.cylinder2.output_enable | writable allowed 0..1 ---
+record(ao, "BD:FocusThreecyLinderHV:02:OutEnable") {
+    field(DESC, "hv_bd.cylinder2.output_enable")
+    field(VAL,  "1")
+    field(PREC, "6")
+}
+
+# --- hv_bd.cylinder2.voltage_readback | mirrors hv_bd.cylinder2.voltage_setpoint ---
+record(calc, "BD:FocusThreecyLinderHV:02:HVMonitor") {
+    field(DESC, "hv_bd.cylinder2.voltage_readback")
+    field(INPA, "BD:FocusThreecyLinderHV:02:HVSet CP")
+    field(CALC, "A")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_bd.cylinder2.current_readback | read-only ---
+record(ai, "BD:FocusThreecyLinderHV:02:CurrentMonitor") {
+    field(DESC, "hv_bd.cylinder2.current_readback")
+    field(VAL,  "0.00027")
+    field(EGU,  "mA")
+    field(PREC, "6")
+}
+
+# --- hv_bd.deflector1.voltage_setpoint | writable allowed 0..10000 ---
+record(ao, "BD:MultipolePositiveHV:01:HVSet") {
+    field(DESC, "hv_bd.deflector1.voltage_setpoint")
+    field(VAL,  "8199.8")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_bd.deflector1.output_enable | writable allowed 0..1 ---
+record(ao, "BD:MultipolePositiveHV:01:OutEnable") {
+    field(DESC, "hv_bd.deflector1.output_enable")
+    field(VAL,  "1")
+    field(PREC, "6")
+}
+
+# --- hv_bd.deflector1.voltage_readback | mirrors hv_bd.deflector1.voltage_setpoint ---
+record(calc, "BD:MultipolePositiveHV:01:HVMonitor") {
+    field(DESC, "hv_bd.deflector1.voltage_readback")
+    field(INPA, "BD:MultipolePositiveHV:01:HVSet CP")
+    field(CALC, "A")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_bd.deflector1.current_readback | read-only ---
+record(ai, "BD:MultipolePositiveHV:01:CurrentMonitor") {
+    field(DESC, "hv_bd.deflector1.current_readback")
+    field(VAL,  "0.05")
+    field(EGU,  "mA")
+    field(PREC, "6")
+}
+
+# --- hv_bd.deflector2.voltage_setpoint | writable allowed 0..10000 ---
+record(ao, "BD:MultipolePositiveHV:02:HVSet") {
+    field(DESC, "hv_bd.deflector2.voltage_setpoint")
+    field(VAL,  "8199")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_bd.deflector2.output_enable | writable allowed 0..1 ---
+record(ao, "BD:MultipolePositiveHV:02:OutEnable") {
+    field(DESC, "hv_bd.deflector2.output_enable")
+    field(VAL,  "1")
+    field(PREC, "6")
+}
+
+# --- hv_bd.deflector2.voltage_readback | mirrors hv_bd.deflector2.voltage_setpoint ---
+record(calc, "BD:MultipolePositiveHV:02:HVMonitor") {
+    field(DESC, "hv_bd.deflector2.voltage_readback")
+    field(INPA, "BD:MultipolePositiveHV:02:HVSet CP")
+    field(CALC, "A")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- hv_bd.deflector2.current_readback | read-only ---
+record(ai, "BD:MultipolePositiveHV:02:CurrentMonitor") {
+    field(DESC, "hv_bd.deflector2.current_readback")
+    field(VAL,  "0.05")
+    field(EGU,  "mA")
+    field(PREC, "6")
+}
+
+# --- hv_bd.main.voltage_setpoint | writable allowed 0..50 ---
+record(ao, "BD:MainHV:01:HVSet") {
+    field(DESC, "hv_bd.main.voltage_setpoint")
+    field(VAL,  "40")
+    field(EGU,  "kV")
+    field(PREC, "6")
+}
+
+# --- hv_bd.main.output_enable | writable allowed 0..1 ---
+record(ao, "BD:MainHV:01:OutEnable") {
+    field(DESC, "hv_bd.main.output_enable")
+    field(VAL,  "1")
+    field(PREC, "6")
+}
+
+# --- hv_bd.main.voltage_readback | mirrors hv_bd.main.voltage_setpoint ---
+record(calc, "BD:MainHV:01:HVMonitor") {
+    field(DESC, "hv_bd.main.voltage_readback")
+    field(INPA, "BD:MainHV:01:HVSet CP")
+    field(CALC, "A")
+    field(EGU,  "kV")
+    field(PREC, "6")
+}
+
+# --- hv_bd.main.current_readback | read-only ---
+record(ai, "BD:MainHV:01:CurrentMonitor") {
+    field(DESC, "hv_bd.main.current_readback")
+    field(VAL,  "0.1705")
+    field(EGU,  "mA")
+    field(PREC, "6")
+}
+
+# --- hv_bd.main.current_setpoint | writable allowed 0..1000 ---
+record(ao, "BD:MainHV:01:HVCurrentSet") {
+    field(DESC, "hv_bd.main.current_setpoint")
+    field(VAL,  "0.2")
+    field(EGU,  "mA")
+    field(PREC, "6")
+}
+
+# --- magnet.m1.current_setpoint | writable allowed 0..600 ---
+record(ao, "BD:DipoleMagnet:01:CurrentSet") {
+    field(DESC, "magnet.m1.current_setpoint")
+    field(VAL,  "600")
+    field(EGU,  "A")
+    field(PREC, "6")
+}
+
+# --- magnet.m1.current_rate_setpoint | writable allowed 0..10 ---
+record(ao, "BD:DipoleMagnet:01:CurrentRateSet") {
+    field(DESC, "magnet.m1.current_rate_setpoint")
+    field(VAL,  "2")
+    field(EGU,  "A/s")
+    field(PREC, "6")
+}
+
+# --- magnet.m1.current_readback | mirrors magnet.m1.current_setpoint ---
+record(calc, "BD:DipoleMagnet:01:CurrentMonitor") {
+    field(DESC, "magnet.m1.current_readback")
+    field(INPA, "BD:DipoleMagnet:01:CurrentSet CP")
+    field(CALC, "A")
+    field(EGU,  "A")
+    field(PREC, "6")
+}
+
+# --- magnet.m1.hv_readback | read-only ---
+record(ai, "BD:DipoleMagnet:01:HVMonitor") {
+    field(DESC, "magnet.m1.hv_readback")
+    field(VAL,  "12000")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- magnet.m1.start | writable allowed 0..1 ---
+record(ao, "BD:DipoleMagnet:01:Start") {
+    field(DESC, "magnet.m1.start")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- magnet.m1.stop | writable allowed 0..1 ---
+record(ao, "BD:DipoleMagnet:01:Stop") {
+    field(DESC, "magnet.m1.stop")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- magnet.m1.reset | writable allowed 0..1 ---
+record(ao, "BD:DipoleMagnet:01:Reset") {
+    field(DESC, "magnet.m1.reset")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- magnet.m2.current_setpoint | writable allowed 0..600 ---
+record(ao, "BD:DipoleMagnet:02:CurrentSet") {
+    field(DESC, "magnet.m2.current_setpoint")
+    field(VAL,  "600")
+    field(EGU,  "A")
+    field(PREC, "6")
+}
+
+# --- magnet.m2.current_rate_setpoint | writable allowed 0..10 ---
+record(ao, "BD:DipoleMagnet:02:CurrentRateSet") {
+    field(DESC, "magnet.m2.current_rate_setpoint")
+    field(VAL,  "2")
+    field(EGU,  "A/s")
+    field(PREC, "6")
+}
+
+# --- magnet.m2.current_readback | mirrors magnet.m2.current_setpoint ---
+record(calc, "BD:DipoleMagnet:02:CurrentMonitor") {
+    field(DESC, "magnet.m2.current_readback")
+    field(INPA, "BD:DipoleMagnet:02:CurrentSet CP")
+    field(CALC, "A")
+    field(EGU,  "A")
+    field(PREC, "6")
+}
+
+# --- magnet.m2.hv_readback | read-only ---
+record(ai, "BD:DipoleMagnet:02:HVMonitor") {
+    field(DESC, "magnet.m2.hv_readback")
+    field(VAL,  "12000")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- magnet.m2.start | writable allowed 0..1 ---
+record(ao, "BD:DipoleMagnet:02:Start") {
+    field(DESC, "magnet.m2.start")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- magnet.m2.stop | writable allowed 0..1 ---
+record(ao, "BD:DipoleMagnet:02:Stop") {
+    field(DESC, "magnet.m2.stop")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- magnet.m2.reset | writable allowed 0..1 ---
+record(ao, "BD:DipoleMagnet:02:Reset") {
+    field(DESC, "magnet.m2.reset")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- magnet.m3.current_setpoint | writable allowed 0..600 ---
+record(ao, "BD:DipoleMagnet:03:CurrentSet") {
+    field(DESC, "magnet.m3.current_setpoint")
+    field(VAL,  "600")
+    field(EGU,  "A")
+    field(PREC, "6")
+}
+
+# --- magnet.m3.current_rate_setpoint | writable allowed 0..10 ---
+record(ao, "BD:DipoleMagnet:03:CurrentRateSet") {
+    field(DESC, "magnet.m3.current_rate_setpoint")
+    field(VAL,  "2")
+    field(EGU,  "A/s")
+    field(PREC, "6")
+}
+
+# --- magnet.m3.current_readback | mirrors magnet.m3.current_setpoint ---
+record(calc, "BD:DipoleMagnet:03:CurrentMonitor") {
+    field(DESC, "magnet.m3.current_readback")
+    field(INPA, "BD:DipoleMagnet:03:CurrentSet CP")
+    field(CALC, "A")
+    field(EGU,  "A")
+    field(PREC, "6")
+}
+
+# --- magnet.m3.hv_readback | read-only ---
+record(ai, "BD:DipoleMagnet:03:HVMonitor") {
+    field(DESC, "magnet.m3.hv_readback")
+    field(VAL,  "12000")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- magnet.m3.start | writable allowed 0..1 ---
+record(ao, "BD:DipoleMagnet:03:Start") {
+    field(DESC, "magnet.m3.start")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- magnet.m3.stop | writable allowed 0..1 ---
+record(ao, "BD:DipoleMagnet:03:Stop") {
+    field(DESC, "magnet.m3.stop")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- magnet.m3.reset | writable allowed 0..1 ---
+record(ao, "BD:DipoleMagnet:03:Reset") {
+    field(DESC, "magnet.m3.reset")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- magnet.m4.current_setpoint | writable allowed 0..600 ---
+record(ao, "BD:DipoleMagnet:04:CurrentSet") {
+    field(DESC, "magnet.m4.current_setpoint")
+    field(VAL,  "600")
+    field(EGU,  "A")
+    field(PREC, "6")
+}
+
+# --- magnet.m4.current_rate_setpoint | writable allowed 0..10 ---
+record(ao, "BD:DipoleMagnet:04:CurrentRateSet") {
+    field(DESC, "magnet.m4.current_rate_setpoint")
+    field(VAL,  "2")
+    field(EGU,  "A/s")
+    field(PREC, "6")
+}
+
+# --- magnet.m4.current_readback | mirrors magnet.m4.current_setpoint ---
+record(calc, "BD:DipoleMagnet:04:CurrentMonitor") {
+    field(DESC, "magnet.m4.current_readback")
+    field(INPA, "BD:DipoleMagnet:04:CurrentSet CP")
+    field(CALC, "A")
+    field(EGU,  "A")
+    field(PREC, "6")
+}
+
+# --- magnet.m4.hv_readback | read-only ---
+record(ai, "BD:DipoleMagnet:04:HVMonitor") {
+    field(DESC, "magnet.m4.hv_readback")
+    field(VAL,  "12000")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- magnet.m4.start | writable allowed 0..1 ---
+record(ao, "BD:DipoleMagnet:04:Start") {
+    field(DESC, "magnet.m4.start")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- magnet.m4.stop | writable allowed 0..1 ---
+record(ao, "BD:DipoleMagnet:04:Stop") {
+    field(DESC, "magnet.m4.stop")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- magnet.m4.reset | writable allowed 0..1 ---
+record(ao, "BD:DipoleMagnet:04:Reset") {
+    field(DESC, "magnet.m4.reset")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- detector.fc1.beam_current | read-only ---
+record(ai, "BD:FC:01:BeamCurrent") {
+    field(DESC, "detector.fc1.beam_current")
+    field(VAL,  "8.31")
+    field(EGU,  "nA")
+    field(PREC, "6")
+}
+
+# --- detector.fc2.beam_current | read-only ---
+record(ai, "BD:FC:02:BeamCurrent") {
+    field(DESC, "detector.fc2.beam_current")
+    field(VAL,  "0.0104")
+    field(EGU,  "nA")
+    field(PREC, "6")
+}
+
+# --- bd_extra.cylinder1.reset | writable allowed 0..1 ---
+record(ao, "BD:FocusThreecyLinderHV:01:Reset") {
+    field(DESC, "bd_extra.cylinder1.reset")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- bd_extra.cylinder1.error | read-only ---
+record(ai, "BD:FocusThreecyLinderHV:01:Error") {
+    field(DESC, "bd_extra.cylinder1.error")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- bd_extra.cylinder2.reset | writable allowed 0..1 ---
+record(ao, "BD:FocusThreecyLinderHV:02:Reset") {
+    field(DESC, "bd_extra.cylinder2.reset")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- bd_extra.cylinder2.error | read-only ---
+record(ai, "BD:FocusThreecyLinderHV:02:Error") {
+    field(DESC, "bd_extra.cylinder2.error")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- bd_extra.main.reset | writable allowed 0..1 ---
+record(ao, "BD:MainHV:01:Reset") {
+    field(DESC, "bd_extra.main.reset")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- ion_optics.jm01.voltage_setpoint | writable allowed 0..5100 ---
+record(ao, "Part1:JM_POWER:01:SET_VOL") {
+    field(DESC, "ion_optics.jm01.voltage_setpoint")
+    field(VAL,  "0")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- ion_optics.jm01.output_enable | writable allowed 0..1 ---
+record(ao, "Part1:JM_POWER:01:OutPut") {
+    field(DESC, "ion_optics.jm01.output_enable")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- ion_optics.jm07.voltage_setpoint | writable allowed 0..5100 ---
+record(ao, "Part1:JM_POWER:07:SET_VOL") {
+    field(DESC, "ion_optics.jm07.voltage_setpoint")
+    field(VAL,  "0")
+    field(EGU,  "V")
+    field(PREC, "6")
+}
+
+# --- ion_optics.jm07.output_enable | writable allowed 0..1 ---
+record(ao, "Part1:JM_POWER:07:OutPut") {
+    field(DESC, "ion_optics.jm07.output_enable")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- ms_scan.start | writable allowed 0..1 ---
+record(ao, "BD:MSScan:01:ScanStart") {
+    field(DESC, "ms_scan.start")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- ms_scan.stop | writable allowed 0..1 ---
+record(ao, "BD:MSScan:01:ScanStop") {
+    field(DESC, "ms_scan.stop")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- ms_scan.start_current | writable allowed 0..600 ---
+record(ao, "BD:MSScan:01:StartCurrent") {
+    field(DESC, "ms_scan.start_current")
+    field(VAL,  "0")
+    field(EGU,  "A")
+    field(PREC, "6")
+}
+
+# --- ms_scan.stop_current | writable allowed 0..600 ---
+record(ao, "BD:MSScan:01:StopCurrent") {
+    field(DESC, "ms_scan.stop_current")
+    field(VAL,  "0")
+    field(EGU,  "A")
+    field(PREC, "6")
+}
+
+# --- ms_scan.wait_step | writable allowed 0..100000 ---
+record(ao, "BD:MSScan:01:WaitStep") {
+    field(DESC, "ms_scan.wait_step")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- ms_scan.wait_times | writable allowed 0..100000 ---
+record(ao, "BD:MSScan:01:WaitTimes") {
+    field(DESC, "ms_scan.wait_times")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- ms_scan.scanz.start_a | writable allowed 0..600 ---
+record(ao, "BD:MS:Scanz:StartA") {
+    field(DESC, "ms_scan.scanz.start_a")
+    field(VAL,  "0")
+    field(EGU,  "A")
+    field(PREC, "6")
+}
+
+# --- ms_scan.scanz.stop_a | writable allowed 0..600 ---
+record(ao, "BD:MS:Scanz:StopA") {
+    field(DESC, "ms_scan.scanz.stop_a")
+    field(VAL,  "0")
+    field(EGU,  "A")
+    field(PREC, "6")
+}
+
+# --- ms_scan.scanz.boolean_start | writable allowed 0..1 ---
+record(ao, "BD:MS:Scanz:BooleanStart") {
+    field(DESC, "ms_scan.scanz.boolean_start")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- ms_scan.scanz.boolean_stop | writable allowed 0..1 ---
+record(ao, "BD:MS:Scanz:BooleanStop") {
+    field(DESC, "ms_scan.scanz.boolean_stop")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- ms_scan.scanz.rate_set | writable allowed 0..10 ---
+record(ao, "BD:MS:Scanz:RateSet") {
+    field(DESC, "ms_scan.scanz.rate_set")
+    field(VAL,  "0")
+    field(EGU,  "A/s")
+    field(PREC, "6")
+}
+
+# --- ms_scan.scanz.wait_step | writable allowed 0..100000 ---
+record(ao, "BD:MS:Scanz:WaitStep") {
+    field(DESC, "ms_scan.scanz.wait_step")
+    field(VAL,  "0")
+    field(PREC, "6")
+}
+
+# --- ms_scan.scanz.wait_time | writable allowed 0..100000 ---
+record(ao, "BD:MS:Scanz:WaitTime") {
+    field(DESC, "ms_scan.scanz.wait_time")
+    field(VAL,  "0")
+    field(PREC, "6")
+}

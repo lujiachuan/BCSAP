@@ -32,10 +32,8 @@ def entry(
     )
 
 
-def config_with(*entries: PvMappingEntry, gateway: str = "simulated") -> PvMappingConfig:
-    return PvMappingConfig(
-        version=1, gateway=gateway, ca_lib_dir="", entries=list(entries)
-    )
+def config_with(*entries: PvMappingEntry) -> PvMappingConfig:
+    return PvMappingConfig(version=1, entries=list(entries))
 
 
 def route_endpoint(app, path: str, method: str):
@@ -87,17 +85,6 @@ class ValidationTests(unittest.TestCase):
         blank = config_with(entry(label="   "))
         self.assertIn((0, "label"), {(i.index, i.field) for i in pv_mapping.validate_config(blank)})
 
-    def test_channel_access_with_missing_ca_dll_is_rejected(self) -> None:
-        config = PvMappingConfig(
-            version=1,
-            gateway="channel-access",
-            ca_lib_dir=r"C:\definitely\missing-ca-dir",
-            entries=[entry()],
-        )
-        issues = pv_mapping.validate_config(config)
-
-        self.assertIn((-1, "ca_lib_dir"), {(i.index, i.field) for i in issues})
-
     def test_pv_pattern_accepts_realistic_epics_names(self) -> None:
         for pv in ("BL:Q1:ISET", "SR:DCCT:Current", "BL:STEER:X", "PV[0]", "A-B_C.1"):
             with self.subTest(pv=pv):
@@ -139,9 +126,37 @@ class PersistenceTests(unittest.TestCase):
 
     def test_file_with_wrong_shape_returns_defaults(self) -> None:
         Path(os.environ["SPECTRUM_PV_MAPPING"]).write_text(
-            json.dumps({"version": 1, "gateway": "nope", "entries": []}), encoding="utf-8"
+            json.dumps({"version": 1, "entries": "不是列表"}), encoding="utf-8"
         )
         self.assertEqual(pv_mapping.load_config(), pv_mapping.default_config())
+
+    def test_empty_entries_file_returns_defaults(self) -> None:
+        """空清单会让健康检查报「ready / 0 项」，属于不可用配置，应回退默认映射。"""
+        Path(os.environ["SPECTRUM_PV_MAPPING"]).write_text(
+            json.dumps({"version": 1, "entries": []}), encoding="utf-8"
+        )
+        config = pv_mapping.load_config()
+
+        self.assertEqual(config, pv_mapping.default_config())
+        self.assertTrue(config.entries)
+
+    def test_config_written_by_previous_schema_still_loads(self) -> None:
+        """旧版本写过 gateway / ca_lib_dir 字段，现在已移除，应忽略多余字段照常读入。"""
+        Path(os.environ["SPECTRUM_PV_MAPPING"]).write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "gateway": "channel-access",
+                    "ca_lib_dir": r"D:\EPICS\CA-3.15.6-windows-x64",
+                    "entries": [entry(pv="SR:Q1:Current").model_dump()],
+                }
+            ),
+            encoding="utf-8",
+        )
+        config = pv_mapping.load_config()
+
+        self.assertEqual(len(config.entries), 1)
+        self.assertEqual(config.entries[0].pv, "SR:Q1:Current")
 
     def test_save_leaves_no_temp_files(self) -> None:
         pv_mapping.save_config(config_with(entry()))
@@ -150,21 +165,35 @@ class PersistenceTests(unittest.TestCase):
 
 
 class MappingApiTests(unittest.TestCase):
+    """接口层测试：PUT/GET 与健康检查的联动。
+
+    设备访问现在统一走真实 CA，所以这里把 CA 钉死在 127.0.0.1 + 不做广播发现，
+    确保测试**永远不会碰到现场真实 IOC**（本机没有模拟 IOC 时只是全部报未连接）。
+    """
+
     def setUp(self) -> None:
         self._directory = tempfile.TemporaryDirectory()
-        self._previous = os.environ.get("SPECTRUM_PV_MAPPING")
+        self._previous = {
+            key: os.environ.get(key)
+            for key in ("SPECTRUM_PV_MAPPING", "EPICS_CA_ADDR_LIST", "EPICS_CA_AUTO_ADDR_LIST")
+        }
         os.environ["SPECTRUM_PV_MAPPING"] = str(
             Path(self._directory.name) / "pv_mapping.json"
         )
-        self.app = create_app(InstrumentRuntime(pv_mapping.default_config()))
+        os.environ["EPICS_CA_ADDR_LIST"] = "127.0.0.1"
+        os.environ["EPICS_CA_AUTO_ADDR_LIST"] = "NO"
+        self.runtime = InstrumentRuntime(pv_mapping.default_config())
+        self.app = create_app(self.runtime)
         self.get_mapping = route_endpoint(self.app, "/control/v1/pv-mapping", "GET")
         self.put_mapping = route_endpoint(self.app, "/control/v1/pv-mapping", "PUT")
 
     def tearDown(self) -> None:
-        if self._previous is None:
-            os.environ.pop("SPECTRUM_PV_MAPPING", None)
-        else:
-            os.environ["SPECTRUM_PV_MAPPING"] = self._previous
+        self.runtime.close()
+        for key, value in self._previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         self._directory.cleanup()
 
     def test_put_persists_and_takes_effect_immediately(self) -> None:
