@@ -30,7 +30,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from apps.desktop_client.initialization import InitializationPage, InitializationWorker
+from apps.desktop_client.initialization import (
+    InitializationPage,
+    InitializationWorker,
+    cache_root_from_settings,
+)
 from apps.desktop_client.motion import PageTransitionController
 from apps.desktop_client.nav_icons import make_nav_icon, make_symbol
 from apps.desktop_client.pages import DEFAULT_SERVICE_URLS
@@ -85,9 +89,9 @@ class MainWindow(QMainWindow):
         self._sidebar_collapsed = False
         self._start_maximized = False
 
-        shell = AmbientCanvas()
-        shell.setObjectName("appShell")
-        shell_layout = QHBoxLayout(shell)
+        self._shell = AmbientCanvas()
+        self._shell.setObjectName("appShell")
+        shell_layout = QHBoxLayout(self._shell)
         shell_layout.setContentsMargins(0, 0, 0, 0)
         shell_layout.setSpacing(0)
 
@@ -129,7 +133,7 @@ class MainWindow(QMainWindow):
 
         self.pages = QStackedWidget(objectName="pages")
         shell_layout.addWidget(self.pages, 1)
-        self.setCentralWidget(shell)
+        self.setCentralWidget(self._shell)
 
         self._page_rows: dict[int, int] = {}
         self._row_of_key: dict[str, int] = {}
@@ -156,6 +160,11 @@ class MainWindow(QMainWindow):
         toggle_shortcut = QShortcut(QKeySequence("Ctrl+B"), self)
         toggle_shortcut.activated.connect(self._toggle_sidebar)
 
+        # Esc = 当前页安全停止（扫谱/调束运行中立即停；手动控制清空待发队列）
+        esc_shortcut = QShortcut(QKeySequence("Esc"), self)
+        esc_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        esc_shortcut.activated.connect(self._escape_safe_stop)
+
         self._add_pages()
         self.navigation.currentRowChanged.connect(self._show_page)
         self._restore_preferences()
@@ -176,7 +185,7 @@ class MainWindow(QMainWindow):
         self._settings.setValue("lastPageRow", self.navigation.currentRow())
         super().closeEvent(event)
 
-    _ACTIVE_PAGE_NAMES = {"scan": "扫谱", "tuning": "自动调束"}
+    _ACTIVE_PAGE_NAMES = {"manual": "手动控制", "scan": "扫谱", "tuning": "自动调束"}
 
     def _operation_active(self, key: str) -> bool:
         """询问页面实例是否有进行中的任务（扫谱/调束各自实现）。"""
@@ -343,7 +352,14 @@ class MainWindow(QMainWindow):
                 "service/instrumentUrl", DEFAULT_SERVICE_URLS["instrument"]
             )
         )
-        worker = InitializationWorker(data_url, instrument_url, self, targets=targets)
+        worker = InitializationWorker(
+            data_url,
+            instrument_url,
+            self,
+            # 中央数据的本地镜像目录来自系统设置，没配置过就用默认值
+            cache_root=cache_root_from_settings(self._settings),
+            targets=targets,
+        )
         worker.stepChanged.connect(self._on_init_step)
         worker.serviceChanged.connect(self._on_service)
         worker.pvStatus.connect(self._on_pv_status)
@@ -412,9 +428,9 @@ class MainWindow(QMainWindow):
     # ---------- 进入判定与操作资格 ----------
 
     def _apply_control_eligibility(self) -> None:
-        """扫谱/调束入口启用与否由模型推导，页面不自行拼条件。"""
+        """手动控制/扫谱/调束入口启用与否由模型推导，页面不自行拼条件。"""
         can_control = self._model.can_control
-        for page_key in ("scan", "tuning"):
+        for page_key in ("manual", "scan", "tuning"):
             row = self._row_of_key.get(page_key)
             if row is None:
                 continue
@@ -430,7 +446,7 @@ class MainWindow(QMainWindow):
         row = self.navigation.currentRow()
         scan_rows = {
             self._row_of_key[key]
-            for key in ("scan", "tuning")
+            for key in ("manual", "scan", "tuning")
             if key in self._row_of_key
         }
         if not can_control and row in scan_rows:
@@ -531,6 +547,15 @@ class MainWindow(QMainWindow):
         # 避免全树 unpolish/polish 造成的切换开销（M1 性能重构）。
         for widget in app.allWidgets():
             widget.update()
+        # L1 表面（#panel / #noticePanel）的 QSS 背景在「只 update 不 polish」的快路径下
+        # 不会失效缓存：表现为切到深色后卡片仍是浅色。这里对这两类表面强制重 polish。
+        for widget in app.allWidgets():
+            if widget.objectName() in ("panel", "noticePanel", "manualTopbar", "manualGroup"):
+                widget.style().unpolish(widget)
+                widget.style().polish(widget)
+        # AmbientCanvas 自绘背景：update() 会被事件循环合并，切主题后可能不重绘，
+        # 表现为浅色主题下仍是深色背景。强制 repaint()。
+        self._shell.repaint()
         self._sync_service_views()
         self._apply_native_chrome()
 
@@ -544,6 +569,19 @@ class MainWindow(QMainWindow):
         """侧栏头部的菜单/主题按钮图标颜色跟随主题。"""
         color = current_palette()["navText"]
         self.sidebar_button.setIcon(make_symbol("menu", color))
+
+    def _escape_safe_stop(self) -> None:
+        """Esc 快捷键：对当前可见页面执行安全停止（不弹确认，直接停）。"""
+        page = self.pages.currentWidget()
+        scroll = None
+        # pages 里装的是 QScrollArea，真正的页面在 scroll.widget()
+        if hasattr(page, "widget"):
+            scroll = page
+            page = page.widget()
+        for obj in (page, scroll):
+            if obj is not None and hasattr(obj, "safe_stop"):
+                obj.safe_stop()
+                return
 
     def _toggle_sidebar(self) -> None:
         self._sidebar_collapsed = not self._sidebar_collapsed

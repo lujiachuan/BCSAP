@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import urllib.error
 import urllib.request
@@ -15,20 +16,32 @@ from PySide6.QtCore import QThread, Signal
 
 PV_MAPPING_PATH = "/control/v1/pv-mapping"
 
+# 正在运行的请求线程。必须在这里保活：线程若挂在页面上，页面先销毁（关闭设置页、
+# 或测试里创建后即释放）时 Qt 会报「QThread: Destroyed while thread is still running」，
+# 而线程此时正阻塞在网络调用上，无法取消，只能等它自己跑完。
+_RUNNING: set[PvMappingRequestThread] = set()
+
 
 class PvMappingRequestThread(QThread):
     """在线程中读写执行服务的 PV 映射，避免阻塞 Qt 主线程。
 
     ``payload`` 为 None 表示 GET，否则为 PUT 的配置体。
     结果统一用 ``completed`` 回传一个字典，界面只处理一种回调形状。
+
+    故意**不挂父对象**、改由模块级 ``_RUNNING`` 保活，理由见上面。
     """
 
     completed = Signal(object)
 
-    def __init__(self, base_url: str, payload: dict | None, parent=None) -> None:
-        super().__init__(parent)
+    def __init__(self, base_url: str, payload: dict | None) -> None:
+        super().__init__()
         self._base_url = base_url
         self._payload = payload
+        _RUNNING.add(self)
+        self.finished.connect(self._forget)
+
+    def _forget(self) -> None:
+        _RUNNING.discard(self)
 
     def run(self) -> None:
         url = self._base_url.rstrip("/") + PV_MAPPING_PATH
@@ -70,6 +83,23 @@ class PvMappingRequestThread(QThread):
         if isinstance(detail, dict):
             return "配置校验未通过，请修正标红项后重试。", list(detail.get("issues", []))
         return str(detail or f"HTTP {exc.code}"), []
+
+
+_SHUTDOWN_WAIT_S = 8.0
+
+
+def _drain_running_requests() -> None:
+    """解释器退出前等在跑的请求收尾。
+
+    请求线程无法取消（阻塞在 urllib 调用里），若不在这里等它结束，解释器退出时
+    仍存活的线程会被销毁，Qt 报「QThread: Destroyed while thread is still running」。
+    """
+    for thread in list(_RUNNING):
+        if thread.isRunning():
+            thread.wait(int(_SHUTDOWN_WAIT_S * 1000))
+
+
+atexit.register(_drain_running_requests)
 
 
 def pv_by_signal(config: dict | None) -> dict[str, str]:

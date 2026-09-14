@@ -1,429 +1,701 @@
-"""自动调束页面：F1 参数表、G1 收敛监控和 H1 前后对比。"""
+"""自动调束页：建议 → 人工确认 → 执行，全过程跟踪。
+
+与旧版的根本区别：旧版在页面里用一条公式加噪声"演"出收敛曲线，从不碰设备。
+现在页面对接执行服务，走架构文档 6.6 规定的链路：
+
+    优化器提候选 → 人工确认 → 执行层校验(边界/单步/速率) → 写设备
+    → 等读回稳定 → 测目标 → 记录本轮
+
+两个刻意的设计：
+
+* **模式固定为「建议 → 人工确认」**。第一版不提供连续自动写入（文档 6.6 的
+  分阶段计划），界面只展示模式、不给切换开关——避免把"要不要自动写设备"
+  做成一个随手可点的复选框。
+* **候选值不等于已执行值**。每轮分别记录建议值、实际下发值、实际回读值与
+  目标测量；只显示建议值会让人误以为设备已经动过了（文档 9.4）。
+"""
 
 from __future__ import annotations
 
-import math
-import random
-
-from PySide6.QtCore import QSettings, Qt, QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QAbstractItemView,
-    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
-    QFormLayout,
     QFrame,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QMessageBox,
-    QProgressBar,
     QPushButton,
     QSpinBox,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
+from apps.desktop_client import instrument_api
 from apps.desktop_client.pages.common import page_layout, primary_button
 from apps.desktop_client.pages.registry import PageSpec
-from apps.desktop_client.pv_mapping_api import PvMappingRequestThread, pv_by_signal
+from apps.desktop_client.pv_mapping_api import PvMappingRequestThread
 from apps.desktop_client.spectrum_plot import SpectrumPlot
 from apps.desktop_client.widgets import MetricCard, PageHeading, Panel
 
+POLL_INTERVAL_MS = 700
+DEFAULT_TARGET = "detector.fc1.beam_current"
+TERMINAL_STATES = frozenset({"completed", "aborted", "failed", "recovery_required"})
+STATE_TEXT = {
+    "draft": "待提交",
+    "validating": "校验参数",
+    "preparing": "申请设备",
+    "running": "调束进行中",
+    "awaiting_confirmation": "等待人工确认候选",
+    "applying": "写入设备并等待稳定",
+    "stop_requested": "停止中",
+    "completed": "调束完成",
+    "aborted": "已停止",
+    "failed": "调束失败",
+    "recovery_required": "需人工确认设备状态",
+}
+
 
 class TuningPage(QWidget):
-    """F1 参数表、G1 收敛监控和 H1 前后对比的自动调束页面。"""
-
-    # 业务信号键 + 本地显示/边界数据。
-    # PV 名不写死在这里：按信号键从系统设置的受控 PV 映射取，改了映射本页跟着变。
-    PARAMETERS = (
-        ("quadrupole.q1.current", "Q1 电流", "1.842 A", "1.60", "2.10", "0.01"),
-        ("quadrupole.q2.current", "Q2 电流", "-0.625 A", "-0.90", "-0.40", "0.01"),
-        ("einzel.voltage", "Einzel 电压", "3.20 kV", "2.80", "3.60", "0.02"),
-        ("steerer.x", "X 偏转", "0.08 V", "-0.50", "0.50", "0.01"),
-        ("steerer.y", "Y 偏转", "-0.12 V", "-0.50", "0.50", "0.01"),
-        ("source.voltage", "Source 电压", "12.4 kV", "11.5", "13.0", "0.05"),
-    )
-    # 映射不可用（服务未启动）时的回退显示，不参与任何写入。
-    FALLBACK_PVS = {
-        "quadrupole.q1.current": "BL:Q1:ISET",
-        "quadrupole.q2.current": "BL:Q2:ISET",
-        "einzel.voltage": "BL:EL:VSET",
-        "steerer.x": "BL:STEER:X",
-        "steerer.y": "BL:STEER:Y",
-        "source.voltage": "BL:SRC:VSET",
-    }
+    """自动调束页（建议 → 人工确认）。"""
 
     def __init__(self) -> None:
         super().__init__()
-        self._iteration = 0
-        self._target_iterations = 40
-        self._values: list[float] = []
-        self._pv_request = None
-        self._pvs_loaded = False
+        self._mapping: list[dict] = []
+        self._rows: list[dict] = []
+        self._run_id: str | None = None
+        self._state = "idle"
+        self._pending: dict | None = None
+        self._iterations: list[dict] = []
+        self._status_in_flight = False
+        self._read_in_flight = False
+        self._best_line = None
+
         self._timer = QTimer(self)
-        self._timer.setInterval(180)
-        self._timer.timeout.connect(self._next_iteration)
+        self._timer.setInterval(POLL_INTERVAL_MS)
+        self._timer.timeout.connect(self._poll)
 
         layout = page_layout(self)
         layout.addWidget(
-            PageHeading("自动调束", "按参数配置、运行监控、结果确认三个阶段完成优化。")
+            PageHeading(
+                "自动调束",
+                "优化器只提出候选参数；确认后才由执行服务做边界/最大单步/变化速率"
+                "校验并写入设备，再等读回稳定、测量目标。每轮的建议值、实际下发值、"
+                "实际回读值分开记录。",
+            )
         )
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._configuration_tab(), "1  参数配置")
-        self.tabs.addTab(self._monitor_tab(), "2  运行监控")
-        self.tabs.addTab(self._result_tab(), "3  结果确认")
+        self.tabs.addTab(self._configuration_tab(), "1 参数配置")
+        self.tabs.addTab(self._monitor_tab(), "2 运行监控")
+        self.tabs.addTab(self._result_tab(), "3 结果确认")
         self.tabs.setTabEnabled(1, False)
         self.tabs.setTabEnabled(2, False)
         layout.addWidget(self.tabs, 1)
 
-    def showEvent(self, event) -> None:  # noqa: N802
-        """首次显示时按受控映射刷新 PV 列（系统设置里改过 PV 后本页跟着变）。"""
-        super().showEvent(event)
-        self._load_pvs()
+        self._load_mapping()
 
-    def _load_pvs(self) -> None:
-        if self._pvs_loaded or (self._pv_request is not None and self._pv_request.isRunning()):
-            return
-        settings = QSettings("SpectrumPlatform", "DesktopClient")
-        base_url = str(settings.value("service/instrumentUrl", "http://127.0.0.1:8765"))
-        self._pv_request = PvMappingRequestThread(base_url, None, self)
-        self._pv_request.completed.connect(self._apply_pvs)
-        self._pv_request.start()
-
-    def _apply_pvs(self, result: dict) -> None:
-        """把映射里的 PV 名填进 PV 列；服务不可达时保留回退值。"""
-        if not result["ok"]:
-            return
-        mapping = pv_by_signal(result["config"])
-        if not mapping:
-            return
-        for row, (signal, *_rest) in enumerate(self.PARAMETERS):
-            pv = mapping.get(signal)
-            item = self.parameter_table.item(row, 6)
-            if pv and item is not None:
-                item.setText(pv)
-        self._pvs_loaded = True
-
+    # ------------------------------------------------------------------
+    # 页签 1：参数配置
+    # ------------------------------------------------------------------
     def _configuration_tab(self) -> QWidget:
         tab = QWidget()
-        layout = QHBoxLayout(tab)
-        layout.setContentsMargins(0, 16, 0, 0)
-        layout.setSpacing(14)
+        outer = QHBoxLayout(tab)
+        outer.setContentsMargins(0, 8, 0, 0)
+        outer.setSpacing(0)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
 
-        variables = Panel("优化变量", "已选择 5 / 6")
-        self.parameter_table = QTableWidget(len(self.PARAMETERS), 7)
+        variables = Panel("优化变量", "勾选参与调束的参数并设定范围")
+        self.parameter_table = QTableWidget(0, 6)
         self.parameter_table.setHorizontalHeaderLabels(
-            ("启用", "设备参数", "当前值", "下限", "上限", "步长", "PV")
+            ["启用", "设备参数", "PV", "下限", "上限", "当前回读"]
         )
-        for row, (signal, name, current, lower, upper, step) in enumerate(self.PARAMETERS):
-            enabled = QTableWidgetItem()
-            enabled.setFlags(
-                Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsSelectable
-                | Qt.ItemFlag.ItemIsUserCheckable
-            )
-            enabled.setCheckState(Qt.CheckState.Checked if row < 5 else Qt.CheckState.Unchecked)
-            self.parameter_table.setItem(row, 0, enabled)
-            values = (name, current, lower, upper, step, self.FALLBACK_PVS.get(signal, ""))
-            for column, value in enumerate(values, start=1):
-                item = QTableWidgetItem(value)
-                if column in (1, 2, 6):
-                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                if column == 6:
-                    item.setToolTip(f"业务信号：{signal}")
-                self.parameter_table.setItem(row, column, item)
-        header = self.parameter_table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         self.parameter_table.verticalHeader().setVisible(False)
-        self.parameter_table.setAlternatingRowColors(True)
-        variables.body.addWidget(self.parameter_table)
+        variables.body.addWidget(self.parameter_table, 1)
+        self.variable_hint = QLabel("正在读取设备参数…", objectName="mutedText")
+        self.variable_hint.setWordWrap(True)
+        variables.body.addWidget(self.variable_hint)
+        splitter.addWidget(variables)
 
-        strategy = Panel("策略与保护", "贝叶斯优化")
-        form = QFormLayout()
-        objective = QComboBox()
-        objective.addItem("最大化束流强度")
-        self.iterations = QSpinBox()
-        self.iterations.setRange(5, 200)
-        self.iterations.setValue(40)
-        self.settle = QDoubleSpinBox()
-        self.settle.setRange(0.1, 30.0)
-        self.settle.setValue(1.5)
-        self.settle.setSuffix(" s")
-        form.addRow("优化目标", objective)
-        form.addRow("最大迭代", self.iterations)
-        form.addRow("稳定等待", self.settle)
-        strategy.body.addLayout(form)
-        self.safety_check = QCheckBox("异常时停止并恢复安全值")
-        self.safety_check.setChecked(True)
-        snapshot_check = QCheckBox("开始前保存参数快照")
-        snapshot_check.setChecked(True)
-        strategy.body.addWidget(self.safety_check)
-        strategy.body.addWidget(snapshot_check)
-        hint = QLabel("边界检查通过，已启用参数均处于设备允许范围内。")
+        strategy = Panel("目标与策略", "贝叶斯优化（GP + EI）")
+        form = QVBoxLayout()
+        form.setSpacing(8)
+
+        form.addWidget(QLabel("优化目标（最大化）", objectName="mutedText"))
+        self.target = QComboBox()
+        self.target.currentIndexChanged.connect(lambda _i: self._refresh_readbacks())
+        form.addWidget(self.target)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("模式", objectName="mutedText"))
+        mode_label = QLabel("建议 → 人工确认（第一版固定）")
+        mode_label.setObjectName("modeChip")
+        mode_row.addWidget(mode_label)
+        mode_row.addStretch()
+        form.addLayout(mode_row)
+
+        self.iterations_spin = QSpinBox()
+        self.iterations_spin.setRange(1, 200)
+        self.iterations_spin.setValue(15)
+        form.addWidget(QLabel("最大轮次", objectName="mutedText"))
+        form.addWidget(self.iterations_spin)
+
+        self.settle_spin = QDoubleSpinBox()
+        self.settle_spin.setRange(0.5, 120.0)
+        self.settle_spin.setSingleStep(0.5)
+        self.settle_spin.setValue(20.0)
+        self.settle_spin.setSuffix(" s")
+        form.addWidget(QLabel("回读稳定超时", objectName="mutedText"))
+        form.addWidget(self.settle_spin)
+
+        self.samples_spin = QSpinBox()
+        self.samples_spin.setRange(1, 20)
+        self.samples_spin.setValue(3)
+        form.addWidget(QLabel("每轮目标采样次数", objectName="mutedText"))
+        form.addWidget(self.samples_spin)
+
+        for widget in (self.iterations_spin, self.settle_spin, self.samples_spin):
+            widget.setMaximumWidth(170)
+
+        form.addStretch()
+        hint = QLabel(
+            "范围必须落在设备允许区间内，且参数需配置最大单步；否则启动时会被拒绝——"
+            "让优化器提出一个必然写不进去的值没有意义。",
+            objectName="mutedText",
+        )
         hint.setWordWrap(True)
-        strategy.body.addWidget(hint)
-        strategy.body.addStretch()
-        start = primary_button("开始自动调束")
-        start.clicked.connect(self.start_tuning)
-        strategy.body.addWidget(start)
-
-        layout.addWidget(variables, 3)
-        layout.addWidget(strategy, 1)
+        form.addWidget(hint)
+        self.start_button = primary_button("开始自动调束")
+        self.start_button.clicked.connect(self.start_tuning)
+        form.addWidget(self.start_button)
+        strategy.body.addLayout(form)
+        splitter.addWidget(strategy)
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([980, 300])
+        outer.addWidget(splitter)
         return tab
 
+    # ------------------------------------------------------------------
+    # 页签 2：运行监控
+    # ------------------------------------------------------------------
     def _monitor_tab(self) -> QWidget:
         tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(0, 16, 0, 0)
-        layout.setSpacing(14)
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 8, 0, 0)
+        outer.setSpacing(10)
 
-        status = QFrame(objectName="panel")
-        status_row = QHBoxLayout(status)
-        status_row.setContentsMargins(14, 11, 14, 11)
-        self.tuning_state = QLabel("准备运行")
-        self.iteration_label = QLabel("第 0 / 40 次迭代", objectName="mutedText")
-        self.tuning_progress = QProgressBar()
-        self.tuning_progress.setTextVisible(False)
-        self.tuning_progress.setFixedWidth(220)
-        self.tuning_stop_button = QPushButton("安全停止", objectName="dangerButton")
+        bar = QFrame(objectName="panel")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(14, 10, 14, 10)
+        self.tuning_state = QLabel("尚未开始")
+        self.iteration_label = QLabel("已完成 0 轮", objectName="mutedText")
+        self.acknowledge_button = QPushButton("确认设备状态")
+        self.acknowledge_button.setVisible(False)
+        self.acknowledge_button.clicked.connect(self._acknowledge)
+        self.tuning_stop_button = QPushButton("停止", objectName="dangerButton")
         self.tuning_stop_button.setEnabled(False)
         self.tuning_stop_button.clicked.connect(self.stop_tuning)
-        status_row.addWidget(self.tuning_state)
-        status_row.addWidget(self.iteration_label)
-        status_row.addWidget(self.tuning_progress)
-        status_row.addStretch()
-        status_row.addWidget(self.tuning_stop_button)
-        layout.addWidget(status)
+        row.addWidget(self.tuning_state)
+        row.addWidget(self.iteration_label)
+        row.addStretch()
+        row.addWidget(self.acknowledge_button)
+        row.addWidget(self.tuning_stop_button)
+        outer.addWidget(bar)
 
-        body = QHBoxLayout()
-        body.setSpacing(14)
-        convergence = Panel("目标量收敛", "束流强度 / μA")
-        self.tuning_plot = SpectrumPlot("迭代次数", "束流强度 / μA")
-        convergence.body.addWidget(self.tuning_plot)
+        # 指标横排成一条紧凑信息带，避免占用曲线右侧整列空间。
+        metrics = QHBoxLayout()
+        metrics.setSpacing(10)
+        self.current_card = MetricCard("本轮测量", "--")
+        self.best_card = MetricCard("历史最优", "--", "", success=True)
+        self.gain_card = MetricCard("相对提升", "--")
+        for card in (self.current_card, self.best_card, self.gain_card):
+            card.setMaximumHeight(92)
+            metrics.addWidget(card, 1)
+        outer.addLayout(metrics)
 
-        metrics = QVBoxLayout()
-        self.current_card = MetricCard("当前值", "--", "实时测量")
-        self.best_card = MetricCard("最佳值", "--", "初始值 8.31 μA", True)
-        self.gain_card = MetricCard("相对提升", "--", "相对初始值", True)
-        metrics.addWidget(self.current_card)
-        metrics.addWidget(self.best_card)
-        metrics.addWidget(self.gain_card)
-        metrics.addStretch()
-        body.addWidget(convergence, 3)
-        body.addLayout(metrics, 1)
-        layout.addLayout(body, 1)
+        plot_panel = Panel("目标量收敛", "x = 轮次，y = 目标测量")
+        self.tuning_plot = SpectrumPlot("轮次", "目标量")
+        plot_panel.body.addWidget(self.tuning_plot, 1)
+        outer.addWidget(plot_panel, 1)
+
+        confirm = QFrame(objectName="noticePanel")
+        confirm_layout = QVBoxLayout(confirm)
+        confirm_layout.setContentsMargins(14, 10, 14, 10)
+        confirm_row = QHBoxLayout()
+        confirm_row.setContentsMargins(0, 0, 0, 0)
+        self.proposal_label = QLabel("等待候选…", objectName="mutedText")
+        self.proposal_label.setWordWrap(True)
+        self.approve_button = primary_button("确认并执行本轮")
+        self.approve_button.setEnabled(False)
+        self.approve_button.clicked.connect(self._approve)
+        confirm_row.addWidget(self.proposal_label, 1)
+        confirm_row.addWidget(self.approve_button)
+        confirm_layout.addLayout(confirm_row)
+
+        # 候选对比表：当前回读 vs 本轮建议值
+        self.proposal_table = QTableWidget(0, 4)
+        self.proposal_table.setHorizontalHeaderLabels(
+            ["参数", "当前回读", "建议值", "变化"]
+        )
+        self.proposal_table.verticalHeader().setVisible(False)
+        self.proposal_table.setMaximumHeight(140)
+        self.proposal_table.setVisible(False)
+        confirm_layout.addWidget(self.proposal_table)
+        outer.addWidget(confirm)
         return tab
 
+    # ------------------------------------------------------------------
+    # 页签 3：结果确认
+    # ------------------------------------------------------------------
     def _result_tab(self) -> QWidget:
         tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(0, 16, 0, 0)
-        layout.setSpacing(14)
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 8, 0, 0)
+        outer.setSpacing(10)
 
         notice = QFrame(objectName="noticePanel")
-        notice_layout = QHBoxLayout(notice)
-        self.result_notice = QLabel("优化结果待生成")
-        notice_layout.addWidget(self.result_notice)
-        notice_layout.addStretch()
+        notice_row = QHBoxLayout(notice)
+        notice_row.setContentsMargins(14, 10, 14, 10)
+        self.result_notice = QLabel("尚未完成任何调束")
         self.result_detail = QLabel("", objectName="mutedText")
-        notice_layout.addWidget(self.result_detail)
-        layout.addWidget(notice)
+        notice_row.addWidget(self.result_notice)
+        notice_row.addStretch()
+        notice_row.addWidget(self.result_detail)
+        outer.addWidget(notice)
 
-        comparison = QHBoxLayout()
-        comparison.setSpacing(14)
-        comparison.addWidget(MetricCard("优化前", "8.31 μA", "任务开始时的稳定测量值"))
-        self.result_card = MetricCard("最佳结果", "--", "等待任务完成", True)
-        comparison.addWidget(self.result_card)
-        layout.addLayout(comparison)
-
-        body = QHBoxLayout()
-        body.setSpacing(14)
-        changes = Panel("参数变化", "初始值 → 最佳值")
-        changes_table = QTableWidget(5, 3)
-        changes_table.setHorizontalHeaderLabels(("参数", "优化前", "最佳值"))
-        values = (
-            ("Q1 电流", "1.842 A", "1.981 A"),
-            ("Q2 电流", "-0.625 A", "-0.706 A"),
-            ("Einzel 电压", "3.20 kV", "3.41 kV"),
-            ("X 偏转", "0.08 V", "0.15 V"),
-            ("Y 偏转", "-0.12 V", "-0.07 V"),
+        # 必须是实例属性：旧版把它写成局部变量，真实结果根本回填不进去
+        self.changes_table = QTableWidget(0, 4)
+        self.changes_table.setHorizontalHeaderLabels(
+            ["参数", "初始回读", "最优回读", "变化"]
         )
-        for row, row_values in enumerate(values):
-            for column, value in enumerate(row_values):
-                changes_table.setItem(row, column, QTableWidgetItem(value))
-        changes_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        changes_table.verticalHeader().setVisible(False)
-        changes_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        changes.body.addWidget(changes_table)
-
-        record = Panel("确认记录", "随任务保存")
-        self.reviewed_checkbox = QCheckBox("已核对设备回读值与安全边界")
-        self.reviewed_checkbox.setChecked(False)
-        record.body.addWidget(self.reviewed_checkbox)
-        record.body.addWidget(QLabel("实验备注", objectName="mutedText"))
-        record.body.addWidget(QTextEdit("束流稳定，采用最佳参数。"))
-        self.apply_status = QLabel("尚未应用结果", objectName="mutedText")
-        record.body.addWidget(self.apply_status)
-        body.addWidget(changes, 2)
-        body.addWidget(record, 1)
-        layout.addLayout(body, 1)
-
-        actions = QHBoxLayout()
-        actions.addStretch()
-        restore = QPushButton("恢复优化前参数", objectName="dangerButton")
-        restore.clicked.connect(self.restore_parameters)
-        save = QPushButton("保存结果但不应用")
-        save.clicked.connect(lambda: self.apply_status.setText("结果已保存（模拟）"))
-        self.apply_button = primary_button("应用最佳参数并完成")
-        self.apply_button.setEnabled(False)
-        self.reviewed_checkbox.toggled.connect(self.apply_button.setEnabled)
-        self.apply_button.clicked.connect(self.apply_best_parameters)
-        actions.addWidget(restore)
-        actions.addWidget(save)
-        actions.addWidget(self.apply_button)
-        layout.addLayout(actions)
+        self.changes_table.verticalHeader().setVisible(False)
+        changes = Panel("参数变化", "来自每轮的实际回读，不用建议值")
+        changes.body.addWidget(self.changes_table, 1)
+        outer.addWidget(changes, 1)
         return tab
 
-    def start_tuning(self) -> None:
-        enabled_count = self._validate_tuning_parameters()
-        if enabled_count is None:
-            return
-        self._target_iterations = self.iterations.value()
-        estimated_seconds = self._target_iterations * self.settle.value()
-        answer = QMessageBox.question(
-            self,
-            "确认开始自动调束",
-            f"将优化 {enabled_count} 个参数，共 {self._target_iterations} 次迭代，"
-            f"预计稳定等待 {estimated_seconds:.0f} 秒。\n\n"
-            "当前为模拟运行，不会写入真实设备。是否继续？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
+    # ------------------------------------------------------------------
+    # 设备参数载入
+    # ------------------------------------------------------------------
+    def _load_mapping(self) -> None:
+        self._request = PvMappingRequestThread(
+            instrument_api.instrument_base_url(), None
         )
-        if answer != QMessageBox.StandardButton.Yes:
+        self._request.completed.connect(self._on_mapping)
+        self._request.start()
+
+    def _on_mapping(self, payload: dict) -> None:
+        if not payload.get("ok"):
+            self.variable_hint.setText(
+                f"读取设备参数失败：{payload.get('message', '')}。请确认执行服务已启动。"
+            )
+            self.variable_hint.setProperty("state", "error")
             return
-        self._iteration = 0
-        self._values = []
-        self.reviewed_checkbox.setChecked(False)
-        self.apply_status.setText("尚未应用结果")
+        self._mapping = list((payload.get("config") or {}).get("entries", []))
+        self._build_variable_rows()
+        self._build_targets()
+        self._refresh_readbacks()
+
+    def _build_variable_rows(self) -> None:
+        candidates = [
+            entry
+            for entry in self._mapping
+            if entry.get("writable") and entry.get("role") == "setpoint"
+        ]
+        self.parameter_table.setRowCount(len(candidates))
+        self._rows = []
+        for row, entry in enumerate(candidates):
+            check = QTableWidgetItem()
+            check.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            check.setCheckState(Qt.CheckState.Unchecked)
+            self.parameter_table.setItem(row, 0, check)
+            self.parameter_table.setItem(
+                row, 1, QTableWidgetItem(str(entry.get("label", entry.get("signal"))))
+            )
+            self.parameter_table.setItem(
+                row, 2, QTableWidgetItem(str(entry.get("pv", "")))
+            )
+
+            low = entry.get("min_value")
+            high = entry.get("max_value")
+            low_spin = QDoubleSpinBox()
+            high_spin = QDoubleSpinBox()
+            for spin in (low_spin, high_spin):
+                spin.setDecimals(2)
+                spin.setRange(
+                    float(low) if low is not None else -1e9,
+                    float(high) if high is not None else 1e9,
+                )
+            low_spin.setValue(float(low) if low is not None else 0.0)
+            high_spin.setValue(float(high) if high is not None else 0.0)
+            self.parameter_table.setCellWidget(row, 3, low_spin)
+            self.parameter_table.setCellWidget(row, 4, high_spin)
+            readback = QLabel("--")
+            readback.setObjectName("mutedText")
+            self.parameter_table.setCellWidget(row, 5, readback)
+            self._rows.append(
+                {
+                    "entry": entry,
+                    "check": check,
+                    "low": low_spin,
+                    "high": high_spin,
+                    "readback": readback,
+                }
+            )
+        self.parameter_table.resizeColumnsToContents()
+        usable = sum(1 for r in self._rows if r["entry"].get("max_step"))
+        self.variable_hint.setProperty("state", "")
+        self.variable_hint.setText(
+            f"共 {len(self._rows)} 个可调参数，其中 {usable} 个配置了最大单步、可用于调束。"
+            "勾选并设定范围后开始。"
+        )
+        self.variable_hint.style().unpolish(self.variable_hint)
+        self.variable_hint.style().polish(self.variable_hint)
+
+    def _build_targets(self) -> None:
+        self.target.clear()
+        for entry in self._mapping:
+            if entry.get("writable") or entry.get("role") != "readback":
+                continue
+            self.target.addItem(
+                f"{entry.get('label', entry.get('signal'))}（{entry.get('unit', '')}）",
+                str(entry.get("signal")),
+            )
+        for index in range(self.target.count()):
+            if self.target.itemData(index) == DEFAULT_TARGET:
+                self.target.setCurrentIndex(index)
+                break
+
+    def _refresh_readbacks(self) -> None:
+        if self._read_in_flight or not self._rows:
+            return
+        signals = [r["entry"]["signal"] for r in self._rows]
+        target = self.target.currentData()
+        if target:
+            signals.append(target)
+        self._read_in_flight = True
+        thread = instrument_api.request_read(signals=signals)
+        thread.completed.connect(self._on_readbacks)
+
+    def _on_readbacks(self, payload: dict) -> None:
+        self._read_in_flight = False
+        if not payload.get("ok"):
+            return
+        readings = instrument_api.readings_by_signal(payload.get("payload"))
+        for row in self._rows:
+            reading = readings.get(row["entry"]["signal"])
+            if reading and reading.get("connected") and reading.get("value") is not None:
+                row["readback"].setText(
+                    f"{float(reading['value']):.3f} {row['entry'].get('unit', '')}"
+                )
+            else:
+                row["readback"].setText("未连接")
+
+    # ------------------------------------------------------------------
+    # 启动
+    # ------------------------------------------------------------------
+    def _selected_variables(self) -> list[dict]:
+        selected = []
+        for row in self._rows:
+            if row["check"].checkState() != Qt.CheckState.Checked:
+                continue
+            entry = row["entry"]
+            selected.append(
+                {
+                    "signal": entry["signal"],
+                    "label": entry.get("label", entry["signal"]),
+                    "low": float(row["low"].value()),
+                    "high": float(row["high"].value()),
+                    "enabled": True,
+                }
+            )
+        return selected
+
+    def start_tuning(self) -> None:
+        variables = self._selected_variables()
+        if not variables:
+            self._complain("请至少勾选一个参与调束的参数。")
+            return
+        by_signal = {r["entry"]["signal"]: r["entry"] for r in self._rows}
+        missing = [
+            v["label"] for v in variables if not by_signal[v["signal"]].get("max_step")
+        ]
+        if missing:
+            self._complain(
+                "以下参数未配置最大单步，不能用于调束（一次大跳变可能毁掉束流）："
+                + "、".join(missing)
+            )
+            return
+        target = self.target.currentData()
+        if not target:
+            self._complain("请选择优化目标。")
+            return
+
+        self._iterations = []
         self.tuning_plot.set_data([], [])
-        self.tuning_plot.set_ranges(1, self._target_iterations, 0.0, 22.0)
-        self.tuning_progress.setValue(0)
+        self.start_button.setEnabled(False)
+        self._status_in_flight = True
+        thread = instrument_api.request_tuning_start(
+            {
+                "target_signal": target,
+                "variables": variables,
+                "mode": "confirm",
+                "max_iterations": self.iterations_spin.value(),
+                "settle_timeout_s": self.settle_spin.value(),
+                "samples_per_point": self.samples_spin.value(),
+            }
+        )
+        thread.completed.connect(self._on_started)
+
+    def _complain(self, message: str) -> None:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("无法开始调束")
+        box.setText(message)
+        box.exec()
+
+    def _on_started(self, payload: dict) -> None:
+        self._status_in_flight = False
+        if not payload.get("ok"):
+            self.start_button.setEnabled(True)
+            self._complain(f"启动失败：{payload.get('message', '')}")
+            return
+        status = payload.get("payload") or {}
+        self._run_id = status.get("run_id")
         self.tabs.setTabEnabled(1, True)
-        self.tabs.setTabEnabled(2, False)
-        self.tabs.setTabEnabled(0, False)
         self.tabs.setCurrentIndex(1)
-        self.tuning_state.setText("正在优化")
         self.tuning_stop_button.setEnabled(True)
-        self.iteration_label.setText(f"第 0 / {self._target_iterations} 次迭代")
-        self._timer.setInterval(round(self.settle.value() * 1000))
+        self._apply_status(status)
         self._timer.start()
 
-    def _next_iteration(self) -> None:
-        self._iteration += 1
-        trend = 8.31 + 10.9 * (1 - math.exp(-self._iteration / 10))
-        value = trend + 0.7 * math.sin(self._iteration * 1.7) + random.uniform(-0.25, 0.25)
-        if self._iteration == min(36, self._target_iterations):
-            value = 19.08
-        self._values.append(value)
-        self.tuning_plot.set_data(range(1, self._iteration + 1), self._values)
-        best = max(self._values)
-        self.current_card.value_label.setText(f"{value:.2f} μA")
-        self.best_card.value_label.setText(f"{best:.2f} μA")
-        self.gain_card.value_label.setText(f"+{(best / 8.31 - 1) * 100:.1f}%")
-        self.iteration_label.setText(
-            f"第 {self._iteration} / {self._target_iterations} 次迭代"
-        )
-        self.tuning_progress.setValue(round(self._iteration / self._target_iterations * 100))
-        if self._iteration >= self._target_iterations:
-            self._timer.stop()
-            self.tuning_state.setText("优化正常完成")
-            self.tuning_stop_button.setEnabled(False)
-            best_index = max(range(len(self._values)), key=self._values.__getitem__)
-            best = self._values[best_index]
-            gain = (best / 8.31 - 1) * 100
-            self.result_notice.setText("优化正常完成 · 无安全告警（模拟）")
-            self.result_detail.setText(f"最佳结果出现在第 {best_index + 1} 次迭代")
-            self.result_card.value_label.setText(f"{best:.2f} μA")
-            self.tuning_plot.annotate_peaks(1)
-            if self.result_card.detail_label is not None:
-                self.result_card.detail_label.setText(f"提升 {gain:.1f}%")
-            self.tabs.setTabEnabled(2, True)
-            self.tabs.setTabEnabled(0, True)
-            self.tabs.setCurrentIndex(2)
+    # ------------------------------------------------------------------
+    # 候选对比表
+    # ------------------------------------------------------------------
+    def _fill_proposal_table(self, pending: dict) -> None:
+        """把本轮候选填成「当前回读 | 建议值 | 变化」对比表。"""
+        suggestions = pending.get("values") or {}
+        current = self._current_readbacks()
+        self.proposal_table.setRowCount(len(suggestions))
+        for row, (signal, value) in enumerate(suggestions.items()):
+            short = signal.split(".")[-1]
+            self.proposal_table.setItem(row, 0, QTableWidgetItem(short))
+            cur = current.get(signal)
+            self.proposal_table.setItem(
+                row, 1, QTableWidgetItem("--" if cur is None else f"{cur:.3f}")
+            )
+            self.proposal_table.setItem(row, 2, QTableWidgetItem(f"{float(value):.3f}"))
+            delta = "--" if cur is None else f"{float(value) - cur:+.3f}"
+            self.proposal_table.setItem(row, 3, QTableWidgetItem(delta))
+        self.proposal_table.resizeColumnsToContents()
+
+    def _current_readbacks(self) -> dict[str, float]:
+        """从变量行的「当前回读」单元格取最新值。"""
+        out: dict[str, float] = {}
+        for row in self._rows:
+            signal = row["entry"]["signal"]
+            text = row["readback"].text()
+            try:
+                out[signal] = float(text.split()[0])
+            except (ValueError, IndexError):
+                continue
+        return out
+
+    # ------------------------------------------------------------------
+    # 确认 / 停止
+    # ------------------------------------------------------------------
+    def _approve(self) -> None:
+        if not self._run_id:
+            return
+        self.approve_button.setEnabled(False)
+        self.proposal_label.setText("正在写入设备并等待读回稳定…")
+        thread = instrument_api.request_tuning_approve(self._run_id)
+        thread.completed.connect(self._on_approved)
+
+    def _on_approved(self, payload: dict) -> None:
+        if not payload.get("ok"):
+            self.proposal_label.setText(f"执行失败：{payload.get('message', '')}")
+            self.approve_button.setEnabled(True)
+            return
+        self._apply_status(payload.get("payload") or {})
+        self._fetch_iterations()
 
     def stop_tuning(self) -> None:
-        if not self._timer.isActive():
+        if not self._run_id:
             return
-        self._timer.stop()
-        self.tuning_state.setText("已安全停止，未应用参数")
         self.tuning_stop_button.setEnabled(False)
-        self.tabs.setTabEnabled(0, True)
+        instrument_api.request_tuning_stop(self._run_id)
+
+    def _acknowledge(self) -> None:
+        if not self._run_id:
+            return
+        thread = instrument_api.request_tuning_acknowledge(
+            self._run_id, note="操作员在界面确认"
+        )
+        thread.completed.connect(lambda _p: self.acknowledge_button.setVisible(False))
 
     def is_operation_active(self) -> bool:
-        """是否仍有进行中的自动调束。"""
-        return self._timer.isActive()
+        return self._run_id is not None and self._state not in TERMINAL_STATES
 
     def safe_stop(self) -> None:
-        """退出前的最佳努力停止：停止迭代，不应用参数。"""
         if self.is_operation_active():
             self.stop_tuning()
 
-    def _validate_tuning_parameters(self) -> int | None:
-        enabled_count = 0
-        for row in range(self.parameter_table.rowCount()):
-            enabled = self.parameter_table.item(row, 0).checkState() == Qt.CheckState.Checked
-            if not enabled:
-                continue
-            enabled_count += 1
-            try:
-                lower = float(self.parameter_table.item(row, 3).text())
-                upper = float(self.parameter_table.item(row, 4).text())
-                step = float(self.parameter_table.item(row, 5).text())
-            except ValueError:
-                QMessageBox.warning(self, "参数格式错误", f"第 {row + 1} 行包含无效数字。")
-                self.parameter_table.setCurrentCell(row, 3)
-                return None
-            if lower >= upper or step <= 0:
-                QMessageBox.warning(
-                    self,
-                    "参数范围错误",
-                    f"第 {row + 1} 行必须满足下限 < 上限，且步长大于 0。",
-                )
-                self.parameter_table.setCurrentCell(row, 3)
-                return None
-        if enabled_count == 0:
-            QMessageBox.warning(self, "没有优化变量", "请至少启用一个设备参数。")
-            return None
-        return enabled_count
+    # ------------------------------------------------------------------
+    # 轮询
+    # ------------------------------------------------------------------
+    def _poll(self) -> None:
+        if not self._run_id:
+            self._timer.stop()
+            return
+        if self._status_in_flight:
+            return
+        self._status_in_flight = True
+        thread = instrument_api.request_tuning_status(self._run_id)
+        thread.completed.connect(self._on_status)
 
-    def restore_parameters(self) -> None:
-        answer = QMessageBox.question(
-            self,
-            "确认恢复参数",
-            "将恢复任务开始前的参数快照。当前为模拟操作，是否继续？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
-        )
-        if answer == QMessageBox.StandardButton.Yes:
-            self.apply_status.setText("已恢复优化前参数（模拟）")
+    def _on_status(self, payload: dict) -> None:
+        self._status_in_flight = False
+        if not payload.get("ok"):
+            return
+        self._apply_status(payload.get("payload") or {})
 
-    def apply_best_parameters(self) -> None:
-        answer = QMessageBox.question(
-            self,
-            "确认应用最佳参数",
-            "将应用表格中的最佳参数。当前为模拟操作，是否继续？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
+    def _apply_status(self, status: dict) -> None:
+        self._state = str(status.get("state", "idle"))
+        completed = int(status.get("completed_iterations") or 0)
+        self.iteration_label.setText(
+            f"已完成 {completed} / {status.get('max_iterations', 0)} 轮"
         )
-        if answer == QMessageBox.StandardButton.Yes:
-            self.apply_status.setText("最佳参数已应用（模拟）")
+        text = STATE_TEXT.get(self._state, self._state)
+        message = status.get("message") or ""
+        if message:
+            text = f"{text} · {message}"
+        self.tuning_state.setText(text)
+
+        self._pending = status.get("pending")
+        if self._pending:
+            self.proposal_label.setText(
+                f"第 {int(self._pending['iteration']) + 1} 轮候选"
+                f"（预测 {float(self._pending['predicted']):.3f}"
+                f" ± {float(self._pending['std']):.3f}）"
+            )
+            self._fill_proposal_table(self._pending)
+            self.proposal_table.setVisible(True)
+            self.approve_button.setEnabled(True)
+        else:
+            self.proposal_label.setText(
+                "本轮已执行，正在生成下一轮候选…"
+                if self._state not in TERMINAL_STATES
+                else "无待确认候选。"
+            )
+            self.approve_button.setEnabled(False)
+
+        if self._state == "recovery_required":
+            self.acknowledge_button.setVisible(True)
+
+        if self._state in TERMINAL_STATES:
+            self._timer.stop()
+            self.start_button.setEnabled(True)
+            self.tuning_stop_button.setEnabled(False)
+            self.approve_button.setEnabled(False)
+            self.tabs.setTabEnabled(2, True)
+            if self._state == "completed":
+                self.result_notice.setText("调束已完成")
+                self.tabs.setCurrentIndex(2)
+            elif self._state == "aborted":
+                self.result_notice.setText("调束已停止")
+            else:
+                self.result_notice.setText(text)
+            self._fetch_iterations()
+
+    def _fetch_iterations(self) -> None:
+        if not self._run_id:
+            return
+        thread = instrument_api.request_tuning_iterations(self._run_id)
+        thread.completed.connect(self._on_iterations)
+
+    def _on_iterations(self, payload: dict) -> None:
+        if not payload.get("ok"):
+            return
+        self._iterations = list(
+            (payload.get("payload") or {}).get("iterations") or []
+        )
+        self._redraw()
+        self._fill_changes()
+
+    def _redraw(self) -> None:
+        usable = [it for it in self._iterations if it.get("objective") is not None]
+        if not usable:
+            self.tuning_plot.set_data([], [])
+            return
+        xs = [float(it["iteration"]) + 1 for it in usable]
+        ys = [float(it["objective"]) for it in usable]
+        self.tuning_plot.set_data(xs, ys)
+        self.current_card.value_label.setText(f"{ys[-1]:.3f}")
+        best = max(ys)
+        self.best_card.value_label.setText(f"{best:.3f}")
+        self.gain_card.value_label.setText(f"{best - ys[0]:+.3f}")
+        self.result_detail.setText(
+            f"共 {len(self._iterations)} 轮，其中 {len(usable)} 轮有有效目标测量"
+        )
+        self._show_best_line(best)
+
+    def _show_best_line(self, best: float) -> None:
+        """在收敛曲线上画一条虚线表示历史最佳，一眼看出是否还在提升。"""
+
+        import pyqtgraph as pg
+
+        from apps.desktop_client.theme import current_palette
+
+        if not hasattr(self, "_best_line") or self._best_line is None:
+            # 注意：InfiniteLine 不接受 dash= 关键字（pyqtgraph 会抛 TypeError）。
+            # 虚线由下面 setPen 的 DashLine 样式给，dash 参数是多余的。
+            self._best_line = pg.InfiniteLine(angle=0, movable=False)
+            self.tuning_plot.view.addItem(self._best_line, ignoreBounds=True)
+        self._best_line.setPos(best)
+        tokens = current_palette()
+        self._best_line.setPen(
+            pg.mkPen(tokens["statusGood"], width=1.5, style=Qt.PenStyle.DashLine)
+        )
+
+    def _fill_changes(self) -> None:
+        """参数变化表只用**实际回读值**：建议值不代表设备真的到过那里。"""
+        usable = [it for it in self._iterations if it.get("objective") is not None]
+        if not usable:
+            self.changes_table.setRowCount(0)
+            return
+        first = self._iterations[0].get("readback") or {}
+        best = max(usable, key=lambda it: float(it["objective"])).get("readback") or {}
+        keys = sorted(set(first) | set(best))
+        self.changes_table.setRowCount(len(keys))
+        for row, key in enumerate(keys):
+            start = first.get(key)
+            end = best.get(key)
+            self.changes_table.setItem(row, 0, QTableWidgetItem(key))
+            self.changes_table.setItem(
+                row, 1, QTableWidgetItem("--" if start is None else f"{start:.3f}")
+            )
+            self.changes_table.setItem(
+                row, 2, QTableWidgetItem("--" if end is None else f"{end:.3f}")
+            )
+            delta = "--" if start is None or end is None else f"{end - start:+.3f}"
+            self.changes_table.setItem(row, 3, QTableWidgetItem(delta))
+        self.changes_table.resizeColumnsToContents()
+
+    # ------------------------------------------------------------------
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        if self.is_operation_active():
+            self._poll()
+            self._timer.start()
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        super().hideEvent(event)
+        self._timer.stop()
 
 
 PAGE_SPEC = PageSpec(

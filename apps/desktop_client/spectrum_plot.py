@@ -2,11 +2,18 @@
 
 组件保留原始数据，显示层启用可视区裁剪和峰值保持型降采样；十字光标
 读数限制在约 30Hz，避免鼠标移动占用 UI 主线程。
+
+两种用法：
+
+* 单曲线（扫谱、调束）：``set_data(x, y)``；
+* 多曲线紧凑版（手动页的束流电流趋势）：``compact=True`` 压扁最小高度，
+  ``value_formatter`` 定制十字读数文字，``set_series([(x, y), (x2, y2)])``
+  叠加第二条曲线与"历史最优"线。
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import numpy as np
 import pyqtgraph as pg
@@ -19,12 +26,23 @@ from apps.desktop_client.theme import current_palette
 class SpectrumPlot(QWidget):
     """扫谱与调束共用的可交互曲线视图。"""
 
-    def __init__(self, x_label: str, y_label: str, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        x_label: str,
+        y_label: str,
+        parent: QWidget | None = None,
+        *,
+        compact: bool = False,
+        value_formatter: Callable[[float, float], str] | None = None,
+    ) -> None:
         super().__init__(parent)
-        self.setMinimumHeight(280)
+        self.setMinimumHeight(150 if compact else 280)
+        self._compact = compact
+        self._value_formatter = value_formatter
         self._raw_x = np.empty(0, dtype=float)
         self._raw_y = np.empty(0, dtype=float)
         self._labels: list[pg.TextItem] = []
+        self._extra_curves: list[pg.PlotDataItem] = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -91,6 +109,53 @@ class SpectrumPlot(QWidget):
         """返回原始数据副本，导出逻辑不得读取显示层降采样结果。"""
         return self._raw_x.copy(), self._raw_y.copy()
 
+    def set_series(
+        self,
+        series: Sequence[tuple[Sequence[float], Sequence[float]]],
+        *,
+        alternative: int = 1,
+        best: Sequence[float] | None = None,
+        auto_range_one_sided: bool = True,
+    ) -> None:
+        """画多条曲线：第 0 条用主色，第 ``alternative`` 条用副色，``best`` 用最优色。
+
+        任何一条为空都不影响其它条；点数不一致也允许（趋势窗口里各路的采样
+        时刻可能差一拍）。
+        """
+        tokens = current_palette()
+        if not series:
+            self.set_data([], [])
+            self._clear_extra_curves()
+            return
+        self.set_data(series[0][0], series[0][1])
+
+        pens = [pg.mkPen(tokens["plotLineAlt"], width=1.6)]
+        if best is not None:
+            pens.append(pg.mkPen(tokens["plotBest"], width=1.2, style=Qt.PenStyle.DashLine))
+        while len(self._extra_curves) < len(pens):
+            curve = self.view.plot()
+            curve.setClipToView(True)
+            self._extra_curves.append(curve)
+        payload: list[tuple[Sequence[float], Sequence[float]]] = list(series[1:])
+        if best is not None:
+            payload = [*payload, (series[0][0], best)]
+        for index, curve in enumerate(self._extra_curves):
+            if index < len(payload):
+                xs, ys = payload[index]
+                curve.setPen(pens[index])
+                curve.setData(x=xs, y=ys, skipFiniteCheck=True)
+                curve.setVisible(True)
+            else:
+                curve.setData([], [])
+                curve.setVisible(False)
+        if auto_range_one_sided:
+            self.view.enableAutoRange(axis="y")
+
+    def _clear_extra_curves(self) -> None:
+        for curve in self._extra_curves:
+            curve.setData([], [])
+            curve.setVisible(False)
+
     def set_ranges(
         self,
         x_min: float,
@@ -142,6 +207,12 @@ class SpectrumPlot(QWidget):
         tokens = current_palette()
         self.view.setBackground(tokens["surfacePanel"])
         self._curve.setPen(pg.mkPen(tokens["plotLine"], width=2))
+        if self._extra_curves:
+            self._extra_curves[0].setPen(pg.mkPen(tokens["plotLineAlt"], width=1.6))
+        if len(self._extra_curves) > 1:
+            self._extra_curves[1].setPen(
+                pg.mkPen(tokens["plotBest"], width=1.2, style=Qt.PenStyle.DashLine)
+            )
         cross_pen = pg.mkPen(tokens["plotAxis"], width=1, style=Qt.PenStyle.DashLine)
         self._cross_x.setPen(cross_pen)
         self._cross_y.setPen(cross_pen)
@@ -160,7 +231,10 @@ class SpectrumPlot(QWidget):
         point = plot_item.vb.mapSceneToView(position)
         self._cross_x.setPos(point.x())
         self._cross_y.setPos(point.y())
-        self._readout.setText(f"x {point.x():.3f}   y {point.y():.3f}")
+        if self._value_formatter is not None:
+            self._readout.setText(self._value_formatter(point.x(), point.y()))
+        else:
+            self._readout.setText(f"x {point.x():.3f}   y {point.y():.3f}")
         self._readout.setPos(point.x(), point.y())
         self._set_crosshair_visible(True)
 

@@ -39,8 +39,10 @@ _STYLE_TEMPLATE = Template(
 QWidget#appShell { background: transparent; }
 QStackedWidget#pages { background: transparent; }
 QWidget#pageRoot { background: transparent; }
-QScrollArea#pageScroll { background: transparent; border: none; }
-QScrollArea#pageScroll QWidget#qt_scrollarea_viewport { background: transparent; }
+/* 所有滚动区透明，露出底层 AmbientCanvas；不按 objectName 区分，
+   否则像 manual 页的 #groupScroll 会漏成系统窗口色（深浅切换时割裂）。 */
+QScrollArea { background: transparent; border: none; }
+QScrollArea QWidget#qt_scrollarea_viewport { background: transparent; }
 
 /* ================= 左侧导航 ================= */
 QFrame#sidebar { background: $sidebarBg; border-right: 1px solid $sidebarBorder; }
@@ -82,6 +84,12 @@ QLabel#mutedText[state="error"] { color: $statusError; }
 /* L1 数据工作面：不透明 */
 QFrame#panel { background: $surfacePanel; border: 1px solid $panelBorder;
                border-radius: ${radiusPanel}px; }
+/* 手控页是高密度仪器界面：更小圆角、更轻边界，浅深主题使用同一组令牌。 */
+QFrame#manualTopbar, QFrame#manualGroup {
+    background: $surfacePanel; border: 1px solid $panelBorder;
+    border-radius: ${radiusControl}px; }
+QFrame#manualGroup[hazard="true"] { border-left: 2px solid $statusWarn; }
+QFrame#manualFrame, QWidget#manualCanvas { background: transparent; border: none; }
 QFrame#noticePanel { background: $noticeBg; border: 1px solid $panelBorder;
                      border-radius: ${radiusCard}px; }
 QFrame#sepLine { color: $separator; }
@@ -128,6 +136,54 @@ QPushButton#plotToolButton { min-height: 26px; max-height: 26px; padding: 0 10px
                              color: $muted; background: transparent; }
 QPushButton:disabled { color: $disabledText; background: $disabledBg;
                        border-color: $disabledBg; }
+/* 手动控制的密集表格行：行内按钮单独压扁，不牵动全局按钮高度 */
+/* 手动控制的密集表格行：行内按钮单独压扁，不牵动全局按钮高度。
+   内边距 3px 是被宽度逼出来的：三列版式里输出格只有 102px，而
+   「启动/停止/复位」三个按钮要挤进去——两字按钮 22px 文字 + 6px 内边距 = 28px。 */
+QPushButton#rowButton { min-height: 22px; max-height: 22px; padding: 0 3px;
+                        border-radius: 5px; font-size: ${fontCaption}px; }
+QPushButton#rowButton:checked { background: $statusGood; color: #062818;
+                                border-color: $statusGood; font-weight: 600; }
+QPushButton#rowButton:disabled { color: $disabledText; background: $disabledBg;
+                                 border-color: $disabledBg; }
+/* 下发是常规操作：使用低饱和强调色，避免每行形成高亮色块。 */
+QPushButton#setButton { min-height: 22px; max-height: 22px; padding: 0 6px;
+                        border-radius: 5px; font-size: ${fontCaption}px;
+                        background: $accentSoft; color: $accent;
+                        border: 1px solid $inputBorder; font-weight: 600; }
+QPushButton#setButton:hover { background: $buttonHoverBg; border-color: $accent; }
+QPushButton#setButton:pressed { background: $disabledBg; }
+QPushButton#setButton:disabled { color: $disabledText; background: $disabledBg;
+                                  border-color: $disabledBg; }
+/* 开关以弱底色表达状态，只有文字和边框使用语义色。 */
+QPushButton#toggleSwitch { min-height: 24px; max-height: 24px; padding: 0;
+                           border-radius: 6px; font-size: ${fontCaption}px;
+                           background: $buttonBg; color: $muted;
+                           border: 1px solid $buttonBorder; font-weight: 600; }
+QPushButton#toggleSwitch:checked { background: $statusGoodBg; color: $statusGood;
+                                   border-color: $statusGood; }
+QPushButton#toggleSwitch:hover:checked { background: $statusGoodBg; }
+QPushButton#toggleSwitch:hover:!checked { background: $buttonHoverBg; }
+QPushButton#toggleSwitch:disabled { color: $disabledText; background: $disabledBg;
+                                    border-color: $disabledBg; }
+QPushButton#switchButton { min-height: 22px; max-height: 22px; padding: 0;
+                           border-radius: 5px; font-size: ${fontCaption}px;
+                           background: $buttonBg; color: $muted;
+                           border: 1px solid $buttonBorder; }
+QPushButton#switchButton[action="on"]:checked {
+    background: $statusGoodBg; color: $statusGood; border-color: $statusGood; font-weight: 600; }
+QPushButton#switchButton[action="off"]:checked {
+    background: $statusIdleBg; color: $textBase; border-color: $statusIdle; font-weight: 600; }
+QPushButton#switchButton:hover { background: $buttonHoverBg; border-color: $accent; }
+QPushButton#switchButton:disabled { color: $disabledText; background: $disabledBg;
+                                    border-color: $disabledBg; }
+/* 步进换档按钮（×1 / ×10）：比行内按钮再窄一点，只放得下三个字符 */
+QPushButton#stepButton { min-height: 22px; max-height: 22px; padding: 0 3px;
+                         border-radius: 5px; font-size: ${fontCaption}px; color: $muted; }
+QPushButton#stepButton:checked { background: $accentSoft; color: $accent;
+                                 border-color: $accent; font-weight: 600; }
+QPushButton#stepButton:disabled { color: $disabledText; background: $disabledBg;
+                                  border-color: $disabledBg; }
 
 /* ================= 输入与选择 ================= */
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit {
@@ -146,6 +202,23 @@ QComboBox QAbstractItemView { background: $surfacePanel; color: $textBase;
                               border: 1px solid $panelBorder; border-radius: ${radiusControl}px;
                               padding: 4px; selection-background-color: $accentSoft;
                               selection-color: $textBase; outline: none; }
+
+/* 手动控制的密集表格行：行内输入框单独压扁 */
+QDoubleSpinBox#rowInput, QComboBox#rowInput { min-height: 22px; max-height: 22px;
+                                              padding: 0 4px; border-radius: 6px; }
+QDoubleSpinBox#rowInput:disabled, QComboBox#rowInput:disabled {
+    background: $disabledBg; color: $disabledText; }
+/* 三列版式里设定框只有 72px：上下箭头让给数字，滚轮与方向键照样能调 */
+QDoubleSpinBox#rowInput::up-button, QDoubleSpinBox#rowInput::down-button {
+    width: 0px; border: none; }
+
+/* 密集表格：列标题与回读读数 */
+QLabel#columnHeader { color: $tableHeaderText; font-size: ${fontCaption}px;
+                      font-weight: 600; }
+QLabel#readbackValue { color: $textBase; }
+QLabel#readbackValue[state="good"] { color: $textBase; font-weight: 600; }
+QLabel#readbackValue[state="warn"] { color: $statusWarn; font-weight: 600; }
+QLabel#readbackValue[state="error"] { color: $statusError; }
 
 /* ================= 数据区：表格 / 滚动条 ================= */
 QHeaderView::section { background: $tableHeaderBg; color: $tableHeaderText; border: none;
@@ -248,8 +321,11 @@ def apply_theme(app, name: str) -> str:
         name = "light"
     _current = name
     palette = PALETTES[name]
-    app.setStyleSheet(build_stylesheet(palette))
+    # Qt 对已有控件会缓存旧 QSS，尤其是带动态属性的高密度卡片。
+    # 主题切换是低频操作，先清空再装配可保证所有表面和伪状态同时刷新。
+    app.setStyleSheet("")
     app.setPalette(_make_qpalette(palette))
+    app.setStyleSheet(build_stylesheet(palette))
     return name
 
 

@@ -11,7 +11,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from PySide6.QtCore import QStandardPaths, QThread, Signal
+from PySide6.QtCore import QSettings, QThread, Signal
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -24,12 +24,63 @@ from PySide6.QtWidgets import (
 
 from packages.spectrum import decode_spectrum, spectrum_checksum
 
+# 本地镜像目录：可在「系统设置 → 服务与连接」里改，也可用环境变量指定
+# （与执行服务的 SPECTRUM_SCAN_STORE 同一套约定，便于部署脚本统一安排落点）。
+CACHE_SETTINGS_KEY = "sync/cacheRoot"
+CACHE_ENV_VAR = "SPECTRUM_CLIENT_CACHE"
+CACHE_DIR_NAME = "client_cache"
+
+
+class CacheUnavailable(RuntimeError):
+    """本地镜像目录不可用（建不了目录 / 不可写）。"""
+
+
+def default_cache_root() -> Path:
+    """默认本地镜像目录：``%LOCALAPPDATA%\\SpectrumPlatform\\client_cache``。
+
+    不用 ``QStandardPaths.AppLocalDataLocation``：它按**应用显示名**拼路径，落点是
+    ``...\\AppData\\Local\\谱图与束流控制平台\\client_cache``——中文目录名在资源
+    管理器里难找，位置也和执行服务的 ``SpectrumPlatform\\spool`` 不在一处。
+    """
+    override = os.environ.get(CACHE_ENV_VAR)
+    if override:
+        return Path(override)
+    root = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    base = Path(root) if root else Path.home() / ".local" / "share"
+    return base / "SpectrumPlatform" / CACHE_DIR_NAME
+
+
+def cache_root_from_settings(settings: QSettings) -> Path:
+    """系统设置里配置的本地镜像目录；没配置过就用默认值。"""
+    raw = str(settings.value(CACHE_SETTINGS_KEY, "") or "").strip()
+    return Path(raw) if raw else default_cache_root()
+
+
+def ensure_cache_root(root: Path) -> Path:
+    """确认目录能建、能写，返回该目录；不可用时报出目录名与改法。
+
+    只判断"目录存在"是不够的：磁盘只读、目录被系统策略锁定时 `mkdir` 会成功而
+    写入失败，同步要到下载谱图那一步才炸出 ``attempt to write a readonly database``，
+    现场看不出是哪个目录的问题。
+    """
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        probe = root / ".write-probe"
+        probe.write_bytes(b"")
+        probe.unlink()
+    except OSError as exc:
+        raise CacheUnavailable(
+            f"本地数据目录不可用：{root}（{exc}）。"
+            "请在「系统设置 → 服务与连接 → 本地数据目录」里换一个可写的目录。"
+        ) from exc
+    return root
+
 
 class LocalDataCache:
     """中央数据的可重建只读缓存，不承载仪器待上传数据。"""
 
     def __init__(self, root: Path) -> None:
-        self.root = root
+        self.root = ensure_cache_root(root)
         self.spectra_dir = root / "spectra"
         self.spectra_dir.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(root / "cache.sqlite")
@@ -237,7 +288,12 @@ class InitializationWorker(QThread):
         self.serviceChanged.emit("instrument", "good", "就绪")
         self.stepChanged.emit("pv", "running", "正在检查受控 PV…")
         try:
-            result = _request_json(self.instrument_url + "/control/v1/pvs/health")
+            # 设备访问走真实 CA，服务端第一次健康检查要等设备是否在线（最长约 5s），
+            # 因此这里不能用默认的 3s，否则设备缺席时只会得到一个 socket 超时，
+            # 而不是「0 / 7 PV 已连接」+ 逐项原因。
+            result = _request_json(
+                self.instrument_url + "/control/v1/pvs/health", timeout=10.0
+            )
             summary = result["summary"]
             total = int(summary["total"])
             connected = int(summary["connected"])
@@ -271,14 +327,11 @@ class InitializationWorker(QThread):
             return False
 
     def _sync_data(self) -> None:
-        self.stepChanged.emit("sync", "running", "正在读取同步目录…")
-        cache_root = self.cache_root
-        if cache_root is None:
-            cache_root = Path(
-                QStandardPaths.writableLocation(
-                    QStandardPaths.StandardLocation.AppLocalDataLocation
-                )
-            ) / "client_cache"
+        cache_root = (
+            self.cache_root if self.cache_root is not None else default_cache_root()
+        )
+        # 先报出目标目录再动手：目录不可用时上面这条已经让现场知道数据本要下到哪。
+        self.stepChanged.emit("sync", "running", f"正在读取同步目录…（本地目录 {cache_root}）")
         cache = LocalDataCache(cache_root)
         try:
             manifest = _request_json(self.data_url + "/api/v1/sync/manifest")
@@ -311,7 +364,10 @@ class InitializationWorker(QThread):
                 self.stepChanged.emit("sync", "running", f"正在下载谱图 {index} / {total}")
 
             cache.set_cursor(str(changes.get("next_cursor", manifest["cursor"])))
-            detail = f"同步完成 · 新增或更新 {len(records)} 条记录、{total} 条谱图"
+            detail = (
+                f"同步完成 · 新增或更新 {len(records)} 条记录、{total} 条谱图"
+                f"（{cache_root}）"
+            )
             self.stepChanged.emit("sync", "good", detail)
         finally:
             cache.close()
@@ -415,7 +471,9 @@ class InitializationPage(QWidget):
         value.style().polish(value)
         retry = self.retry_buttons.get(key)
         if retry is not None:
-            retry.setVisible(state == "error" and key in self.RETRY_TARGETS)
+            # 「已跳过 / 已取消」也给重试入口：数据服务当时不可达而跳过同步后，
+            # 没有重试就只能重启客户端才能把数据拉下来。
+            retry.setVisible(state in {"error", "warn"} and key in self.RETRY_TARGETS)
 
     def set_retry_enabled(self, enabled: bool) -> None:
         """初始化任务运行期间禁点重试，结束后放开。"""
@@ -470,9 +528,9 @@ def _collect_pv_details(result: dict) -> list[str]:
     return lines
 
 
-def _request_json(url: str) -> dict:
+def _request_json(url: str, timeout: float = 3.0) -> dict:
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(request, timeout=3.0) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
 

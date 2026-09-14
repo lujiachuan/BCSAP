@@ -117,6 +117,11 @@ def make_nav_icon(name: str, color: str = DEFAULT_ICON_COLOR) -> QIcon:
         painter.drawLine(39, 11, 37, 17)
         painter.drawLine(14, 39, 8, 37)
         painter.drawLine(9, 37, 11, 31)
+    elif name == "control":
+        # 仪表盘：下半开口弧 + 指针，区别于 tuning 的滑杆与 settings 的齿轮
+        painter.drawArc(QRectF(9, 12, 30, 30), 0, 180 * 16)
+        painter.drawLine(QPointF(24, 27), QPointF(34, 17))
+        painter.drawEllipse(QPointF(24, 27), 2.4, 2.4)
     elif name == "settings":
         painter.drawEllipse(QRectF(17, 17, 14, 14))
         painter.drawEllipse(QRectF(21, 21, 6, 6))

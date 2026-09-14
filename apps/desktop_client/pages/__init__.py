@@ -18,6 +18,7 @@ from __future__ import annotations
 from apps.desktop_client.pages import (  # noqa: F401
     analysis,
     library,
+    manual,
     samples,
     scan,
     settings,
@@ -27,6 +28,7 @@ from apps.desktop_client.pages import (  # noqa: F401
 )
 
 # 兼容性再导出：历史路径 apps.desktop_client.pages.X 继续可用。
+from apps.desktop_client.pages.manual import ManualControlPage
 from apps.desktop_client.pages.placeholder import PlaceholderPage
 from apps.desktop_client.pages.registry import (  # noqa: F401
     SECTIONS,
@@ -46,6 +48,7 @@ from apps.desktop_client.pages.workbench import WorkbenchPage
 # 侧栏展示顺序 = 下面元组的顺序（先“实验控制”分区，再“数据与系统”分区）。
 _PAGE_SPECS = (
     workbench.PAGE_SPEC,
+    manual.PAGE_SPEC,
     samples.PAGE_SPEC,
     scan.PAGE_SPEC,
     tuning.PAGE_SPEC,
@@ -62,6 +65,7 @@ del _PAGE_SPECS
 
 __all__ = [
     "DEFAULT_SERVICE_URLS",
+    "ManualControlPage",
     "PageSpec",
     "PlaceholderPage",
     "SECTIONS",

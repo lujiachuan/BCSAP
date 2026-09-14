@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QSettings, Qt, QThread, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QSettings, Qt, QThread, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QHeaderView,
@@ -27,6 +29,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from apps.desktop_client.initialization import (
+    CACHE_SETTINGS_KEY,
+    CacheUnavailable,
+    cache_root_from_settings,
+    default_cache_root,
+    ensure_cache_root,
+)
 from apps.desktop_client.pages.common import page_layout
 from apps.desktop_client.pages.registry import PageSpec
 from apps.desktop_client.pv_mapping_api import PvMappingRequestThread
@@ -42,10 +51,7 @@ DEFAULT_SERVICE_URLS = {
 # 受控设备 PV 映射（业务信号 → 真实 EPICS PV）。
 # 方案文档 6.2：映射是执行服务持有的受控配置，客户端只通过 API 读写，
 # 不直接访问 IOC；保存由执行服务校验并立即生效。
-PV_GATEWAYS = (
-    ("模拟 EPICS（无 IOC 的开发/演示）", "simulated"),
-    ("真实 EPICS 通道访问（CA）", "channel-access"),
-)
+# 设备访问统一走真实 EPICS Channel Access，没有模式开关；无 IOC 时健康检查会如实报未连接。
 # 表格列：设备参数 / 业务信号 / PV 名称 / 单位 / 可写 / 必需
 PV_COLUMNS = ("设备参数", "业务信号", "PV 名称", "单位", "可写", "必需")
 
@@ -62,6 +68,24 @@ def _valid_service_url(value: str) -> bool:
         and not parsed.query
         and not parsed.fragment
     )
+
+
+def _prepare_cache_root(value: str) -> tuple[Path | None, str]:
+    """校验本地数据目录：必须是非空绝对路径，且真的能建、能写。
+
+    校验用执行同步时的同一段逻辑（`ensure_cache_root`），不另写一份——
+    否则会出现"设置里说可以、同步时才失败"的分裂。
+    """
+    text = value.strip()
+    if not text:
+        return None, "本地数据目录不能为空；点「用默认目录」可填回默认值。"
+    path = Path(text)
+    if not path.is_absolute():
+        return None, "请输入绝对路径（例如 D:\\谱图数据\\client_cache）。"
+    try:
+        return ensure_cache_root(path), ""
+    except CacheUnavailable as exc:
+        return None, str(exc)
 
 
 def _probe_service(base_url: str, path: str) -> tuple[bool, str]:
@@ -109,9 +133,10 @@ class SystemSettingsPage(QWidget):
     themeChanged = Signal(str)
     motionPreferenceChanged = Signal(bool)
 
-    def __init__(self) -> None:
+    def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
-        self._settings = QSettings("SpectrumPlatform", "DesktopClient")
+        # settings 只在测试里注入（临时 INI 文件）；运行时统一用本机偏好。
+        self._settings = settings or QSettings("SpectrumPlatform", "DesktopClient")
         self._probe_thread: ConnectionProbeThread | None = None
         self._pv_request: PvMappingRequestThread | None = None
         self._pv_loaded = False
@@ -195,6 +220,8 @@ class SystemSettingsPage(QWidget):
         panel.body.addWidget(hint)
         layout.addWidget(panel)
 
+        layout.addWidget(self._build_cache_panel())
+
         actions = QHBoxLayout()
         self.feedback_label = QLabel("", objectName="mutedText")
         self.feedback_label.setWordWrap(True)
@@ -219,6 +246,64 @@ class SystemSettingsPage(QWidget):
         )
         return tab
 
+    def _build_cache_panel(self) -> Panel:
+        """本地数据目录：中央数据镜像到哪，默认值直接写在界面上。"""
+        panel = Panel(
+            "本地数据目录",
+            "数据服务里的实验记录与谱图会增量下载到这里（本机只读镜像，可随时重建）",
+        )
+        self.cache_root = QLineEdit()
+        self.cache_root.setToolTip("填绝对路径；换目录后下次同步会重新下载到新目录")
+        default = default_cache_root()
+        browse = QPushButton("浏览…")
+        browse.clicked.connect(self._browse_cache_root)
+        open_button = QPushButton("打开目录")
+        open_button.clicked.connect(self._open_cache_root)
+        use_default = QPushButton("用默认目录")
+        use_default.clicked.connect(self._use_default_cache_root)
+        holder = QWidget()
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        row.addWidget(self.cache_root, 1)
+        row.addWidget(browse)
+        row.addWidget(open_button)
+        row.addWidget(use_default)
+        form = QFormLayout()
+        form.addRow("镜像目录", holder)
+        panel.body.addLayout(form)
+        hint = QLabel(
+            f"默认目录：{default}。保存时会自动创建并检查可写；换目录不会删除旧目录里的"
+            "内容，新目录在下次同步（重启客户端，或重试「同步中央数据」）时生效。"
+        )
+        hint.setObjectName("mutedText")
+        hint.setWordWrap(True)
+        panel.body.addWidget(hint)
+        self.cache_root.setText(str(cache_root_from_settings(self._settings)))
+        return panel
+
+    def _use_default_cache_root(self) -> None:
+        self.cache_root.setText(str(default_cache_root()))
+        self._set_feedback("idle", "已填入默认目录，点击“保存设置”生效。")
+
+    def _browse_cache_root(self) -> None:
+        directory = QFileDialog.getExistingDirectory(
+            self, "选择本地数据目录", self.cache_root.text().strip() or str(Path.home())
+        )
+        if directory:
+            self.cache_root.setText(str(Path(directory)))
+
+    def _open_cache_root(self) -> None:
+        text = self.cache_root.text().strip()
+        path, problem = _prepare_cache_root(text)
+        if path is None:
+            self._flash_feedback(False, problem)
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            self._flash_feedback(False, f"打不开目录：{path}")
+            return
+        self._set_feedback("good", f"已在资源管理器中打开 {path}")
+
     def _save_service_urls(self) -> None:
         data_url = self.data_url.text().strip()
         instrument_url = self.instrument_url.text().strip()
@@ -230,9 +315,20 @@ class SystemSettingsPage(QWidget):
             self._flash_feedback(False, "仪器执行地址无效，请输入 http(s)://主机:端口。")
             self.instrument_url.setFocus()
             return
+        cache_root, problem = _prepare_cache_root(self.cache_root.text())
         self._settings.setValue("service/dataUrl", data_url)
         self._settings.setValue("service/instrumentUrl", instrument_url)
-        self._flash_feedback(True, "已保存服务地址（本机连接偏好）。")
+        if cache_root is None:
+            # 目录不可用（选了离线网盘、打错盘符）不该连服务地址都存不下去：
+            # 能存的先存，再明确说清哪一项没通过、当前生效的仍是哪个目录。
+            self._flash_feedback(
+                False, f"服务地址已保存；本地数据目录未保存：{problem}"
+            )
+            self.cache_root.setFocus()
+            return
+        self._settings.setValue(CACHE_SETTINGS_KEY, str(cache_root))
+        self.cache_root.setText(str(cache_root))
+        self._flash_feedback(True, f"已保存服务地址与本地数据目录（{cache_root}）。")
 
     def _restore_default_urls(self) -> None:
         self.data_url.setText(DEFAULT_SERVICE_URLS["data"])
@@ -284,21 +380,6 @@ class SystemSettingsPage(QWidget):
         layout.setSpacing(14)
 
         panel = Panel("业务信号 → PV 映射", "执行服务受控配置 · 保存后立即生效")
-        form = QFormLayout()
-        self.pv_gateway = QComboBox()
-        for display, key in PV_GATEWAYS:
-            self.pv_gateway.addItem(display, key)
-        self.pv_gateway.setToolTip(
-            "模拟模式不连任何设备；真实模式通过 Channel Access 读写现场 IOC。"
-        )
-        form.addRow("网关模式", self.pv_gateway)
-        self.pv_ca_lib_dir = QLineEdit()
-        self.pv_ca_lib_dir.setPlaceholderText(
-            "留空自动发现；也可填 ca.dll 所在目录"
-        )
-        form.addRow("CA 库目录", self.pv_ca_lib_dir)
-        panel.body.addLayout(form)
-
         self.pv_table = QTableWidget(0, len(PV_COLUMNS))
         self.pv_table.setHorizontalHeaderLabels(PV_COLUMNS)
         header = self.pv_table.horizontalHeader()
@@ -332,7 +413,8 @@ class SystemSettingsPage(QWidget):
         note = QLabel(
             "说明：这里的 PV 就是现场 IOC 上的真实 PV 名，保存后健康检查、调束与扫谱"
             "都会按新映射执行；「可写」决定允许下发设定值，「必需」决定该 PV 掉线时"
-            "是否判定设备不可用。真实模式下写入仍受参数边界与设备联锁约束。"
+            "是否判定设备不可用。写入仍受参数边界与设备联锁约束。"
+            "本机没有 IOC 时可先启动仓库里 sim/ 的模拟 IOC 联调。"
         )
         note.setWordWrap(True)
         panel.body.addWidget(note)
@@ -361,7 +443,7 @@ class SystemSettingsPage(QWidget):
 
     def _start_pv_request(self, payload: dict | None) -> None:
         self.pv_save_button.setEnabled(False)
-        self._pv_request = PvMappingRequestThread(self._instrument_base_url(), payload, self)
+        self._pv_request = PvMappingRequestThread(self._instrument_base_url(), payload)
         self._pv_request.completed.connect(self._finish_pv_request)
         self._pv_request.finished.connect(self._release_pv_request)
         self._pv_request.start()
@@ -375,7 +457,16 @@ class SystemSettingsPage(QWidget):
     def _finish_pv_request(self, result: dict) -> None:
         if not result["ok"]:
             self._mark_pv_issues(result["issues"])
-            self._set_pv_feedback("error", result["message"])
+            if result["issues"]:
+                self._set_pv_feedback("error", result["message"])
+            else:
+                # 拿不到映射时要讲清楚原因：表格为空不等于「没有配置」。
+                self._set_pv_feedback(
+                    "error",
+                    f"读不到 PV 映射：{self._instrument_base_url()} 上的仪器执行服务不可达。"
+                    "请先启动执行服务（或本机调试用的 sim 模拟 IOC）后点“重新载入”；"
+                    "服务启动后映射会自动从这里载入，不会丢失。",
+                )
             return
         self._render_pv_mapping(result["config"])
         self._pv_loaded = True
@@ -393,18 +484,8 @@ class SystemSettingsPage(QWidget):
             self._set_pv_flag(row, 5, bool(entry.get("required", True)))
         for row in range(self.pv_table.rowCount()):
             self._clear_pv_row_marks(row)
-        index = self.pv_gateway.findData(config.get("gateway", "simulated"))
-        if index >= 0:
-            self.pv_gateway.setCurrentIndex(index)
-        self.pv_ca_lib_dir.setText(str(config.get("ca_lib_dir", "")))
-        self._set_pv_feedback(
-            "good" if config.get("gateway") == "channel-access" else "idle",
-            f"已载入 {len(entries)} 条映射（网关：{self._pv_gateway_label()}）。",
-        )
+        self._set_pv_feedback("good", f"已载入 {len(entries)} 条映射。")
         self.pv_save_button.setEnabled(True)
-
-    def _pv_gateway_label(self) -> str:
-        return "真实 EPICS" if self.pv_gateway.currentData() == "channel-access" else "模拟"
 
     # ---- PV 映射：表格增删改 ----
 
@@ -450,8 +531,6 @@ class SystemSettingsPage(QWidget):
             )
         return {
             "version": self._pv_config_version,
-            "gateway": self.pv_gateway.currentData(),
-            "ca_lib_dir": self.pv_ca_lib_dir.text().strip(),
             "entries": entries,
         }
 
