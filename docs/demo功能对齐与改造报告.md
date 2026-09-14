@@ -580,10 +580,10 @@ $env:QT_QPA_PLATFORM='offscreen'
 
 | P1 项 | 状态 | 关键改动 | 验证 |
 |---|---|---|---|
-| 1 调束目标/变量白名单 + 束线拓扑 | ✅ | 映射新增 `tunable` / `beam_target` 两个标记（**默认都不参与**：能写≠该调、能读≠是目标），设备档案按命名规则标记（29 个可调变量；4 路磁铁速率被排除）；新增 `packages/domain/beamline.py` 束线拓扑（8 段，从气路到束流探测）+ 上游关系；新增 `GET /control/v1/tuning/catalog` 返回目标/变量/拓扑/上游/联动组/排除原因；调束页改为读目录：目标只剩 FC1/FC2、变量只剩可调量、**选目标自动勾选其上游参数**，并把"为什么某个参数没列出来"写在提示里 | `tests/test_tuning_catalog.py`（13 例）+ `tests/test_tuning_page.py`（8 例）+ 在线目录实测：目标 2 个、变量 29 个、排除 57（非束流读数）+4（速率）、上游 29 个、联动组 3 个 |
+| 1 调束目标/变量白名单 + 束线拓扑 | ✅ | 映射新增 `tunable` / `beam_target` 两个标记（**默认都不参与**：能写≠该调、能读≠是目标），设备档案按命名规则标记（29 个可调变量；4 路磁铁速率被排除）；新增 `packages/domain/beamline.py` 束线拓扑（8 段，从气路到束流探测）+ 上游关系；新增 `GET /control/v1/tuning/catalog` 返回目标/变量/拓扑/上游/联动组/排除原因；调束页改为读目录：目标只剩 FC1/FC2、变量只剩可调量、**选目标自动勾选其上游参数**，并把"为什么某个参数没列出来"写在提示里 | `tests/test_tuning_catalog.py`（13 例，**第四轮复跑为 14 例**）+ `tests/test_tuning_page.py`（8 例）+ 在线目录实测：目标 2 个、变量 29 个、排除 57（非束流读数）+4（速率）、上游 29 个、联动组 3 个 |
 | 2 启动前快照 + 束流丢失回退 | ✅ | 启动时（占用设备后、进入 RUNNING 前）记录**各路参与变量的实际回读**与**目标基线**，落库 `snapshot_json` / `baseline_objective`；**取不到任何一路回读就拒绝启动**（没快照就没退路）。每轮结束后按三条判据判异常：目标读不到 / ≤ 绝对阈值 / 相对基线下降超过 `loss_relative`；**连续 `loss_strikes` 次**才触发（单点毛刺不退参数）。触发后经**执行层**（`ramp=True`，边界与单步约束照样生效）逐路退回快照并逐路等回读到位；全部到位才 `aborted`+交还设备，任一路退不到位则转 `RECOVERY_REQUIRED` 并**保留设备锁**。回退原因与逐路实际回读写入 `tuning_runs.recovery_json`（老库幂等补列） | `tests/test_tuning_guard.py`（12 例）+ 界面 10 例；**真实链路实测**：磁铁 210 A → 启动（快照 210 / 基线 8.31）→ 确认一轮 → 保护触发（`目标 8.31 已低于绝对阈值 100`）→ 状态 `aborted`、回退记录 `ok=true, restored={magnet.m1.current_setpoint: 210.0}` → **实测磁铁回读回到 210.0**、设备锁已交还（紧接着的扫谱正常完成） |
 | 3 应用最优 / 恢复初始 / 回安全值 | ✅ | 新增 `POST /control/v1/tuning/runs/{id}/finalize`（`action` + **必须 `confirm=true`**）。三种动作的取值为：最优轮**实际回读** / 启动前快照 / 映射里每路的**下限**（无下限按 0）。动作**重新申请设备组**（任务已交还锁，别人可能正在用）→ 走执行层逐路写（含单步与速率约束）→ **逐路等回读到位** → 返回逐路实际回读；设备组被占返回 409、未确认/任务未结束/恢复待确认一律 400。结果落库 `tuning_runs.finalize_json`（老库幂等补列）并在状态接口回传。结果页新增三个按钮 + 二次确认 + 逐路回读反馈 | `tests/test_tuning_finalize.py`（13 例）+ 界面 8 例；**真实链路实测**：190 A 快照 → 一轮 → 最优轮 200 → `restore_initial` 设备回 190 / `safe_values` 回 0 / `apply_best` 回 200；`confirm=false` → 400、被扫谱占组 → 409（并点名占用者） |
-| 4 逐参数优化后联合微调 | ✅ | 新增 `strategy`（`joint` / `sequential_then_joint`）、`calls_per_variable`、`joint_frac`、`hold_s` 四个参数。阶段 1 **逐个变量单独优化**（每个用 `calls_per_variable` 轮，其余变量**不写**、只读回记录，后一个变量的起点是前一个停下时的位置）；阶段 2 **围绕每个变量自己的最优点**收窄到原范围的 `joint_frac` 做联合微调，并**接续阶段 1 的观测**（换维度时把历史观测投影到新维度，GP 不该因为换阶段就忘掉）。`hold_s` = 稳定到位后再等一会儿才采目标。状态与候选都带上阶段信息（`stage/stage_index/stage_total/stage_variable`、`active_signals`）。轮次不够跑完阶段 1 时**启动即拒绝** | `tests/test_tuning_stages.py`（11 例）+ 界面 5 例；**真实链路实测**（2 变量 × 每个 2 轮 → 联合 4 轮）：轮 1–2 只写磁铁（聚焦电压保持 2123.0 不动、只记录）、轮 3–4 只写聚焦电压（磁铁保持 204.4）、轮 5–8 联合且候选落回阶段 1 最优点附近（磁铁 202–206 / 聚焦 2500–2543） |
+| 4 逐参数优化后联合微调 | ✅ | 新增 `strategy`（`joint` / `sequential_then_joint`）、`calls_per_variable`、`joint_frac`、`hold_s` 四个参数。阶段 1 **逐个变量单独优化**（每个用 `calls_per_variable` 轮，其余变量**不写**、只读回记录，后一个变量的起点是前一个停下时的位置）；阶段 2 **围绕每个变量自己的最优点**收窄到原范围的 `joint_frac` 做联合微调，并**接续阶段 1 的观测**（换维度时把历史观测投影到新维度，GP 不该因为换阶段就忘掉）。`hold_s` = 稳定到位后再等一会儿才采目标。状态与候选都带上阶段信息（`stage/stage_index/stage_total/stage_variable`、`active_signals`）。轮次不够跑完阶段 1 时**启动即拒绝** | `tests/test_tuning_stages.py`（11 例，**第四轮复跑为 15 例**：另含每轮阶段记录、阶段落盘往返与老库补列 3 例）+ 界面 5 例；**真实链路实测**（2 变量 × 每个 2 轮 → 联合 4 轮）：轮 1–2 只写磁铁（聚焦电压保持 2123.0 不动、只记录）、轮 3–4 只写聚焦电压（磁铁保持 204.4）、轮 5–8 联合且候选落回阶段 1 最优点附近（磁铁 202–206 / 聚焦 2500–2543） |
 | 5 全参数谱图导出与实验元数据 | ✅ | 见 §8.3 第 5 行：`device_snapshot`（52 路现场读数）+ `acquisition`（真实 `run_id` 与起止时间）+ 文件名带工况参数 | 见 §8.4 |
 | 6 LabVIEW/MSScan 接入 | ⛔ 阻塞 | 冻结文档已交付（§8.3 第 6 行）；**接入前必须先由现场回答 `docs/LabVIEW数据链路协议冻结.md` §10 的 7 个问题**（帧格式能否改、有无完成信号、`run_id` 由谁生成、中继保留与否、接收器放哪、每点时间戳来源、RunVI/AbortVI 是否要平台控制） | — |
 
@@ -681,6 +681,30 @@ $env:QT_QPA_PLATFORM='offscreen'
 | 「按钮选中态跟随实际回读」偶发失败 | 按钮选中态按**回读值**每个轮询周期刷一次，点完立刻断言会撞上"回读还没回来"那一帧 | 改成等待其跟随到位（或服务端明确拒绝），有界 10 s |
 
 顺手把这两处依赖的"消息区文案"改成先清空再提交：不清空时 `pump` 可能被**上一次**留下的"已下发/被拒绝"立刻满足，断言实际看的是旧结果。
+
+---
+
+### 8.11 取证复跑与"报告声明机检"（2026-09-14 第四轮）
+
+报告的结论大量写成"某文件（N 例）""只剩 X 条既有违规""某端点返回 400"这种**可核对**的形式。后续几轮一直在加用例与改代码，不核对就会出现"报告说 11 例、实际 15 例"这类漂移——报告是给人当事实看的，漂了比没有更糟。所以新增 `tools/check_report_claims.py`：把能被机器证伪的部分逐条对一遍。
+
+```powershell
+# 一条命令核对：路径存在性、测试文件条数、既有违规条数（--skip-tests 时跳过全量复跑）
+.\.venv\Scripts\python.exe -X utf8 tools\check_report_claims.py
+```
+
+| 本轮复跑项 | 命令 | 结果 |
+|---|---|---|
+| 全量单测 | `$env:QT_QPA_FONTDIR="C:\Windows\Fonts"; .\.venv\Scripts\python.exe -m pytest tests -q` | **651 passed, 253 subtests**（§8.4 的 444/236 是 P0 当时的快照，保留作历史；最新一条以本节为准） |
+| 静态检查 | `.\.venv\Scripts\python.exe -m ruff check apps packages tests tools` | 5 条既有违规，0 新增 |
+| 在线自检 | `check_signal_chain.py` / `check_manual_page_live.py`（连跑 5 次）/ `check_scan_page_live.py` / `check_tuning_page_live.py` / `check_read_only_live.py` | 全部通过；手动页自检连跑 5 次 5 通过（修掉两处瞬时采样误报后） |
+| 对比度 | `tools/contrast_audit.py` | 通过 40 条、不达标 0 |
+| 截图回归 | `tools/ui_snapshot.py --out build/ui_snap` | 20 张，`[ok] 20 张截图互不相同` |
+| 报告声明机检 | `tools/check_report_claims.py` | 引用 21 个路径 0 缺失；3 处"（N 例：…）"总数声明全部相符；既有违规声明 5 条与实际一致 |
+
+**本轮机检抓到的两处漂移（已改）**：`tests/test_tuning_catalog.py` 报告写 13 例、实际 14 例；`tests/test_tuning_stages.py` 报告写 11 例、实际 15 例（第三轮又加了每轮阶段相关 3 例）。两处都在原行内标注了复跑值，不改历史数字——"当时是多少"与"现在是多少"都要看得见。
+
+**顺带做了一次语义抽查**（数字对得上不代表内容对）：§8.6 第 1 行的目录实测数字直接问在线服务复核——`targets=2`、`variables=29`、`stages=8`（气路→溅射→真空→离子光学→DW→BD→磁铁→探测器）、`linked_sets=3`、`excluded` 两栏 57（不是束流测量）+4（变化速率/保护类），`upstream` 两个目标各 29 路。与报告一致。
 
 ---
 
