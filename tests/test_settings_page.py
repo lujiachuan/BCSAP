@@ -23,6 +23,7 @@ from apps.desktop_client.initialization import (
     default_cache_root,
 )
 from apps.desktop_client.pages import SystemSettingsPage
+from apps.desktop_client.pages.settings import PV_SIGNAL_COLUMN
 
 DEFAULT_SERVICE_URLS = {
     "data": "http://127.0.0.1:8000",
@@ -161,6 +162,172 @@ class CacheDirSettingsTests(unittest.TestCase):
         )
 
         self.assertEqual(worker.cache_root, chosen)
+
+
+def mapping_entry(signal: str, **overrides: object) -> dict:
+    """一条带完整安全字段的映射（形状与执行服务 GET 返回的一致）。"""
+    entry = {
+        "signal": signal,
+        "label": signal,
+        "pv": "PV:" + signal,
+        "unit": "sccm",
+        "writable": True,
+        "required": True,
+        "group": "气体流量",
+        "readback_signal": signal.replace("_setpoint", "_readback"),
+        "rate_signal": "",
+        "role": "setpoint",
+        "tunable": True,
+        "beam_target": False,
+        "min_value": 0.0,
+        "max_value": 500.0,
+        "max_step": 10.0,
+        "max_rate": 5.0,
+        "settle_tol": 2.0,
+        "settle_timeout": 30.0,
+    }
+    entry.update(overrides)
+    return entry
+
+
+SAFETY_FIELDS = (
+    "group",
+    "role",
+    "readback_signal",
+    "rate_signal",
+    "tunable",
+    "beam_target",
+    "min_value",
+    "max_value",
+    "max_step",
+    "max_rate",
+    "settle_tol",
+    "settle_timeout",
+)
+
+
+class PvMappingSafetyFieldTests(CacheDirSettingsTests):
+    """保存 PV 映射不能丢掉界面没显示的**安全字段**。
+
+    契约里这些字段都有默认值，缺字段不会报错——所以"只按表格重建条目"的写法
+    会静默清空写入边界、单步/速率保护和稳定判据，分组与角色丢失还会让手动页控件
+    退化、调束因缺 max_step 拒绝启动。
+    """
+
+    def loaded_page(self, *entries: dict) -> SystemSettingsPage:
+        page = self.make_page()
+        page._render_pv_mapping({"version": 1, "entries": list(entries)})
+        return page
+
+    def test_visible_only_save_keeps_every_safety_field(self) -> None:
+        original = mapping_entry("gas.ar.flow_setpoint")
+        page = self.loaded_page(original)
+
+        collected = page._collect_pv_mapping()["entries"][0]
+
+        for field in SAFETY_FIELDS:
+            self.assertEqual(collected[field], original[field], field)
+
+    def test_editing_a_displayed_field_keeps_the_hidden_ones(self) -> None:
+        page = self.loaded_page(mapping_entry("gas.ar.flow_setpoint"))
+        page._set_pv_text(0, 2, "Part1:Flow_W:CS200A:Setpoint")  # 改 PV 名
+        page._set_pv_flag(0, 4, False)  # 改成只读
+
+        collected = page._collect_pv_mapping()["entries"][0]
+
+        self.assertEqual(collected["pv"], "Part1:Flow_W:CS200A:Setpoint")
+        self.assertFalse(collected["writable"])
+        self.assertEqual(collected["max_step"], 10.0)
+        self.assertEqual(collected["settle_tol"], 2.0)
+        self.assertEqual(collected["readback_signal"], "gas.ar.flow_readback")
+
+    def test_the_payload_only_carries_contract_fields(self) -> None:
+        """合并后的条目必须是契约字段，不能把界面控件带出的额外键发上去。"""
+        from packages.contracts import PvMappingEntry
+
+        page = self.loaded_page(mapping_entry("gas.ar.flow_setpoint"))
+
+        collected = page._collect_pv_mapping()["entries"][0]
+
+        self.assertEqual(set(collected), set(PvMappingEntry.model_fields))
+
+    def test_renaming_the_signal_drops_the_stale_readback_pairing(self) -> None:
+        """业务信号就是行身份：改名后旧的回读配对会指向别的通道，必须清空。"""
+        page = self.loaded_page(mapping_entry("gas.ar.flow_setpoint"))
+        page._set_pv_text(0, PV_SIGNAL_COLUMN, "gas.ne.flow_setpoint")
+
+        collected = page._collect_pv_mapping()["entries"][0]
+
+        self.assertEqual(collected["signal"], "gas.ne.flow_setpoint")
+        self.assertEqual(collected["readback_signal"], "")
+        self.assertEqual(collected["group"], "气体流量")
+        self.assertEqual(collected["max_value"], 500.0)
+
+    def test_editing_the_signal_cell_in_place_keeps_the_hidden_fields(self) -> None:
+        """操作员在表格里直接改单元格（编辑器写回原 item）也要留住安全字段。"""
+        page = self.loaded_page(mapping_entry("gas.ar.flow_setpoint"))
+        page.pv_table.item(0, PV_SIGNAL_COLUMN).setText("gas.ne.flow_setpoint")
+
+        collected = page._collect_pv_mapping()["entries"][0]
+
+        self.assertEqual(collected["readback_signal"], "")
+        self.assertEqual(collected["max_step"], 10.0)
+        self.assertEqual(collected["settle_timeout"], 30.0)
+
+    def test_configured_rate_signal_survives_editing_a_visible_field(self) -> None:
+        """磁铁的速率配对（`CurrentRateSet`）同样不能因为保存而丢——丢了以后
+        成组回落就静默不下发速率，只按 max_step 慢慢爬。"""
+        page = self.loaded_page(
+            mapping_entry(
+                "magnet.m1.current_setpoint",
+                rate_signal="magnet.m1.current_rate_setpoint",
+                readback_signal="magnet.m1.current_readback",
+            )
+        )
+        page._set_pv_text(0, 2, "BD:DipoleMagnet:01:CurrentSet")
+
+        collected = page._collect_pv_mapping()["entries"][0]
+
+        self.assertEqual(collected["rate_signal"], "magnet.m1.current_rate_setpoint")
+        self.assertEqual(collected["readback_signal"], "magnet.m1.current_readback")
+
+    def test_new_rows_carry_no_safety_fields(self) -> None:
+        page = self.make_page()
+        page._add_pv_row()
+        page._set_pv_text(0, PV_SIGNAL_COLUMN, "quadrupole.q3.current")
+        page._set_pv_text(0, 2, "BL:Q3:ISET")
+
+        collected = page._collect_pv_mapping()["entries"][0]
+
+        self.assertEqual(
+            set(collected), {"label", "signal", "pv", "unit", "writable", "required"}
+        )
+
+    def test_hover_shows_the_hidden_fields_and_survives_clear_marks(self) -> None:
+        page = self.loaded_page(mapping_entry("gas.ar.flow_setpoint"))
+
+        tooltip = page.pv_table.item(0, PV_SIGNAL_COLUMN).toolTip()
+        self.assertIn("分组：气体流量", tooltip)
+        self.assertIn("回读配对：gas.ar.flow_readback", tooltip)
+        self.assertIn("边界：0 ~ 500 sccm", tooltip)
+        self.assertIn("单步上限：10", tooltip)
+        self.assertIn("稳定判据：2 / 30 s", tooltip)
+
+        page._clear_pv_row_marks(0)
+
+        self.assertIn("分组：气体流量", page.pv_table.item(0, PV_SIGNAL_COLUMN).toolTip())
+
+    def test_row_marks_restore_the_safety_tooltip_after_an_error(self) -> None:
+        page = self.loaded_page(mapping_entry("gas.ar.flow_setpoint"))
+        page._mark_pv_issues(
+            [{"index": 0, "field": "signal", "message": "业务信号重复"}]
+        )
+
+        self.assertEqual(page.pv_table.item(0, PV_SIGNAL_COLUMN).toolTip(), "业务信号重复")
+
+        page._clear_all_pv_marks()
+
+        self.assertIn("分组：气体流量", page.pv_table.item(0, PV_SIGNAL_COLUMN).toolTip())
 
 
 if __name__ == "__main__":

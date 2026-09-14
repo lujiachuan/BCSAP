@@ -25,6 +25,10 @@ SIGNALS_READ_PATH = "/control/v1/signals/read"
 SIGNALS_WRITE_PATH = "/control/v1/signals/write"
 SCAN_RUNS_PATH = "/control/v1/scan/runs"
 TUNING_RUNS_PATH = "/control/v1/tuning/runs"
+TUNING_CATALOG_PATH = "/control/v1/tuning/catalog"
+# 成组写入一次要下发多路，且服务端会逐路走斜坡（受 max_rate 限制），超时给足
+BATCH_WRITE_TIMEOUT_S = 60.0
+MAGNET_RETRACT_PATH = "/control/v1/magnets/retract"
 
 DEFAULT_INSTRUMENT_URL = "http://127.0.0.1:8765"
 
@@ -38,12 +42,31 @@ SCAN_START_TIMEOUT_S = 20.0
 SCAN_POLL_TIMEOUT_S = 10.0
 # 调束确认执行：服务端同步完成「写设备 → 等稳定 → 采目标」，必须留足
 TUNING_APPLY_TIMEOUT_S = 180.0
+# 成组回落：服务端按请求里的 timeout_s 逐路写速率、写电流、等回读进入容差。
+# 客户端超时必须比它长，否则会把「还在等最后一路到位」显示成网络超时，
+# 现场会误判成设备或网络故障。
+MAGNET_RETRACT_TIMEOUT_S = 120.0
 
 # 正在运行的请求线程。挂模块级集合而不是父页面：页面先销毁时 Qt 会报
 # 「QThread: Destroyed while thread is still running」，而这些线程阻塞在网络
 # 调用里无法取消，只能等它跑完（与 pv_mapping_api 同一处理）。
 _RUNNING: set[QThread] = set()
 _write_busy = False
+# 全局只读部署模式（执行服务按部署参数禁用所有写入）：由启动检查写入，页面据此
+# 不给"能按但按不动"的按钮并说明原因。**这不是安全边界**——真正的强制点在
+# 执行服务的 SignalWriteService.write()（所有写路径都经过它）。
+_read_only = False
+
+
+def set_read_only(value: bool) -> None:
+    """记录执行服务是否处于全局只读模式（启动检查时调用）。"""
+    global _read_only
+    _read_only = bool(value)
+
+
+def is_read_only() -> bool:
+    """执行服务是否处于全局只读部署模式。"""
+    return _read_only
 
 
 def instrument_base_url() -> str:
@@ -179,6 +202,43 @@ def _post(path: str, payload: dict, base_url: str | None = None, timeout: float 
 # ----------------------------------------------------------------------
 # 调束任务（架构文档 6.6：建议 → 人工确认）
 # ----------------------------------------------------------------------
+def request_batch_write(
+    writes: list[dict],
+    *,
+    note: str = "",
+    atomic: bool = True,
+    base_url: str | None = None,
+) -> _JsonRequestThread | None:
+    """成组写入（磁铁 1+2 / 3+4 / 1~4 这类一起下发的动作）。
+
+    **必须由执行服务成批做**：客户端循环调单点接口会留下"前两台动了、后两台还在
+    原位"的中间状态，而且没有地方记录"这一批本来是一起下的"（改造报告 §4.2）。
+
+    与单点写入共用同一个串行闸门：成组下发期间不允许另一个写插进来。
+    """
+    global _write_busy
+    if _write_busy:
+        return None
+    _write_busy = True
+    thread = _post(
+        "/control/v1/signals/write-batch",
+        {"writes": writes, "atomic": atomic, "note": note},
+        base_url,
+        timeout=BATCH_WRITE_TIMEOUT_S,
+    )
+    thread.finished.connect(_release_write)
+    return thread
+
+
+def request_tuning_catalog(base_url: str | None = None):
+    """调束可选项目录：可选目标、可调变量、束线拓扑与目标的上下游关系。
+
+    目录由执行服务按**当前映射**算出。客户端不再自己"凡是可写的都当变量、
+    凡是只读的都当目标"——那等于把设备语义交给界面猜（改造报告 §5.2）。
+    """
+    return _get(TUNING_CATALOG_PATH, base_url)
+
+
 def request_tuning_start(request: dict, base_url: str | None = None):
     return _post(TUNING_RUNS_PATH, request, base_url, timeout=SCAN_START_TIMEOUT_S)
 
@@ -211,6 +271,22 @@ def request_tuning_acknowledge(run_id: str, note: str = "", base_url: str | None
     return _post(
         f"{TUNING_RUNS_PATH}/{run_id}/acknowledge{suffix}", {}, base_url,
         timeout=SCAN_START_TIMEOUT_S,
+    )
+
+
+def request_tuning_finalize(
+    run_id: str, action: str, base_url: str | None = None
+):
+    """结束后的设备处置：应用最优 / 恢复启动前 / 回安全值。
+
+    写设备并逐路等回读到位，超时按冻结时间给足（与"确认执行一轮"同量级）；
+    ``confirm=true`` 由客户端显式发——服务端也会再挡一道，防止脚本绕过确认框。
+    """
+    return _post(
+        f"{TUNING_RUNS_PATH}/{run_id}/finalize",
+        {"action": action, "confirm": True},
+        base_url,
+        timeout=TUNING_APPLY_TIMEOUT_S,
     )
 
 
@@ -308,6 +384,35 @@ def request_scan_points(
     run_id: str, since: int = 0, base_url: str | None = None
 ) -> ScanPointsThread:
     thread = ScanPointsThread(base_url or instrument_base_url(), run_id, since)
+    thread.start()
+    return thread
+
+
+# ----------------------------------------------------------------------
+# 成组回落（架构文档 6.6：回落属于设备安全收尾，客户端只负责发起与如实展示）
+# ----------------------------------------------------------------------
+class MagnetRetractThread(_JsonRequestThread):
+    """把一组磁铁退到目标电流：服务端逐路写速率、写电流、等回读进入容差。"""
+
+    def __init__(self, base_url: str, request: dict) -> None:
+        super().__init__(
+            base_url.rstrip("/") + MAGNET_RETRACT_PATH,
+            request,
+            MAGNET_RETRACT_TIMEOUT_S,
+            method="POST",
+        )
+
+
+def request_magnet_retract(
+    request: dict, base_url: str | None = None
+) -> MagnetRetractThread:
+    """启动一次成组回落。
+
+    两种失败形状都要认：**有路没到位**时服务端返回 200 且 ``ok=false``（``message``
+    说明哪一路没到位或被拒，``applied`` 里是逐路实际回读）；设备组被扫谱/调束占着时
+    返回 409，由 ``_JsonRequestThread`` 统一转成 ``ok=false`` + 原因文本。
+    """
+    thread = MagnetRetractThread(base_url or instrument_base_url(), request)
     thread.start()
     return thread
 

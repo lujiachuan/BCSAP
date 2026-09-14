@@ -57,6 +57,8 @@ class InitializationApiTests(unittest.TestCase):
         self.assertIn("/api/v1/sync/manifest", data_paths)
         self.assertIn("/api/v1/sync/changes", data_paths)
         self.assertIn("/control/v1/pvs/health", instrument_paths)
+        # 成组回落必须走执行服务（客户端只写第一路 = 其余磁铁停在原地）
+        self.assertIn("/control/v1/magnets/retract", instrument_paths)
 
 
 class CacheRootConfigTests(unittest.TestCase):

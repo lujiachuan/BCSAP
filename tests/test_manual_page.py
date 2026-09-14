@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -18,8 +19,27 @@ from PySide6.QtCore import QPoint, QPointF, QSettings, Qt
 from PySide6.QtGui import QWheelEvent
 from PySide6.QtWidgets import QApplication, QLabel
 
+from apps.desktop_client import instrument_api
 from apps.desktop_client.pages import manual
 from apps.desktop_client.pages.registry import page_specs
+
+
+class _GroupPanelSignal:
+    """成组下发请求线程的 completed 信号替身。"""
+
+    def __init__(self, payload: dict | None) -> None:
+        self._payload = payload
+
+    def connect(self, callback, *_args, **_kwargs) -> None:
+        if self._payload is not None:
+            callback(self._payload)
+
+
+class _GroupPanelThread:
+    """替掉成组下发的请求线程：单测不连服务，也不留 QThread。"""
+
+    def __init__(self, payload: dict | None = None) -> None:
+        self.completed = _GroupPanelSignal(payload)
 
 
 def entry(signal: str, **overrides: object) -> dict:
@@ -1908,6 +1928,186 @@ class DeviceStateUnknownTests(unittest.TestCase):
 
         self.assertNotIn("设备状态未知", self.page.status_label.text())
         self.assertEqual(self.page.status_label.property("state"), "good")
+
+
+def magnet_entries() -> list[dict]:
+    """四台磁铁（设定 + 速率 + 回读），够成组设定面板用。"""
+    rows: list[dict] = []
+    for n in (1, 2, 3, 4):
+        rows += [
+            entry(
+                f"magnet.m{n}.current_setpoint",
+                label=f"磁铁{n} 电流设定",
+                writable=True,
+                role="setpoint",
+                unit="A",
+                group="磁铁电源",
+                readback_signal=f"magnet.m{n}.current_readback",
+                rate_signal=f"magnet.m{n}.current_rate_setpoint",
+                min_value=0.0,
+                max_value=600.0,
+                max_step=100.0,
+            ),
+            entry(
+                f"magnet.m{n}.current_rate_setpoint",
+                label=f"磁铁{n} 速率设定",
+                writable=True,
+                role="setpoint",
+                unit="A/s",
+                group="磁铁电源",
+                min_value=0.0,
+                max_value=10.0,
+            ),
+            entry(
+                f"magnet.m{n}.current_readback",
+                label=f"磁铁{n} 电流回读",
+                unit="A",
+                group="磁铁电源",
+            ),
+        ]
+    return rows
+
+
+class MagnetGroupPanelTests(unittest.TestCase):
+    """成组设定：组定义只有一份、整批下发、失败要说清是哪一台。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def make_page(self, entries: list[dict] | None = None) -> manual.ManualControlPage:
+        page = manual.ManualControlPage()
+        page._on_mapping(
+            {
+                "ok": True,
+                "config": {
+                    "entries": entries if entries is not None else magnet_entries()
+                },
+            }
+        )
+        return page
+
+    def test_group_choices_use_the_shared_link_group_definition(self) -> None:
+        from packages.domain import beamline
+
+        choices = manual._magnet_group_choices()
+
+        self.assertEqual(len(choices), len(beamline.LINKED_VARIABLE_SETS))
+        for (label, signals), linked in zip(choices, beamline.LINKED_VARIABLE_SETS):
+            self.assertEqual(signals, [s for s in linked if s.endswith("_setpoint")])
+            self.assertTrue(label.startswith("磁铁"))
+            self.assertTrue(label.endswith("同步"))
+
+    def test_panel_is_built_when_the_mapping_has_the_magnets(self) -> None:
+        page = self.make_page()
+
+        panel = page.magnet_group_panel
+        self.assertIsNotNone(panel)
+        self.assertEqual(panel.group_combo.count(), len(manual._magnet_group_choices()))
+
+    def test_panel_is_skipped_without_magnet_signals(self) -> None:
+        page = self.make_page(
+            [entry("gas.ar.flow_setpoint", writable=True, role="setpoint")]
+        )
+
+        self.assertIsNone(page.magnet_group_panel)
+
+    def test_batch_request_carries_every_member_of_the_group(self) -> None:
+        page = self.make_page()
+        panel = page.magnet_group_panel
+        panel.group_combo.setCurrentIndex(len(manual._magnet_group_choices()) - 1)
+        panel.current_spin.setValue(120.0)
+        sent: dict = {}
+
+        def fake(writes, *, note="", atomic=True, base_url=None):
+            sent.update({"writes": writes, "note": note, "atomic": atomic})
+            return _GroupPanelThread()
+
+        with mock.patch.object(instrument_api, "request_batch_write", fake):
+            panel._submit()
+
+        self.assertTrue(sent["atomic"])
+        self.assertEqual(
+            [item["signal"] for item in sent["writes"]],
+            [f"magnet.m{n}.current_setpoint" for n in (1, 2, 3, 4)],
+        )
+        self.assertTrue(all(item["value"] == 120.0 for item in sent["writes"]))
+        self.assertIn("1+2+3+4", sent["note"])
+
+    def test_rate_is_sent_before_the_current_when_enabled(self) -> None:
+        page = self.make_page()
+        panel = page.magnet_group_panel
+        panel.group_combo.setCurrentIndex(0)  # 磁铁1+2
+        panel.current_spin.setValue(150.0)
+        panel.rate_check.setChecked(True)
+        panel.rate_spin.setValue(4.0)
+        sent: dict = {}
+
+        def fake(writes, *, note="", atomic=True, base_url=None):
+            sent["writes"] = writes
+            return _GroupPanelThread()
+
+        with mock.patch.object(instrument_api, "request_batch_write", fake):
+            panel._submit()
+
+        self.assertEqual(
+            [item["signal"] for item in sent["writes"]],
+            [
+                "magnet.m1.current_rate_setpoint",
+                "magnet.m2.current_rate_setpoint",
+                "magnet.m1.current_setpoint",
+                "magnet.m2.current_setpoint",
+            ],
+        )
+
+    def test_partial_success_names_the_failing_member(self) -> None:
+        page = self.make_page()
+        panel = page.magnet_group_panel
+
+        panel._on_done(
+            {
+                "ok": True,
+                "payload": {
+                    "ok": False,
+                    "message": "成组写入部分成功：3 路已下发、1 路失败",
+                    "results": [
+                        {"signal": "magnet.m1.current_setpoint", "accepted": True},
+                        {
+                            "signal": "magnet.m2.current_setpoint",
+                            "accepted": False,
+                            "reason": "CA 写入超时",
+                        },
+                    ],
+                },
+            }
+        )
+
+        text = panel.result_label.text()
+        self.assertIn("部分成功", text)
+        self.assertIn("magnet.m2.current_setpoint", text)
+        self.assertIn("CA 写入超时", text)
+        self.assertEqual(panel.result_label.property("state"), "error")
+
+    def test_transport_failure_is_never_shown_as_success(self) -> None:
+        page = self.make_page()
+        panel = page.magnet_group_panel
+
+        panel._on_done({"ok": False, "message": "设备组当前不可用：磁铁电源"})
+
+        self.assertIn("未执行", panel.result_label.text())
+        self.assertIn("设备组当前不可用", panel.result_label.text())
+        self.assertEqual(panel.result_label.property("state"), "error")
+
+    def test_busy_write_is_reported_instead_of_dropped(self) -> None:
+        page = self.make_page()
+        panel = page.magnet_group_panel
+
+        with mock.patch.object(
+            instrument_api, "request_batch_write", lambda *a, **k: None
+        ):
+            panel._submit()
+
+        self.assertIn("上一次写入", panel.result_label.text())
 
 
 if __name__ == "__main__":

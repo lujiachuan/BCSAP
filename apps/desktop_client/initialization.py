@@ -24,6 +24,8 @@ from PySide6.QtWidgets import (
 
 from packages.spectrum import decode_spectrum, spectrum_checksum
 
+from . import instrument_api
+
 # 本地镜像目录：可在「系统设置 → 服务与连接」里改，也可用环境变量指定
 # （与执行服务的 SPECTRUM_SCAN_STORE 同一套约定，便于部署脚本统一安排落点）。
 CACHE_SETTINGS_KEY = "sync/cacheRoot"
@@ -275,7 +277,7 @@ class InitializationWorker(QThread):
     def _check_instrument(self) -> bool:
         self.stepChanged.emit("instrument", "running", "正在连接…")
         try:
-            _request_json(self.instrument_url + "/control/v1/status")
+            status = _request_json(self.instrument_url + "/control/v1/status")
         except Exception as exc:  # 连接类错误统一展示，不区分细节
             self.stepChanged.emit("instrument", "error", f"不可达：{exc}")
             self.stepChanged.emit("pv", "warn", "已跳过")
@@ -284,7 +286,16 @@ class InitializationWorker(QThread):
             self.pvStatus.emit(0, 0, ["仪器执行服务不可达，未执行 PV 检查。"])
             return False
 
-        self.stepChanged.emit("instrument", "good", "仪器执行服务可达")
+        # 全局只读部署模式：记在客户端一份，页面据此不给"能按但按不动"的按钮。
+        # 真正的强制点在执行层，这里只是让界面别撒谎。
+        instrument_api.set_read_only(bool(status.get("read_only")))
+        self.stepChanged.emit(
+            "instrument",
+            "good",
+            "仪器执行服务可达（全局只读模式）"
+            if status.get("read_only")
+            else "仪器执行服务可达",
+        )
         self.serviceChanged.emit("instrument", "good", "就绪")
         self.stepChanged.emit("pv", "running", "正在检查受控 PV…")
         try:

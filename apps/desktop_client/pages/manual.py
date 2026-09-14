@@ -54,6 +54,8 @@ from PySide6.QtCore import QPoint, QRect, QSettings, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
@@ -74,6 +76,7 @@ from apps.desktop_client.spectrum_plot import SpectrumPlot
 from apps.desktop_client.theme import current_palette
 from apps.desktop_client.trend_buffer import DEFAULT_KEEP_S, TrendBuffer
 from apps.desktop_client.widgets import PageHeading
+from packages.domain import beamline
 
 # 回读轮询间隔：128 路一次快照，本地回环开销很低
 POLL_INTERVAL_MS = 1000
@@ -144,6 +147,8 @@ STEP_LEVELS = (1, 10, 100)
 # 量程端点**——顶到端点后增量被夹住，×100 与 ×10 的差别就消失了。实测旧的分母
 # 50（×100 = 200% 量程）在 DW 通道 5000 V 处三档增量全是 +100 V，与 ×1 完全一样。
 SPAN_PER_BASE_STEP = 500.0
+# 成组设定卡片的高度（表头 + 一行控件 + 结果行）
+MAGNET_GROUP_PANEL_HEIGHT = 132
 # 单行最多几个设定槽（现场映射最多 2 个：磁铁电流+速率、主高压电压+电流）
 MAX_SETPOINT_SLOTS = 3
 # 回读列一行最多平铺几个读数，超出用 «· +n» 提示，明细进 tooltip
@@ -877,6 +882,146 @@ class _DraggableFrame(QFrame):
         super().mouseReleaseEvent(event)
 
 
+def _magnet_group_choices() -> list[tuple[str, list[str]]]:
+    """成组设定的可选组：磁铁 1+2 / 3+4 / 1~4。
+
+    联动组只有**一份定义**（``packages.domain.beamline.LINKED_VARIABLE_SETS``），
+    这里只把设定信号挑出来、按磁铁序号生成标签——不在界面里另抄一份。
+    """
+    choices: list[tuple[str, list[str]]] = []
+    for linked in beamline.LINKED_VARIABLE_SETS:
+        setpoints = [signal for signal in linked if signal.endswith("_setpoint")]
+        if len(setpoints) < 2:
+            continue
+        indexes = [signal.split(".")[1][1:] for signal in setpoints]
+        choices.append((f"磁铁{'+'.join(indexes)} 同步", setpoints))
+    return choices
+
+
+class _MagnetGroupPanel(_GroupPanel):
+    """磁铁成组设定：把一组磁铁一起下发同一个电流（可选先下发速率）。
+
+    下发交给执行服务的**成组接口**，不在界面里循环调单点写：后者在中途失败时
+    会留下"前两台已经动了、后两台还在原位"的中间状态，而磁场不均匀比整体不动
+    更危险（改造报告 §4.2）。成组接口会先整批干跑校验，任何一项不合格就整批不写。
+    """
+
+    def __init__(
+        self,
+        page: ManualControlPage,
+        choices: list[tuple[str, list[str]]],
+        entries: Sequence[dict],
+    ) -> None:
+        super().__init__("磁铁成组", "整批校验后一起下发", with_steps=False)
+        self.page = page
+        self.choices = choices
+        self._by_signal = {str(entry.get("signal") or ""): entry for entry in entries}
+        self._in_flight = False
+
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 1, 0, 1)
+        row_layout.setSpacing(ROW_SPACING)
+
+        row_layout.addWidget(QLabel("组"))
+        self.group_combo = QComboBox()
+        for label, signals in choices:
+            self.group_combo.addItem(label, list(signals))
+        self.group_combo.setToolTip("成组下发的成员（联动组定义来自平台）")
+        row_layout.addWidget(self.group_combo, 1)
+
+        self.current_spin = QDoubleSpinBox()
+        self.current_spin.setDecimals(2)
+        self.current_spin.setRange(-1e9, 1e9)
+        self.current_spin.setFixedWidth(SPIN_WIDTH + 14)
+        self.current_spin.setToolTip("这一组磁铁要下发的电流（A）")
+        row_layout.addWidget(self.current_spin)
+
+        self.rate_check = QCheckBox("速率")
+        self.rate_check.setToolTip("勾选则先下发各台的 CurrentRateSet，再下发电流")
+        self.rate_check.toggled.connect(self._on_rate_toggled)
+        row_layout.addWidget(self.rate_check)
+        self.rate_spin = QDoubleSpinBox()
+        self.rate_spin.setDecimals(2)
+        self.rate_spin.setRange(0.0, 1e6)
+        self.rate_spin.setFixedWidth(SPIN_WIDTH)
+        self.rate_spin.setEnabled(False)
+        row_layout.addWidget(self.rate_spin)
+
+        self.send_button = QPushButton("成组下发", objectName="setButton")
+        self.send_button.setToolTip("由执行服务整批校验后一起下发；失败会逐路报出")
+        self.send_button.clicked.connect(self._submit)
+        row_layout.addWidget(self.send_button)
+        row_layout.addStretch()
+        self.body.addWidget(row)
+
+        self.result_label = QLabel("尚未下发。整批校验不通过时一次都不会写设备。")
+        self.result_label.setObjectName("mutedText")
+        self.result_label.setWordWrap(True)
+        self.body.addWidget(self.result_label)
+
+    def _on_rate_toggled(self, checked: bool) -> None:
+        self.rate_spin.setEnabled(checked)
+
+    def _set_result(self, text: str, state: str) -> None:
+        self.result_label.setText(text)
+        self.result_label.setProperty("state", state)
+        self.result_label.style().unpolish(self.result_label)
+        self.result_label.style().polish(self.result_label)
+
+    def _submit(self) -> None:
+        if self._in_flight:
+            return
+        signals = list(self.group_combo.currentData() or [])
+        if not signals:
+            return
+        current = float(self.current_spin.value())
+        writes: list[dict] = []
+        if self.rate_check.isChecked():
+            # 先速率后电流：与成组回落的顺序一致，避免"电流已经在退、设备还按旧速率走"
+            rate = float(self.rate_spin.value())
+            for signal in signals:
+                rate_signal = str(self._by_signal.get(signal, {}).get("rate_signal") or "")
+                if rate_signal:
+                    writes.append({"signal": rate_signal, "value": rate, "ramp": True})
+        writes.extend(
+            {"signal": signal, "value": current, "ramp": True} for signal in signals
+        )
+        thread = instrument_api.request_batch_write(
+            writes, note=f"{self.group_combo.currentText()} → {current:g} A"
+        )
+        if thread is None:
+            self._set_result("上一次写入还没结束，请稍候再试。", "warn")
+            return
+        self._in_flight = True
+        self.send_button.setEnabled(False)
+        self._set_result("正在整批校验并下发…", "warn")
+        thread.completed.connect(self._on_done)
+
+    def _on_done(self, payload: dict) -> None:
+        self._in_flight = False
+        self.send_button.setEnabled(True)
+        if not payload.get("ok"):
+            # 传输层失败：原因照实说，绝不显示成成功
+            reason = payload.get("message") or "服务未说明原因"
+            self._set_result(f"成组下发未执行：{reason}", "error")
+            return
+        result = payload.get("payload") or {}
+        detail = result.get("message") or ""
+        if result.get("ok"):
+            self._set_result(detail or "成组下发完成", "good")
+            return
+        # 部分成功/整批未写：逐路列出谁没成，别让操作员猜
+        failed = [
+            f"{item.get('signal')}（{item.get('reason') or '未说明'}）"
+            for item in (result.get("results") or [])
+            if not item.get("accepted")
+        ]
+        if failed:
+            detail = f"{detail}｜未成功：{'、'.join(failed)}"
+        self._set_result(detail or "成组下发失败", "error")
+
+
 class _DeviceRow(QWidget):
     """一行一个设备：名称 ｜ 设定槽 ｜ 回读 ｜ 输出。"""
 
@@ -1057,7 +1202,9 @@ class _DeviceRow(QWidget):
         self._sync_switches(readings)
         self._sync_modes(readings)
         self._refresh_readback(readings, connected)
-        self.set_controls_enabled(connected)
+        # 全局只读部署模式下写入控件始终禁用：每轮刷新都会按连接状态启用控件，
+        # 这里必须一起判断，否则只读模式会被下一帧快照"解锁"。
+        self.set_controls_enabled(connected and not instrument_api.is_read_only())
 
     def _sync_switches(self, readings: dict[str, dict]) -> None:
         """开关 toggle 的选中态跟随实际回读——否则会误发一次反向动作。"""
@@ -1649,13 +1796,32 @@ class ManualControlPage(QWidget):
         self._build_rows()
         self._mapping_loaded = True
         writable = sum(1 for e in self._entries if e.get("writable"))
-        self.topbar.set_message(
-            f"{len(self._entries)} 路受控信号折成 {len(self._rows)} 个设备"
-            f"（可写 {writable} 路）。",
-            "good",
-        )
-        self.all_off_button.setEnabled(writable > 0)
+        if instrument_api.is_read_only():
+            # 只读部署：既不给写按钮，也不说"可写 N 路"（那是误导）
+            self.topbar.set_message(
+                f"{len(self._entries)} 路受控信号折成 {len(self._rows)} 个设备；"
+                "**全局只读模式**：执行服务按部署参数禁用了所有写入，本页只能监视。",
+                "warn",
+            )
+            self.topbar.all_off_button.setEnabled(False)
+            self._lock_read_only_controls()
+        else:
+            self.topbar.set_message(
+                f"{len(self._entries)} 路受控信号折成 {len(self._rows)} 个设备"
+                f"（可写 {writable} 路）。",
+                "good",
+            )
+            self.all_off_button.setEnabled(writable > 0)
         self._poll()
+
+    def _lock_read_only_controls(self) -> None:
+        """把本页所有会写设备的控件压住，并在成组卡片上说明原因。"""
+        for row in self._rows:
+            row.set_controls_enabled(False)
+        panel = self.magnet_group_panel
+        if panel is not None:
+            panel.send_button.setEnabled(False)
+            panel._set_result("全局只读模式：执行服务禁用了所有写入，不提供成组下发。", "warn")
 
     def _build_rows(self) -> None:
         self._clear_body()
@@ -1675,6 +1841,47 @@ class ManualControlPage(QWidget):
             if all(signal in consumed for signal in (s for spec in specs for s in spec.signals())):
                 continue  # 整组都在顶栏大字里了，不再占画布
             self._add_panel(name, specs, assignment.get(name, _DEFAULT_COLUMN))
+        self._add_magnet_group_panel(built, assignment)
+
+    def _add_magnet_group_panel(
+        self, built: Sequence[tuple[str, Sequence[DeviceSpec]]], assignment: dict[str, int]
+    ) -> None:
+        """成组设定卡片：只在映射里真的有这些磁铁设定信号时才建。
+
+        放在磁铁组所在的那一列，跟设备卡片一样可拖拽、可折叠。
+        """
+        available = {str(entry.get("signal") or "") for entry in self._entries}
+        choices = [
+            (label, signals)
+            for label, signals in _magnet_group_choices()
+            if all(signal in available for signal in signals)
+        ]
+        if not choices:
+            self.magnet_group_panel = None
+            return
+        panel = _MagnetGroupPanel(self, choices, self._entries)
+        self.magnet_group_panel = panel
+        self._place_panel(
+            panel,
+            key="__magnet_group__",
+            column=self._magnet_group_column(assignment),
+            height=MAGNET_GROUP_PANEL_HEIGHT,
+        )
+
+    def _magnet_group_column(self, assignment: dict[str, int]) -> int:
+        """成组卡片放在磁铁组那一列（找不到就放默认列）。"""
+        magnet_signals = {
+            signal
+            for _label, signals in _magnet_group_choices()
+            for signal in signals
+        }
+        for entry in self._entries:
+            if str(entry.get("signal") or "") not in magnet_signals:
+                continue
+            group = str(entry.get("group") or "")
+            if group in assignment:
+                return assignment[group]
+        return _DEFAULT_COLUMN
 
     def _add_trend_card(self, column: int = 1) -> None:
         """束流电流趋势卡片：放在**中列**最上面，可折叠/拖拽/缩放。

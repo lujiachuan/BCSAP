@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from apps.desktop_client import instrument_api
 from apps.desktop_client.initialization import (
     CACHE_SETTINGS_KEY,
     CacheUnavailable,
@@ -54,8 +55,61 @@ DEFAULT_SERVICE_URLS = {
 # 设备访问统一走真实 EPICS Channel Access，没有模式开关；无 IOC 时健康检查会如实报未连接。
 # 表格列：设备参数 / 业务信号 / PV 名称 / 单位 / 可写 / 必需
 PV_COLUMNS = ("设备参数", "业务信号", "PV 名称", "单位", "可写", "必需")
+# 业务信号列：行的身份，也是「未显示的安全字段」的载体（保存时按行合并回去）
+PV_SIGNAL_COLUMN = 1
+
+# 角色只作只读提示用；控件生成仍在手动页里按 role 决定
+_ROLE_LABELS = {
+    "setpoint": "设定值",
+    "toggle": "开关",
+    "pulse": "脉冲",
+    "readback": "只读测量",
+}
 
 LOG_LEVELS = (("调试", "debug"), ("信息", "info"), ("警告", "warning"), ("错误", "error"))
+
+
+def _value_text(value: object) -> str:
+    """安全参数的显示文本；None 表示该项不校验，用「—」而不是 0。"""
+    if value is None or value == "":
+        return "—"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _entry_detail(entry: dict | None) -> str:
+    """把表格里不显示的安全字段整理成一行只读说明（挂在业务信号单元格的提示里）。
+
+    这六个字段由执行服务强制执行，界面上不开放编辑；这里至少让操作员看得见
+    「这条映射到底有没有边界、配对和稳定判据」。
+    """
+    if not entry:
+        return "新行：未设置设备参数（分组/角色/回读配对/边界/限速/稳定判据），保存后按默认值生效。"
+    role = str(entry.get("role") or "")
+    low, high = entry.get("min_value"), entry.get("max_value")
+    unit = str(entry.get("unit") or "")
+    if low is None and high is None:
+        bounds = "—"
+    else:
+        bounds = f"{_value_text(low)} ~ {_value_text(high)}" + (f" {unit}" if unit else "")
+    tol, timeout = entry.get("settle_tol"), entry.get("settle_timeout")
+    if tol is None and timeout is None:
+        settle = "—"
+    else:
+        settle = f"{_value_text(tol)} / {_value_text(timeout)} s"
+    return " · ".join(
+        (
+            f"分组：{entry.get('group') or '（未分组）'}",
+            f"角色：{_ROLE_LABELS.get(role, role or '未归类')}",
+            f"回读配对：{entry.get('readback_signal') or '—'}",
+            f"边界：{bounds}",
+            f"单步上限：{_value_text(entry.get('max_step'))}",
+            f"速率上限：{_value_text(entry.get('max_rate'))}",
+            f"稳定判据：{settle}",
+            "（以上字段保存时原样保留）",
+        )
+    )
 
 
 def _valid_service_url(value: str) -> bool:
@@ -248,10 +302,7 @@ class SystemSettingsPage(QWidget):
 
     def _build_cache_panel(self) -> Panel:
         """本地数据目录：中央数据镜像到哪，默认值直接写在界面上。"""
-        panel = Panel(
-            "本地数据目录",
-            "数据服务里的实验记录与谱图会增量下载到这里（本机只读镜像，可随时重建）",
-        )
+        panel = Panel("本地数据目录", "中央数据的本地只读镜像，可随时重建")
         self.cache_root = QLineEdit()
         self.cache_root.setToolTip("填绝对路径；换目录后下次同步会重新下载到新目录")
         default = default_cache_root()
@@ -415,6 +466,8 @@ class SystemSettingsPage(QWidget):
             "都会按新映射执行；「可写」决定允许下发设定值，「必需」决定该 PV 掉线时"
             "是否判定设备不可用。写入仍受参数边界与设备联锁约束。"
             "本机没有 IOC 时可先启动仓库里 sim/ 的模拟 IOC 联调。"
+            "\n表格只列常用的 6 个字段；分组、角色、回读配对、边界、最大单步、最大速率"
+            "和稳定判据由执行服务持有，保存时按行原样保留（悬停「业务信号」可查看）。"
         )
         note.setWordWrap(True)
         panel.body.addWidget(note)
@@ -449,7 +502,8 @@ class SystemSettingsPage(QWidget):
         self._pv_request.start()
 
     def _release_pv_request(self) -> None:
-        self.pv_save_button.setEnabled(True)
+        # 只读部署下不给"保存映射"：服务端 PUT 会 400，按钮不该看起来能按
+        self.pv_save_button.setEnabled(not instrument_api.is_read_only())
         if self._pv_request is not None:
             self._pv_request.deleteLater()
             self._pv_request = None
@@ -477,15 +531,37 @@ class SystemSettingsPage(QWidget):
         self.pv_table.setRowCount(len(entries))
         for row, entry in enumerate(entries):
             self._set_pv_text(row, 0, entry.get("label", ""))
-            self._set_pv_text(row, 1, entry.get("signal", ""))
+            self._set_pv_text(row, PV_SIGNAL_COLUMN, entry.get("signal", ""))
             self._set_pv_text(row, 2, entry.get("pv", ""))
             self._set_pv_text(row, 3, entry.get("unit", ""))
             self._set_pv_flag(row, 4, bool(entry.get("writable", True)))
             self._set_pv_flag(row, 5, bool(entry.get("required", True)))
+            self._remember_pv_entry(row, entry)
         for row in range(self.pv_table.rowCount()):
             self._clear_pv_row_marks(row)
         self._set_pv_feedback("good", f"已载入 {len(entries)} 条映射。")
-        self.pv_save_button.setEnabled(True)
+        self.pv_save_button.setEnabled(not instrument_api.is_read_only())
+
+    # ---- PV 映射：未显示的安全字段 ----
+
+    def _remember_pv_entry(self, row: int, entry: dict | None) -> None:
+        """把服务端返回的**完整**条目挂到该行的业务信号单元格上。
+
+        表格只显示 6 个常用字段，其余安全字段（分组/角色/回读配对/边界/最大单步/
+        最大速率/稳定判据）靠这份原始条目在保存时合并回去。
+        """
+        item = self.pv_table.item(row, PV_SIGNAL_COLUMN)
+        if item is None:
+            return
+        item.setData(Qt.ItemDataRole.UserRole, dict(entry) if entry else None)
+        item.setToolTip(_entry_detail(entry))
+
+    def _pv_row_entry(self, row: int) -> dict | None:
+        item = self.pv_table.item(row, PV_SIGNAL_COLUMN)
+        if item is None:
+            return None
+        stored = item.data(Qt.ItemDataRole.UserRole)
+        return dict(stored) if isinstance(stored, dict) else None
 
     # ---- PV 映射：表格增删改 ----
 
@@ -493,13 +569,14 @@ class SystemSettingsPage(QWidget):
         row = self.pv_table.rowCount()
         self.pv_table.insertRow(row)
         self._set_pv_text(row, 0, "新参数")
-        self._set_pv_text(row, 1, "")
+        self._set_pv_text(row, PV_SIGNAL_COLUMN, "")
         self._set_pv_text(row, 2, "")
         self._set_pv_text(row, 3, "")
         self._set_pv_flag(row, 4, True)
         self._set_pv_flag(row, 5, True)
-        self.pv_table.setCurrentCell(row, 1)
-        self.pv_table.editItem(self.pv_table.item(row, 1))
+        self._remember_pv_entry(row, None)
+        self.pv_table.setCurrentCell(row, PV_SIGNAL_COLUMN)
+        self.pv_table.editItem(self.pv_table.item(row, PV_SIGNAL_COLUMN))
 
     def _remove_pv_rows(self) -> None:
         rows = sorted({index.row() for index in self.pv_table.selectedIndexes()})
@@ -511,24 +588,47 @@ class SystemSettingsPage(QWidget):
         self._set_pv_feedback("idle", f"已删除 {len(rows)} 行，点击“保存映射”生效。")
 
     def _save_pv_mapping(self) -> None:
+        if instrument_api.is_read_only():
+            # 只读部署下执行服务会 400（映射决定写入边界，改它等于改安全配置）
+            self._set_pv_feedback(
+                "warn", "全局只读模式：执行服务禁用了所有写入，PV 映射不可保存。"
+            )
+            return
         self._clear_all_pv_marks()
         payload = self._collect_pv_mapping()
         self._set_pv_feedback("idle", "正在保存…")
         self._start_pv_request(payload=payload)
 
     def _collect_pv_mapping(self) -> dict:
+        """写回配置：表格里显示的 6 个字段来自表格，其余安全字段按行原样保留。
+
+        只按表格重建条目会静默丢掉 group / role / readback_signal / min_value /
+        max_value / max_step / max_rate / settle_tol / settle_timeout——这些字段在
+        契约里都有默认值，Pydantic 不会报错，于是"保存一次"就等于把写入边界、
+        单步/速率保护和稳定判据全部清空（分组与角色丢失还会让手动页控件退化、
+        调束因缺 max_step 拒绝启动）。回归测试见
+        ``tests/test_settings_page.py::PvMappingSafetyFieldTests``。
+        """
         entries = []
         for row in range(self.pv_table.rowCount()):
-            entries.append(
+            original = self._pv_row_entry(row) or {}
+            signal = self._pv_text(row, PV_SIGNAL_COLUMN)
+            entry = dict(original)
+            if original and signal != str(original.get("signal") or ""):
+                # 业务信号就是这一行的身份：改了名字还沿用旧的回读配对会指向别的
+                # 设备通道，必须清空；边界/限速/稳定判据属于同类通道，继续沿用。
+                entry["readback_signal"] = ""
+            entry.update(
                 {
                     "label": self._pv_text(row, 0),
-                    "signal": self._pv_text(row, 1),
+                    "signal": signal,
                     "pv": self._pv_text(row, 2),
                     "unit": self._pv_text(row, 3),
                     "writable": self._pv_flag(row, 4),
                     "required": self._pv_flag(row, 5),
                 }
             )
+            entries.append(entry)
         return {
             "version": self._pv_config_version,
             "entries": entries,
@@ -541,7 +641,16 @@ class SystemSettingsPage(QWidget):
         return item.text().strip() if item is not None else ""
 
     def _set_pv_text(self, row: int, column: int, value: str) -> None:
-        self.pv_table.setItem(row, column, QTableWidgetItem(value))
+        item = QTableWidgetItem(value)
+        # 业务信号列上挂着「未显示的安全字段」原始条目：程序化改写单元格时不能
+        # 顺手把它丢掉（渲染时紧接着的 _remember_pv_entry 会覆盖成新值）。
+        if column == PV_SIGNAL_COLUMN:
+            previous = self.pv_table.item(row, column)
+            if previous is not None:
+                item.setData(
+                    Qt.ItemDataRole.UserRole, previous.data(Qt.ItemDataRole.UserRole)
+                )
+        self.pv_table.setItem(row, column, item)
 
     def _pv_flag(self, row: int, column: int) -> bool:
         item = self.pv_table.item(row, column)
@@ -586,6 +695,10 @@ class SystemSettingsPage(QWidget):
             if item is not None:
                 item.setBackground(Qt.GlobalColor.transparent)
                 item.setToolTip("")
+        # 业务信号列的提示是「未显示的安全字段」的只读出口，清标红时不能一起抹掉
+        item = self.pv_table.item(row, PV_SIGNAL_COLUMN)
+        if item is not None:
+            item.setToolTip(_entry_detail(self._pv_row_entry(row)))
 
     def _set_pv_feedback(self, state: str, message: str) -> None:
         self.pv_feedback.setText(message)

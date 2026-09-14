@@ -172,6 +172,27 @@ class SpectrumPlot(QWidget):
             self.view.enableAutoRange()
             self.view.autoRange(padding=0.06)
 
+    def mark_best(self, x: float, y: float, text: str = "") -> None:
+        """标出曲线上的一个点（调束响应曲线的"最优采样"）。
+
+        和 ``annotate_peaks`` 的分工：那个找**局部峰值**，判断依据是"比左右都高"，
+        而响应曲线的采样点按参数值排序、点数不多，全局最高点通常不构成局部峰。
+        这里直接标调用方指定的点，不在显示层替调用方判断"哪个点最好"。
+        """
+        self._clear_peak_labels()
+        tokens = current_palette()
+        self._peaks.setData(
+            x=[float(x)],
+            y=[float(y)],
+            brush=pg.mkBrush(tokens["plotBest"]),
+            pen=pg.mkPen(tokens["surfacePanel"]),
+        )
+        if text:
+            label = pg.TextItem(text, color=tokens["textBase"], anchor=(0.5, 1.5))
+            label.setPos(float(x), float(y))
+            self.view.addItem(label)
+            self._labels.append(label)
+
     def annotate_peaks(self, maximum: int = 4) -> None:
         """标记最显著的局部峰值，数量受限以避免标签遮挡。"""
         self._clear_peak_labels()
