@@ -45,18 +45,20 @@ def entry(
     return PvMappingEntry(
         signal=signal, label=signal, pv=pv, unit=unit, writable=writable,
         required=False, group=group, role=role, readback_signal=readback_signal,
+        scan_axis=(writable and role == "setpoint" and signal.endswith(".current_setpoint")),
+        scan_detector=(not writable and signal.endswith(".beam_current")),
         **safety,  # type: ignore[arg-type]
     )
 
 
-def build_config(*, coupled: bool = True, max_current: float = 600.0) -> PvMappingConfig:
-    """一路磁铁设定 + 回读 + 探测器。coupled=False 时回读不跟随设定。"""
+def build_config(*, max_current: float = 600.0) -> PvMappingConfig:
+    """一路磁铁设定 + 回读 + 探测器。"""
     return PvMappingConfig(
         version=1,
         entries=[
             entry(
                 "magnet.m1.current_setpoint", "BD:DipoleMagnet:01:CurrentSet", "A",
-                readback_signal="magnet.m1.current_readback" if coupled else "",
+                readback_signal="magnet.m1.current_readback",
                 min_value=0.0, max_value=max_current, max_step=100.0,
                 settle_tol=0.5, settle_timeout=1.0,
             ),
@@ -261,7 +263,8 @@ class ScanServiceTests(unittest.TestCase):
 
     def test_unsettled_readback_fails_when_configured_to_fail(self) -> None:
         """回读不跟随设定 → 永远不稳定；on_unsettled=fail 必须判失败。"""
-        service, _ = self.build(build_config(coupled=False))
+        service, signals = self.build(build_config())
+        signals._gateway._coupling = {}
 
         status = self.wait(
             service,
@@ -273,7 +276,8 @@ class ScanServiceTests(unittest.TestCase):
 
     def test_unsettled_readback_is_recorded_and_flagged_when_configured(self) -> None:
         """on_unsettled=record：点要记下来，但 quality 必须如实标注。"""
-        service, _ = self.build(build_config(coupled=False))
+        service, signals = self.build(build_config())
+        signals._gateway._coupling = {}
 
         status = self.wait(
             service,
@@ -772,6 +776,29 @@ class ScanServiceTests(unittest.TestCase):
         if status.state == "aborted":
             self.assertLess(status.completed_points, status.total_points)
 
+    def test_safe_stop_uses_the_same_retract_policy_as_completion(self) -> None:
+        service, signals = self.build(build_group_config())
+        started = service.start(
+            self.group_request(
+                start=100.0,
+                stop=500.0,
+                step=1.0,
+                dwell_s=0.01,
+                retract=RetractSpec(current_a=0.0, rate_a_s=2.0),
+            )
+        )
+
+        service.stop(started.run_id)
+        status = self.wait(service, started.run_id)
+
+        self.assertEqual(status.state, "aborted")
+        self.assertIn("安全停止", status.message)
+        for n in MAGNETS:
+            self.assertEqual(
+                signals._gateway.read(f"magnet.m{n}.current_readback").value,
+                0.0,
+            )
+
     def test_stopping_a_finished_run_is_a_noop(self) -> None:
         service, _ = self.build()
         finished = self.wait(service, service.start(self.request()).run_id)
@@ -828,6 +855,31 @@ class ScanServiceTests(unittest.TestCase):
 
         with self.assertRaises(ScanError):
             service.start(self.request(axis=axis(["detector.fc1.beam_current"])))
+
+    def test_writable_signal_without_scan_capability_is_rejected(self) -> None:
+        config = build_config()
+        config.entries[0] = config.entries[0].model_copy(update={"scan_axis": False})
+        service, _ = self.build(config)
+
+        with self.assertRaises(ScanError) as caught:
+            service.start(self.request())
+
+        self.assertIn("未允许", str(caught.exception))
+
+    def test_detector_without_scan_capability_is_rejected(self) -> None:
+        config = build_config()
+        config.entries[-1] = config.entries[-1].model_copy(update={"scan_detector": False})
+        service, _ = self.build(config)
+
+        with self.assertRaises(ScanError) as caught:
+            service.start(self.request())
+
+        self.assertIn("扫描探测器", str(caught.exception))
+
+    def test_non_divisible_step_still_includes_requested_stop(self) -> None:
+        targets = self.request(start=0.0, stop=1.0, step=0.6).targets()
+
+        self.assertEqual(targets, [0.0, 0.6, 1.0])
 
     def test_step_direction_mismatch_is_rejected(self) -> None:
         service, _ = self.build()

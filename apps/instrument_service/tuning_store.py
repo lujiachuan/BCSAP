@@ -245,6 +245,16 @@ class TuningStore:
                 "SELECT * FROM tuning_runs WHERE run_id = ?", (run_id,)
             ).fetchone()
 
+    def incomplete_runs(self) -> list[sqlite3.Row]:
+        """返回上次进程未正常收尾的任务，供启动恢复屏障使用。"""
+        with self._session() as connection:
+            return list(
+                connection.execute(
+                    "SELECT * FROM tuning_runs "
+                    "WHERE state NOT IN ('completed', 'aborted', 'failed')"
+                )
+            )
+
     def db_path(self) -> Path:
         return self._db_path
 

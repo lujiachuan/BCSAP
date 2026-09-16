@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from packages.contracts import (
     PvMappingEntry,
     PvMappingIssue,
 )
+from packages.contracts.pv_mapping import SIGNAL_ROLES
 
 from . import device_profiles
 
@@ -168,11 +170,60 @@ def load_config() -> PvMappingConfig:
     return config
 
 
+class PvMappingLoadError(RuntimeError):
+    """现场映射存在但不可用；运行时必须进入只读保护，不能静默换默认 PV。"""
+
+
+def load_config_checked() -> PvMappingConfig:
+    """生产运行时使用的失效关闭加载器；仅首次安装时允许使用默认映射。"""
+    path = config_path()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        config = PvMappingConfig.model_validate(raw)
+    except FileNotFoundError:
+        return default_config()
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise PvMappingLoadError(f"PV 映射读取失败：{path}（{exc}）") from exc
+    # 新增能力字段对老现场文件做一次内存迁移：只按同名内置设备补缺失键，
+    # 已经显式写过 true/false 的现场选择绝不覆盖。
+    defaults = {entry.signal: entry for entry in default_config().entries}
+    raw_entries = {
+        str(item.get("signal") or ""): item
+        for item in raw.get("entries", [])
+        if isinstance(item, dict)
+    }
+    migrated = []
+    for entry in config.entries:
+        source = raw_entries.get(entry.signal, {})
+        fallback = defaults.get(entry.signal)
+        updates = {}
+        if fallback is not None:
+            for field in ("scan_axis", "scan_detector", "safe_value"):
+                if field not in source:
+                    updates[field] = getattr(fallback, field)
+        migrated.append(entry.model_copy(update=updates) if updates else entry)
+    config = config.model_copy(update={"entries": migrated})
+    issues = validate_config(config)
+    if issues:
+        detail = "；".join(issue.message for issue in issues[:3])
+        raise PvMappingLoadError(f"PV 映射校验失败：{path}（{detail}）")
+    return config
+
+
 def save_config(config: PvMappingConfig) -> Path:
     """原子写盘：先写同目录临时文件再替换，避免中途失败留下半截配置。"""
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(config.model_dump(), ensure_ascii=False, indent=2) + "\n"
+    if path.exists():
+        try:
+            previous = PvMappingConfig.model_validate(
+                json.loads(path.read_text(encoding="utf-8"))
+            )
+        except (OSError, json.JSONDecodeError, ValueError):
+            previous = None
+        if previous is not None and not validate_config(previous):
+            shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
     handle, temp_name = tempfile.mkstemp(
         dir=str(path.parent), prefix=".pv_mapping-", suffix=".tmp"
     )
@@ -251,6 +302,127 @@ def validate_config(config: PvMappingConfig) -> list[PvMappingIssue]:
         if not entry.label.strip():
             issues.append(
                 PvMappingIssue(index=index, field="label", message="设备参数名不能为空")
+            )
+
+        if entry.role not in ("", *SIGNAL_ROLES):
+            issues.append(
+                PvMappingIssue(
+                    index=index,
+                    field="role",
+                    message=f"未知信号角色：{entry.role}",
+                )
+            )
+        if entry.display_order < 0:
+            issues.append(
+                PvMappingIssue(
+                    index=index,
+                    field="display_order",
+                    message="显示顺序不能为负数",
+                )
+            )
+        if (
+            entry.scan_axis
+            or entry.scan_detector
+            or entry.tunable
+            or entry.beam_target
+        ) and not entry.group:
+            issues.append(
+                PvMappingIssue(
+                    index=index,
+                    field="group",
+                    message="扫谱/调束能力必须配置设备分组",
+                )
+            )
+        if entry.safe_value is not None:
+            if entry.min_value is not None and entry.safe_value < entry.min_value:
+                issues.append(
+                    PvMappingIssue(index=index, field="safe_value", message="安全值低于下限")
+                )
+            if entry.max_value is not None and entry.safe_value > entry.max_value:
+                issues.append(
+                    PvMappingIssue(index=index, field="safe_value", message="安全值超过上限")
+                )
+        if entry.scan_axis:
+            if not entry.writable or entry.role != "setpoint":
+                issues.append(
+                    PvMappingIssue(
+                        index=index,
+                        field="scan_axis",
+                        message="扫描轴必须是可写 setpoint",
+                    )
+                )
+            if not entry.readback_signal or entry.settle_tol is None:
+                issues.append(
+                    PvMappingIssue(
+                        index=index,
+                        field="scan_axis",
+                        message="扫描轴必须配置回读信号和稳定容差",
+                    )
+                )
+            if entry.max_step is None or entry.max_step <= 0:
+                issues.append(
+                    PvMappingIssue(
+                        index=index,
+                        field="scan_axis",
+                        message="扫描轴必须配置正数最大单步",
+                    )
+                )
+        if entry.scan_detector and (entry.writable or entry.role != "readback"):
+            issues.append(
+                PvMappingIssue(
+                    index=index,
+                    field="scan_detector",
+                    message="扫描探测器必须是只读 readback",
+                )
+            )
+        if entry.tunable and (not entry.writable or entry.role != "setpoint"):
+            issues.append(
+                PvMappingIssue(
+                    index=index,
+                    field="tunable",
+                    message="调束变量必须是可写 setpoint",
+                )
+            )
+        if entry.tunable and (entry.max_step is None or entry.max_step <= 0):
+            issues.append(
+                PvMappingIssue(
+                    index=index,
+                    field="tunable",
+                    message="调束变量必须配置正数最大单步",
+                )
+            )
+        if entry.tunable and entry.signal.endswith(".current_rate_setpoint"):
+            issues.append(
+                PvMappingIssue(
+                    index=index,
+                    field="tunable",
+                    message="变化速率属于保护参数，不能作为调束变量",
+                )
+            )
+        if entry.beam_target and (entry.writable or entry.role != "readback"):
+            issues.append(
+                PvMappingIssue(
+                    index=index,
+                    field="beam_target",
+                    message="调束目标必须是只读 readback",
+                )
+            )
+
+        if entry.readback_signal and entry.readback_signal not in by_signal:
+            issues.append(
+                PvMappingIssue(
+                    index=index,
+                    field="readback_signal",
+                    message=f"回读信号不在映射里：{entry.readback_signal}",
+                )
+            )
+        elif entry.readback_signal and by_signal[entry.readback_signal].writable:
+            issues.append(
+                PvMappingIssue(
+                    index=index,
+                    field="readback_signal",
+                    message="回读信号必须是只读测量，不能指向可写设定值",
+                )
             )
 
         # 变化速率配对：配了就必须指向本配置里存在且可写的信号。写错了不会报错，

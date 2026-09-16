@@ -14,6 +14,8 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -80,7 +82,7 @@ PV_PROBE_TIMEOUT_S = 30.0
 PV_SHRINK_MIN_ENTRIES = 10
 PV_SHRINK_RATIO = 0.5
 
-# 角色只作只读提示用；控件生成仍在手动页里按 role 决定
+# 角色参与服务端能力校验，手动页仍按 role 选择控件类型。
 _ROLE_LABELS = {
     "setpoint": "设定值",
     "toggle": "开关",
@@ -123,15 +125,105 @@ def _entry_detail(entry: dict | None) -> str:
     return " · ".join(
         (
             f"分组：{entry.get('group') or '（未分组）'}",
+            f"设备：{entry.get('device_label') or entry.get('device_id') or '按信号名归并'}",
             f"角色：{_ROLE_LABELS.get(role, role or '未归类')}",
             f"回读配对：{entry.get('readback_signal') or '—'}",
             f"边界：{bounds}",
             f"单步上限：{_value_text(entry.get('max_step'))}",
             f"速率上限：{_value_text(entry.get('max_rate'))}",
             f"稳定判据：{settle}",
-            "（以上字段保存时原样保留）",
+            f"安全值：{_value_text(entry.get('safe_value'))}",
+            "能力：" + ("、".join(
+                label
+                for key, label in (
+                    ("tunable", "调束变量"),
+                    ("beam_target", "调束目标"),
+                    ("scan_axis", "扫谱轴"),
+                    ("scan_detector", "扫谱探测器"),
+                )
+                if entry.get(key)
+            ) or "—"),
+            (
+                f"显示：{'是' if entry.get('visible', True) else '否'} / "
+                f"顺序 {entry.get('display_order', 0)}"
+            ),
         )
     )
+
+
+class _DevicePropertiesDialog(QDialog):
+    """编辑映射的设备语义；现有控件类型无需再修改手动页代码。"""
+
+    TEXT_FIELDS = (
+        ("group", "设备分组"),
+        ("device_id", "设备 ID（同一卡片填相同值）"),
+        ("device_label", "设备显示名"),
+        ("readback_signal", "回读信号"),
+        ("rate_signal", "速率信号"),
+    )
+    NUMBER_FIELDS = (
+        ("min_value", "最小值"), ("max_value", "最大值"),
+        ("max_step", "最大单步"), ("max_rate", "最大速率"),
+        ("settle_tol", "稳定容差"), ("settle_timeout", "稳定超时 s"),
+        ("safe_value", "安全值"), ("display_order", "显示顺序"),
+    )
+    FLAG_FIELDS = (
+        ("visible", "在手动页显示"), ("tunable", "允许作为调束变量"),
+        ("beam_target", "允许作为调束目标"), ("scan_axis", "允许作为扫谱轴"),
+        ("scan_detector", "允许作为扫谱探测器"),
+    )
+
+    def __init__(self, entry: dict, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("设备属性")
+        self._entry = dict(entry)
+        self._texts: dict[str, QLineEdit] = {}
+        self._numbers: dict[str, QLineEdit] = {}
+        self._flags: dict[str, QCheckBox] = {}
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        for key, label in self.TEXT_FIELDS:
+            edit = QLineEdit(str(entry.get(key) or ""))
+            self._texts[key] = edit
+            form.addRow(label, edit)
+        self.role = QComboBox()
+        self.role.addItem("未归类", "")
+        for key, label in _ROLE_LABELS.items():
+            self.role.addItem(label, key)
+        current_role = str(entry.get("role") or "")
+        self.role.setCurrentIndex(max(0, self.role.findData(current_role)))
+        form.addRow("控件类型", self.role)
+        for key, label in self.NUMBER_FIELDS:
+            edit = QLineEdit(_value_text(entry.get(key)).replace("—", ""))
+            edit.setPlaceholderText("留空表示不限制")
+            self._numbers[key] = edit
+            form.addRow(label, edit)
+        for key, label in self.FLAG_FIELDS:
+            check = QCheckBox(label)
+            check.setChecked(bool(entry.get(key, key == "visible")))
+            self._flags[key] = check
+            form.addRow("", check)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def entry(self) -> dict:
+        result = dict(self._entry)
+        result.update({key: edit.text().strip() for key, edit in self._texts.items()})
+        result["role"] = str(self.role.currentData())
+        for key, edit in self._numbers.items():
+            text = edit.text().strip()
+            if key == "display_order":
+                result[key] = int(text) if text else 0
+            else:
+                result[key] = float(text) if text else None
+        result.update({key: check.isChecked() for key, check in self._flags.items()})
+        return result
 
 
 def _valid_service_url(value: str) -> bool:
@@ -234,7 +326,9 @@ class SystemSettingsPage(QWidget):
         section_names = ("服务与连接", "PV 映射", "日志与权限", "外观")
         self.settings_selector = QComboBox(objectName="settingsSelector")
         self.settings_selector.addItems(section_names)
-        self.settings_selector.setVisible(False)
+        # 先按窄屏形态装配，避免侧栏的最小宽度在首次 show 前把窗口撑过 900 px；
+        # 第一次 resizeEvent 会按实际宽度切换成侧栏或顶部选择器。
+        self.settings_selector.setVisible(True)
         layout.addWidget(self.settings_selector)
 
         content = QWidget()
@@ -243,6 +337,7 @@ class SystemSettingsPage(QWidget):
         content_layout.setSpacing(14)
         self.settings_nav = QListWidget(objectName="settingsNavigation")
         self.settings_nav.setFixedWidth(180)
+        self.settings_nav.setVisible(False)
         for name in section_names:
             self.settings_nav.addItem(QListWidgetItem(name))
         self.settings_nav.setCurrentRow(0)
@@ -511,16 +606,20 @@ class SystemSettingsPage(QWidget):
         actions = QHBoxLayout()
         self.pv_feedback = QLabel("", objectName="mutedText")
         self.pv_feedback.setWordWrap(True)
-        actions.addWidget(self.pv_feedback, 1)
-        add_row = QPushButton("新增行")
+        panel.body.addWidget(self.pv_feedback)
+        actions.addStretch()
+        add_row = QPushButton("新增")
         add_row.clicked.connect(self._add_pv_row)
-        remove_row = QPushButton("删除选中行")
+        edit_properties = QPushButton("设备属性")
+        edit_properties.setToolTip("配置分组、控件类型、安全边界，以及扫谱/调束能力")
+        edit_properties.clicked.connect(self._edit_pv_properties)
+        remove_row = QPushButton("删除")
         remove_row.clicked.connect(self._remove_pv_rows)
-        reload_button = QPushButton("重新载入")
+        reload_button = QPushButton("重载")
         reload_button.clicked.connect(lambda: self._load_pv_mapping(force=True))
         self.pv_save_button = QPushButton("保存映射", objectName="primaryButton")
         self.pv_save_button.clicked.connect(self._save_pv_mapping)
-        for button in (add_row, remove_row, reload_button):
+        for button in (add_row, edit_properties, remove_row, reload_button):
             actions.addWidget(button)
         actions.addWidget(self.pv_save_button)
         panel.body.addLayout(actions)
@@ -532,8 +631,8 @@ class SystemSettingsPage(QWidget):
             "本机没有 IOC 时可先启动仓库里 sim/ 的模拟 IOC 联调。"
             "\n「连接 / 当前值」两列是点「测试连接并读取」后的现场快照（caget），"
             "只读、不参与保存；双击某一行可以只重读那一路。"
-            "\n其余安全字段（分组、角色、回读配对、边界、最大单步、最大速率、稳定判据）"
-            "由执行服务持有，保存时按行原样保留（悬停「业务信号」可查看）。"
+            "\n点「编辑设备属性」可以配置分组、控件类型、回读配对、安全边界，以及"
+            "扫谱/调束能力；悬停「业务信号」可快速查看。"
             "**某一路连不上不影响扫谱/调束入口**：各自只用得到自己那几路，缺哪一路"
             "由执行服务在启动时点名拒绝。"
         )
@@ -573,7 +672,9 @@ class SystemSettingsPage(QWidget):
 
     def _release_pv_request(self) -> None:
         # 只读部署下不给"保存映射"：服务端 PUT 会 400，按钮不该看起来能按
-        self.pv_save_button.setEnabled(not instrument_api.is_read_only())
+        self.pv_save_button.setEnabled(
+            not instrument_api.is_read_only() or instrument_api.can_repair_mapping()
+        )
         if self._pv_request is not None:
             self._pv_request.deleteLater()
             self._pv_request = None
@@ -598,6 +699,10 @@ class SystemSettingsPage(QWidget):
             # 映射刚改过：PV 名可能变了，原来的"已连接/当前值"对新名字不再成立，
             # 自动重测一次；失败也不影响保存结果（提示里会说）。
             self._pv_pending_reprobe = False
+            if instrument_api.can_repair_mapping():
+                # 服务端只有在修复配置并成功热更新后才会返回成功，此时解除客户端
+                # 的保守写保护；部署只读不会进入这条分支。
+                instrument_api.set_read_only(False)
             self._probe_pvs()
 
     def _render_pv_mapping(self, config: dict) -> None:
@@ -618,7 +723,9 @@ class SystemSettingsPage(QWidget):
             self._clear_pv_row_marks(row)
             self._reset_pv_probe_cells(row)
         self._set_pv_feedback("good", f"已载入 {len(entries)} 条映射。")
-        self.pv_save_button.setEnabled(not instrument_api.is_read_only())
+        self.pv_save_button.setEnabled(
+            not instrument_api.is_read_only() or instrument_api.can_repair_mapping()
+        )
         self._apply_pv_filter()
 
     # ---- PV 映射：查找 / 筛选 / 检测（caget）----
@@ -852,11 +959,44 @@ class SystemSettingsPage(QWidget):
         self._set_pv_text(row, 3, "")
         self._set_pv_flag(row, 4, True)
         self._set_pv_flag(row, 5, True)
-        self._remember_pv_entry(row, None)
+        self._remember_pv_entry(
+            row,
+            {
+                "group": "未分组",
+                "device_id": "",
+                "device_label": "",
+                "role": "setpoint",
+                "readback_signal": "",
+                "rate_signal": "",
+                "visible": True,
+                "display_order": row,
+                "safe_value": None,
+                "tunable": False,
+                "beam_target": False,
+                "scan_axis": False,
+                "scan_detector": False,
+            },
+        )
         self._reset_pv_probe_cells(row)
         self.pv_table.setCurrentCell(row, PV_SIGNAL_COLUMN)
         self.pv_table.editItem(self.pv_table.item(row, PV_SIGNAL_COLUMN))
         self._refresh_pv_summary()
+
+    def _edit_pv_properties(self) -> None:
+        row = self.pv_table.currentRow()
+        if row < 0:
+            self._set_pv_feedback("warn", "请先选择一行设备参数。")
+            return
+        dialog = _DevicePropertiesDialog(self._pv_row_entry(row) or {}, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            entry = dialog.entry()
+        except ValueError:
+            self._set_pv_feedback("error", "设备属性中的数值格式不正确。")
+            return
+        self._remember_pv_entry(row, entry)
+        self._set_pv_feedback("idle", "设备属性已更新，点击“保存映射”后生效。")
 
     def _remove_pv_rows(self) -> None:
         rows = sorted({index.row() for index in self.pv_table.selectedIndexes()})
@@ -885,7 +1025,7 @@ class SystemSettingsPage(QWidget):
         )
 
     def _save_pv_mapping(self) -> None:
-        if instrument_api.is_read_only():
+        if instrument_api.is_read_only() and not instrument_api.can_repair_mapping():
             # 只读部署下执行服务会 400（映射决定写入边界，改它等于改安全配置）
             self._set_pv_feedback(
                 "warn", "全局只读模式：执行服务禁用了所有写入，PV 映射不可保存。"

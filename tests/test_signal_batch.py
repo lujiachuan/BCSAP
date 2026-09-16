@@ -13,6 +13,7 @@ from pathlib import Path
 
 from apps.instrument_service.runtime import InstrumentRuntime
 from apps.instrument_service.scan_store import ScanStore
+from apps.instrument_service.tuning_store import TuningStore
 from packages.contracts import SignalWriteRequest
 
 MAGNETS = (1, 2, 3, 4)
@@ -81,6 +82,7 @@ class BatchWriteTests(unittest.TestCase):
             self.config,
             gateway_factory=create_simulated_gateway,
             store=ScanStore(Path(self._directory.name)),
+            tuning_store=TuningStore(Path(self._directory.name)),
         )
 
     def tearDown(self) -> None:
@@ -174,6 +176,53 @@ class BatchWriteTests(unittest.TestCase):
     def test_batch_releases_the_group_afterwards(self) -> None:
         self.runtime.write_batch(batch([100.0, 100.0, 100.0, 100.0]))
 
+        self.assertEqual(self.runtime.locks.held(), {})
+
+    def test_single_write_is_refused_while_task_holds_group(self) -> None:
+        self.runtime.locks.acquire({"磁铁电源"}, owner="scan-1")
+        before = self.readback(1)
+
+        result = self.runtime.write_signal(
+            SignalWriteRequest(signal=SETPOINTS[0], value=120.0)
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertIn("设备组不可用", result.reason or "")
+        self.assertEqual(self.readback(1), before)
+
+    def test_retry_of_completed_single_write_returns_cached_result_without_rewriting(self) -> None:
+        request = SignalWriteRequest(
+            signal=SETPOINTS[0],
+            value=120.0,
+            command_id="00000000-0000-4000-8000-000000000001",
+        )
+        first = self.runtime.write_signal(request)
+        self.runtime.locks.acquire({"磁铁电源"}, owner="scan-1")
+
+        repeated = self.runtime.write_signal(request)
+
+        self.assertTrue(first.accepted)
+        self.assertEqual(repeated, first)
+
+    def test_restart_recovery_blocks_group_until_acknowledged(self) -> None:
+        run_id = "interrupted-scan"
+        self.runtime.store.create_run(
+            run_id,
+            "磁铁扫描",
+            READBACKS[0],
+            {"setpoint_signals": [SETPOINTS[0]], "readback_signal": READBACKS[0]},
+            "2026-09-16T00:00:00+00:00",
+        )
+        self.runtime.store.set_state(run_id, "running")
+
+        self.runtime.recover_startup()
+        blocked = self.runtime.write_signal(
+            SignalWriteRequest(signal=SETPOINTS[0], value=120.0)
+        )
+
+        self.assertFalse(blocked.accepted)
+        self.assertEqual(len(self.runtime.startup_recoveries), 1)
+        self.runtime.acknowledge_startup_recovery(run_id, "现场已核对")
         self.assertEqual(self.runtime.locks.held(), {})
 
     # ---------------- 执行途中失败：逐路报清 ----------------

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+from datetime import UTC, datetime
 from threading import RLock
 from uuid import uuid4
 
@@ -11,6 +13,7 @@ from packages.contracts import (
     PvMappingConfig,
     SignalBatchWriteResponse,
     SignalWriteRequest,
+    SignalWriteResult,
 )
 
 from . import pv_mapping
@@ -62,10 +65,19 @@ class InstrumentRuntime:
         监视/分析的机器上，把整个执行服务设成只读比逐条把信号标成不可写可靠得多。
         """
         self._lock = RLock()
-        self._config = config if config is not None else pv_mapping.load_config()
-        self._read_only = (
+        self._config_error = ""
+        if config is not None:
+            self._config = config
+        else:
+            try:
+                self._config = pv_mapping.load_config_checked()
+            except pv_mapping.PvMappingLoadError as exc:
+                self._config = pv_mapping.default_config()
+                self._config_error = str(exc)
+        self._deployment_read_only = (
             read_only_from_env() if read_only is None else bool(read_only)
         )
+        self._read_only = bool(self._config_error) or self._deployment_read_only
         self._gateway_factory = gateway_factory
         self._gateway = None
         self._signals: SignalWriteService | None = None
@@ -77,6 +89,8 @@ class InstrumentRuntime:
         self._scan: ScanService | None = None
         self._tuning_store = tuning_store
         self._tuning: TuningService | None = None
+        self._recovery_checked = False
+        self._startup_recoveries: dict[str, dict] = {}
 
     @property
     def config(self) -> PvMappingConfig:
@@ -85,8 +99,167 @@ class InstrumentRuntime:
 
     @property
     def read_only(self) -> bool:
-        """全局只读部署模式是否启用。"""
+        """部署只读或配置损坏保护是否正在阻止设备写入。"""
         return self._read_only
+
+    @property
+    def deployment_read_only(self) -> bool:
+        return self._deployment_read_only
+
+    @property
+    def config_error(self) -> str:
+        return self._config_error
+
+    def write_signal(self, request: SignalWriteRequest) -> SignalWriteResult:
+        """单路手动写入也必须短暂占用设备组，不能穿透扫谱/调束锁。"""
+        entry = self.signals.entry(request.signal)
+        cached = self.signals.cached_write_result(request.command_id)
+        if cached is not None:
+            return cached
+        owner = f"manual-{uuid4()}"
+        try:
+            self._locks.acquire([entry.group or "__ungrouped__"], owner=owner)
+        except DeviceBusy as exc:
+            return SignalWriteResult(
+                signal=entry.signal,
+                pv=entry.pv,
+                unit=entry.unit,
+                accepted=False,
+                requested=request.value,
+                reason=str(exc),
+                command_id=request.command_id,
+                dry_run=request.dry_run,
+                finished_at=datetime.now(UTC).isoformat(),
+            )
+        try:
+            return self.signals.write(request)
+        finally:
+            self._locks.release(owner=owner)
+
+    def mapping_update_blocker(self) -> str | None:
+        held = self._locks.held()
+        with self._lock:
+            scan = self._scan
+            tuning = self._tuning
+        scan_id = scan.active_run_id() if scan is not None else None
+        tuning_id = tuning.active_run_id() if tuning is not None else None
+        if not held and scan_id is None and tuning_id is None:
+            return None
+        detail = "、".join(f"{group}（{owner}）" for group, owner in held.items())
+        tasks = "、".join(
+            text
+            for text in (
+                f"扫谱 {scan_id}" if scan_id else "",
+                f"调束 {tuning_id}" if tuning_id else "",
+            )
+            if text
+        )
+        reason = "；".join(part for part in (tasks, detail) if part)
+        return f"存在活动任务或待恢复设备组，暂不能修改映射：{reason}"
+
+    def acquire_mapping_update(self, config: PvMappingConfig) -> str:
+        """在保存到切换完成期间锁住全部旧/新设备组，封闭检查后的竞态窗口。"""
+        blocker = self.mapping_update_blocker()
+        if blocker:
+            raise DeviceBusy(blocker)
+        groups = {
+            entry.group or "__ungrouped__"
+            for entry in (*self.config.entries, *config.entries)
+        }
+        owner = f"mapping-{uuid4()}"
+        self._locks.acquire(groups, owner=owner)
+        return owner
+
+    def release_mapping_update(self, owner: str) -> None:
+        self._locks.release(owner=owner)
+
+    @property
+    def startup_recoveries(self) -> list[dict]:
+        with self._lock:
+            return [dict(item) for item in self._startup_recoveries.values()]
+
+    def recover_startup(self) -> None:
+        """把上次进程遗留的非终态任务转为恢复屏障并重新占用相关设备组。"""
+        with self._lock:
+            if self._recovery_checked:
+                return
+        by_signal = {entry.signal: entry for entry in self.config.entries}
+        candidates: list[tuple[str, object, list[str]]] = []
+        for row in self.store.incomplete_runs():
+            try:
+                axis = json.loads(row["axis_json"] or "{}")
+                signals = list(axis.get("setpoint_signals") or [])
+            except (AttributeError, TypeError, ValueError):
+                signals = []
+            candidates.append(("scan", row, signals))
+        for row in self.tuning_store.incomplete_runs():
+            try:
+                variables = json.loads(row["variables_json"] or "[]")
+                signals = [
+                    str(item.get("signal") or "")
+                    for item in variables
+                    if isinstance(item, dict)
+                ]
+            except (TypeError, ValueError):
+                signals = []
+            candidates.append(
+                ("tuning", row, signals)
+            )
+        prepared: list[tuple[str, object, list[str]]] = []
+        all_groups: set[str] = set()
+        known_groups = {entry.group for entry in self.config.entries if entry.group}
+        for kind, row, signals in candidates:
+            groups = sorted(
+                {
+                    by_signal[signal].group
+                    for signal in signals
+                    if signal in by_signal and by_signal[signal].group
+                }
+                or known_groups
+            )
+            prepared.append((kind, row, groups))
+            all_groups.update(groups)
+        if all_groups:
+            self._locks.acquire(all_groups, owner="startup-recovery")
+        for kind, row, groups in prepared:
+            run_id = str(row["run_id"])
+            recovery = {
+                "run_id": run_id,
+                "kind": kind,
+                "groups": groups,
+                "message": "服务重启时任务未处于终态，请核对设备实际状态后确认释放",
+            }
+            self._startup_recoveries[run_id] = recovery
+            if kind == "scan":
+                self.store.set_state(run_id, "recovery_required")
+            else:
+                self.tuning_store.set_state(run_id, "recovery_required", recovery["message"])
+        with self._lock:
+            self._recovery_checked = True
+
+    def acknowledge_startup_recovery(self, run_id: str, note: str = "") -> dict:
+        with self._lock:
+            try:
+                recovery = dict(self._startup_recoveries[run_id])
+            except KeyError as exc:
+                raise ValueError(f"没有这个启动恢复项：{run_id}") from exc
+            if recovery["kind"] == "scan":
+                self.store.set_state(run_id, "aborted")
+            else:
+                message = f"已人工确认：{note}".rstrip("：")
+                self.tuning_store.set_state(run_id, "aborted", message)
+            self._startup_recoveries.pop(run_id)
+            if not self._startup_recoveries:
+                self._locks.release(owner="startup-recovery")
+        recovery["acknowledged"] = True
+        recovery["note"] = note
+        return recovery
+
+    def acknowledge_all_startup_recoveries(self, note: str = "") -> list[dict]:
+        return [
+            self.acknowledge_startup_recovery(run_id, note)
+            for run_id in list(self._startup_recoveries)
+        ]
 
     @property
     def locks(self) -> DeviceLockManager:
@@ -177,11 +350,10 @@ class InstrumentRuntime:
             )
 
         groups = {
-            entry.group
+            entry.group or "__ungrouped__"
             for entry in (
                 self.signals.entry(request.signal) for request in requests
             )
-            if entry.group
         }
         owner = f"batch-{uuid4()}"
         try:
@@ -240,11 +412,10 @@ class InstrumentRuntime:
         会被 ``DeviceBusy`` 挡住，而不是在别人的任务下面偷偷写设定值。
         """
         groups = {
-            entry.group
+            entry.group or "__ungrouped__"
             for entry in (
                 self.signals.entry(signal) for signal in setpoint_signals
             )
-            if entry.group
         }
         owner = f"retract-{uuid4()}"
         self._locks.acquire(groups, owner=owner)
@@ -276,10 +447,13 @@ class InstrumentRuntime:
 
         读写服务与网关、配置一一对应，必须一并重建，否则会继续用旧映射写设备。
         """
+        replacement = self._gateway_factory(config)
         with self._lock:
             previous = self._gateway
             self._config = config
-            self._gateway = self._gateway_factory(config)
+            self._config_error = ""
+            self._read_only = self._deployment_read_only
+            self._gateway = replacement
             self._signals = None
             if previous is not None:
                 close = getattr(previous, "close", None)
@@ -298,6 +472,7 @@ class InstrumentRuntime:
         """
         with self._lock:
             scan = self._scan
+            tuning = self._tuning
         if scan is not None:
             for run_id in scan.run_ids():
                 try:
@@ -305,6 +480,13 @@ class InstrumentRuntime:
                 except Exception:  # noqa: BLE001  关闭路径尽力而为
                     pass
             scan.wait_idle(10.0)
+        if tuning is not None:
+            for run_id in tuning.run_ids():
+                try:
+                    tuning.stop(run_id)
+                except Exception:  # noqa: BLE001  关闭路径尽力而为
+                    pass
+            tuning.wait_idle(10.0)
         self._close_gateway()
 
     def _close_gateway(self) -> None:

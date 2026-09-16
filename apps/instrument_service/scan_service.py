@@ -237,12 +237,25 @@ class ScanService:
         if not request.axis.setpoint_signals:
             raise ScanError("扫描轴至少要有一路设定信号")
         try:
+            allowed_readbacks: set[str] = set()
             for signal in request.axis.setpoint_signals:
                 entry = self._signals.entry(signal)
                 if not entry.writable:
                     raise ScanError(f"扫描设定信号不可写：{signal}")
+                if not entry.scan_axis:
+                    raise ScanError(f"设备档案未允许该信号作为扫描轴：{signal}")
+                allowed_readbacks.add(entry.readback_signal or signal)
             self._signals.entry(request.axis.readback_signal)
-            self._signals.entry(request.detector_signal)
+            if request.axis.readback_signal not in allowed_readbacks:
+                raise ScanError(
+                    "扫描坐标回读必须来自所选扫描轴："
+                    f"{request.axis.readback_signal}"
+                )
+            detector = self._signals.entry(request.detector_signal)
+            if not detector.scan_detector or detector.writable:
+                raise ScanError(
+                    f"设备档案未允许该信号作为扫描探测器：{request.detector_signal}"
+                )
         except WriteRejected as exc:
             raise ScanError(str(exc)) from exc
         if request.samples_per_point < 1:
@@ -563,7 +576,11 @@ class ScanService:
             self._note_store_problem(run, problem)
 
     def _finish_aborted(self, run: _Run) -> None:
-        # 停止后设备停在当前值，状态是明确的，可以交还
+        # 安全停止与正常完成使用同一回落策略；失败时保留锁等待人工确认。
+        outcome = self._retract(run)
+        if outcome is not None and not outcome.ok:
+            self._finish_failed(run, f"停止后的回落失败：{outcome.message}", state_unknown=True)
+            return
         self._locks.release(owner=run.run_id)
         with self._lock:
             state = run.state
@@ -576,18 +593,19 @@ class ScanService:
             if run.state == ScanState.RUNNING:
                 self._to(run, ScanState.STOP_REQUESTED, "收到停止请求")
             if run.state == ScanState.STOP_REQUESTED:
-                self._to(run, ScanState.ABORTED, "已按请求停止")
+                suffix = f"；{outcome.message}" if outcome is not None else ""
+                self._to(run, ScanState.ABORTED, f"已安全停止{suffix}")
             run.finished_at = _now()
         # 停止前的点也是真实数据，尽力保存；保存失败不改判终态
         try:
             stored = self._persist_points(run)
         except Exception as exc:  # noqa: BLE001
             with self._lock:
-                run.message = f"已停止；部分数据未能保存：{exc}{problem}"
+                run.message = f"{run.message}；部分数据未能保存：{exc}{problem}"
             return
         with self._lock:
             run.spectrum = stored
-            run.message = f"已停止，保存了 {stored.point_count} 点{problem}"
+            run.message = f"{run.message}，保存了 {stored.point_count} 点{problem}"
 
     def _finish_completed(self, run: _Run) -> None:
         try:

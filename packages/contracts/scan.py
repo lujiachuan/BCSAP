@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+from math import isclose
+
 from pydantic import BaseModel, ConfigDict, field_validator
 
 
@@ -133,7 +135,12 @@ class ScanRunRequest(BaseModel):
         count = int(abs(span) / abs(self.step)) + 1
         if count > limit:
             raise ValueError(f"按当前参数将产生 {count} 个点，超过上限 {limit}")
-        return [self.start + self.step * index for index in range(count)]
+        targets = [self.start + self.step * index for index in range(count)]
+        if not isclose(targets[-1], self.stop, rel_tol=1e-12, abs_tol=1e-12):
+            targets.append(self.stop)
+        if len(targets) > limit:
+            raise ValueError(f"按当前参数将产生 {len(targets)} 个点，超过上限 {limit}")
+        return targets
 
 
 class ScanPoint(BaseModel):

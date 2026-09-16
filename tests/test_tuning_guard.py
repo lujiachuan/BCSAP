@@ -184,9 +184,10 @@ class TuningGuardTests(unittest.TestCase):
         self.set_target(0.2)
         after = service.approve(status.run_id)
 
-        self.assertEqual(after.state, "aborted")
+        self.assertEqual(after.state, "recovery_required")
         self.assertIsNone(after.recovery, "不自动回退时不该有回退记录")
         self.assertIn("人工处理", after.message)
+        self.assertTrue(after.locked_groups)
 
     def test_rollback_that_never_settles_keeps_the_device_and_asks_for_confirmation(self) -> None:
         service = self.build()

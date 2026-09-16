@@ -202,11 +202,18 @@ def mapping_entry(signal: str, **overrides: object) -> dict:
         "writable": True,
         "required": True,
         "group": "气体流量",
+        "device_id": "gas.ar",
+        "device_label": "Ar 流量",
         "readback_signal": signal.replace("_setpoint", "_readback"),
         "rate_signal": "",
         "role": "setpoint",
         "tunable": True,
         "beam_target": False,
+        "scan_axis": False,
+        "scan_detector": False,
+        "visible": True,
+        "display_order": 0,
+        "safe_value": 0.0,
         "min_value": 0.0,
         "max_value": 500.0,
         "max_step": 10.0,
@@ -220,11 +227,18 @@ def mapping_entry(signal: str, **overrides: object) -> dict:
 
 SAFETY_FIELDS = (
     "group",
+    "device_id",
+    "device_label",
     "role",
     "readback_signal",
     "rate_signal",
     "tunable",
     "beam_target",
+    "scan_axis",
+    "scan_detector",
+    "visible",
+    "display_order",
+    "safe_value",
     "min_value",
     "max_value",
     "max_step",
@@ -319,7 +333,7 @@ class PvMappingSafetyFieldTests(CacheDirSettingsTests):
         self.assertEqual(collected["rate_signal"], "magnet.m1.current_rate_setpoint")
         self.assertEqual(collected["readback_signal"], "magnet.m1.current_readback")
 
-    def test_new_rows_carry_no_safety_fields(self) -> None:
+    def test_new_rows_have_editable_device_defaults(self) -> None:
         page = self.make_page()
         page._add_pv_row()
         page._set_pv_text(0, PV_SIGNAL_COLUMN, "quadrupole.q3.current")
@@ -327,9 +341,10 @@ class PvMappingSafetyFieldTests(CacheDirSettingsTests):
 
         collected = page._collect_pv_mapping()["entries"][0]
 
-        self.assertEqual(
-            set(collected), {"label", "signal", "pv", "unit", "writable", "required"}
-        )
+        self.assertEqual(collected["group"], "未分组")
+        self.assertEqual(collected["role"], "setpoint")
+        self.assertTrue(collected["visible"])
+        self.assertFalse(collected["scan_axis"])
 
     def test_hover_shows_the_hidden_fields_and_survives_clear_marks(self) -> None:
         page = self.loaded_page(mapping_entry("gas.ar.flow_setpoint"))

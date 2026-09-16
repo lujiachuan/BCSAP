@@ -87,6 +87,13 @@ class SignalWriteService:
         except KeyError as exc:
             raise WriteRejected(f"未配置的业务信号：{signal}") from exc
 
+    def cached_write_result(self, command_id: str | None) -> SignalWriteResult | None:
+        """返回已经成功完成的幂等写结果；查询本身不会触碰设备。"""
+        if not command_id:
+            return None
+        with self._lock:
+            return self._completed.get(command_id)
+
     def resolve(self, signals: list[str] | None = None) -> list[PvMappingEntry]:
         """把请求的信号名列表解析成条目；None/空表示全部。"""
         if not signals:
@@ -186,8 +193,7 @@ class SignalWriteService:
             )
 
         if request.command_id:
-            with self._lock:
-                cached = self._completed.get(request.command_id)
+            cached = self.cached_write_result(request.command_id)
             if cached is not None:
                 return cached
 

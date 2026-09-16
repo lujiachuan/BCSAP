@@ -363,6 +363,38 @@ class TuningPage(QWidget):
         self.config_note.setWordWrap(True)
         form.addWidget(self.config_note)
 
+        # 默认只保留启动任务必需的参数；低频策略与保护项按需展开，
+        # 让 1320×820 下的开始按钮始终留在当前页内。
+        advanced_label_texts = {
+            "逐参数阶段：每个变量用几轮",
+            "联合微调范围（占各参数原范围）",
+            "每轮写完后额外保持",
+            "观测噪声（目标量纲）",
+            "随机种子",
+            "绝对归零阈值（束流接近零）",
+            "相对损失阈值（低于启动前基线多少算丢失）",
+            "连续异常次数才触发保护",
+            "完成后处置建议（仅提示，执行仍需二次确认）",
+        }
+        self._advanced_widgets = [
+            self.calls_spin, self.joint_frac_spin, self.hold_spin,
+            self.noise_spin, self.seed_spin,
+            self.loss_absolute_check, self.loss_absolute_spin,
+            self.loss_relative_spin, self.loss_strikes_spin,
+            self.auto_recover_check, self.finalize_pref,
+            self.save_config_button, self.load_config_button, self.config_note,
+        ]
+        self._advanced_widgets.extend(
+            label
+            for label in strategy.findChildren(QLabel)
+            if label.text() in advanced_label_texts
+        )
+        self.advanced_button = QPushButton("展开高级参数")
+        self.advanced_button.setCheckable(True)
+        self.advanced_button.toggled.connect(self._toggle_advanced_options)
+        form.addWidget(self.advanced_button)
+        self._toggle_advanced_options(False)
+
         form.addStretch()
         hint = QLabel(
             "范围必须落在设备允许区间内，且参数需配置最大单步；否则启动时会被拒绝——"
@@ -386,6 +418,11 @@ class TuningPage(QWidget):
         splitter.setSizes([980, 300])
         outer.addWidget(splitter)
         return tab
+
+    def _toggle_advanced_options(self, visible: bool) -> None:
+        for widget in self._advanced_widgets:
+            widget.setVisible(visible)
+        self.advanced_button.setText("收起高级参数" if visible else "展开高级参数")
 
     # ------------------------------------------------------------------
     # 页签 2：运行监控

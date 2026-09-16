@@ -34,6 +34,8 @@ def entry(signal: str, pv: str, unit: str, **kwargs: object) -> PvMappingEntry:
         "role": "readback", "readback_signal": "",
     }
     base.update(kwargs)
+    base.setdefault("tunable", bool(base["writable"] and base["role"] == "setpoint"))
+    base.setdefault("beam_target", signal.endswith(".beam_current"))
     return PvMappingEntry(**base)  # type: ignore[arg-type]
 
 
@@ -211,6 +213,26 @@ class TuningServiceTests(unittest.TestCase):
             service.start(
                 request(variables=[TuningVariable(signal=TARGET, low=0.0, high=1.0)])
             )
+
+    def test_variable_without_tuning_capability_is_rejected(self) -> None:
+        config = build_config()
+        config.entries[0] = config.entries[0].model_copy(update={"tunable": False})
+        service = self.build(config)
+
+        with self.assertRaises(TuningError) as caught:
+            service.start(request())
+
+        self.assertIn("未允许", str(caught.exception))
+
+    def test_target_without_beam_capability_is_rejected(self) -> None:
+        config = build_config()
+        config.entries[-1] = config.entries[-1].model_copy(update={"beam_target": False})
+        service = self.build(config)
+
+        with self.assertRaises(TuningError) as caught:
+            service.start(request())
+
+        self.assertIn("调束目标", str(caught.exception))
 
     def test_writable_signal_cannot_be_the_target(self) -> None:
         service = self.build()

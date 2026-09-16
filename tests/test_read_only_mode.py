@@ -669,6 +669,16 @@ class SettingsPageReadOnlyTests(_ClientCase):
 
         self.assertEqual(len(self.saved), 1)
 
+    def test_configuration_protection_still_allows_mapping_repair(self) -> None:
+        instrument_api.set_read_only(True, allow_mapping_repair=True)
+        self.addCleanup(instrument_api.set_read_only, False)
+        self.load()
+
+        self.assertTrue(self.page.pv_save_button.isEnabled())
+        self.page._save_pv_mapping()
+
+        self.assertEqual(len(self.saved), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

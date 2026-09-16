@@ -26,6 +26,7 @@ SIGNALS_WRITE_PATH = "/control/v1/signals/write"
 SCAN_RUNS_PATH = "/control/v1/scan/runs"
 TUNING_RUNS_PATH = "/control/v1/tuning/runs"
 TUNING_CATALOG_PATH = "/control/v1/tuning/catalog"
+RECOVERY_PATH = "/control/v1/recovery"
 # 成组写入一次要下发多路，且服务端会逐路走斜坡（受 max_rate 限制），超时给足
 BATCH_WRITE_TIMEOUT_S = 60.0
 MAGNET_RETRACT_PATH = "/control/v1/magnets/retract"
@@ -52,21 +53,28 @@ MAGNET_RETRACT_TIMEOUT_S = 120.0
 # 调用里无法取消，只能等它跑完（与 pv_mapping_api 同一处理）。
 _RUNNING: set[QThread] = set()
 _write_busy = False
-# 全局只读部署模式（执行服务按部署参数禁用所有写入）：由启动检查写入，页面据此
-# 不给"能按但按不动"的按钮并说明原因。**这不是安全边界**——真正的强制点在
+# 写保护状态（部署只读或配置损坏保护）：由启动检查写入，页面据此不给
+# "能按但按不动"的按钮并说明原因。**这不是安全边界**——真正的强制点在
 # 执行服务的 SignalWriteService.write()（所有写路径都经过它）。
 _read_only = False
+_mapping_repair_allowed = False
 
 
-def set_read_only(value: bool) -> None:
-    """记录执行服务是否处于全局只读模式（启动检查时调用）。"""
-    global _read_only
+def set_read_only(value: bool, *, allow_mapping_repair: bool = False) -> None:
+    """记录执行服务写保护状态；配置损坏时仅放行映射修复。"""
+    global _mapping_repair_allowed, _read_only
     _read_only = bool(value)
+    _mapping_repair_allowed = bool(value and allow_mapping_repair)
 
 
 def is_read_only() -> bool:
-    """执行服务是否处于全局只读部署模式。"""
+    """执行服务是否拒绝常规设备写入。"""
     return _read_only
+
+
+def can_repair_mapping() -> bool:
+    """只读是否仅由映射损坏触发，此时设置页仍可提交修复后的映射。"""
+    return _mapping_repair_allowed
 
 
 def instrument_base_url() -> str:
@@ -239,6 +247,18 @@ def request_tuning_catalog(base_url: str | None = None):
     凡是只读的都当目标"——那等于把设备语义交给界面猜（改造报告 §5.2）。
     """
     return _get(TUNING_CATALOG_PATH, base_url)
+
+
+def request_recovery_items(base_url: str | None = None):
+    return _get(RECOVERY_PATH, base_url)
+
+
+def request_acknowledge_all_recoveries(base_url: str | None = None):
+    return _post(
+        f"{RECOVERY_PATH}/acknowledge-all",
+        {"note": "已在手动控制页核对设备实际状态"},
+        base_url,
+    )
 
 
 def request_tuning_start(request: dict, base_url: str | None = None):

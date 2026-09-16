@@ -46,11 +46,13 @@ from packages.contracts.tuning import (
     TuningRunStatus,
     TuningVariable,
 )
+from packages.domain import beamline
 from packages.domain.tuning import TuningState, transition_tuning
 from packages.optimizer import Dimension, GpEiOptimizer
 
 from .device_locks import DeviceBusy, DeviceLockManager
 from .signal_io import SignalWriteService, WriteRejected
+from .tuning_catalog import NEVER_TUNABLE_SUFFIXES
 from .tuning_store import TuningStore
 
 # 处置动作的中文名（返回给界面直接用，避免两处各写一套）
@@ -181,6 +183,15 @@ class TuningService:
     def run_ids(self) -> list[str]:
         with self._lock:
             return list(self._runs)
+
+    def wait_idle(self, timeout: float = 30.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if all(run.state in TERMINAL_STATES for run in self._runs.values()):
+                    return True
+            time.sleep(0.02)
+        return False
 
     def _require(self, run_id: str) -> _Run:
         with self._lock:
@@ -389,6 +400,10 @@ class TuningService:
             entry = self._entry(variable.signal)
             if not entry.writable:
                 raise TuningError(f"参与调束的参数不可写：{variable.signal}")
+            if not entry.tunable:
+                raise TuningError(f"设备档案未允许该参数参与调束：{variable.signal}")
+            if entry.signal.endswith(NEVER_TUNABLE_SUFFIXES):
+                raise TuningError(f"保护/速率参数禁止参与调束：{variable.signal}")
             self._check_range(variable, entry)
             if entry.max_step is None or entry.max_step <= 0:
                 raise TuningError(
@@ -406,6 +421,19 @@ class TuningService:
         target = self._entry(request.target_signal)
         if target.writable:
             raise TuningError(f"目标量应为只读测量信号：{request.target_signal}")
+        if not target.beam_target:
+            raise TuningError(f"设备档案未允许该信号作为调束目标：{request.target_signal}")
+        disallowed = [
+            variable.signal
+            for variable in variables
+            if not beamline.is_upstream_of(
+                self._entry(variable.signal).group, target.group
+            )
+        ]
+        if disallowed:
+            raise TuningError(
+                "以下参数不在目标上游，禁止参与调束：" + "、".join(disallowed)
+            )
         if target.group:
             groups.add(target.group)
         return dimensions, groups
@@ -646,10 +674,11 @@ class TuningService:
         if tripped:
             if not run.request.auto_recover:
                 # 不自动回退：把异常摆到台面上，让操作员决定（设备锁仍握着）
-                self._finish_aborted(
+                self._finish_failed(
                     run,
                     f"束流异常已连续 {run.anomalies} 轮：{reason}；"
                     "已按配置停止自动流程，参数保持现状，请人工处理",
+                    state_unknown=True,
                 )
                 return self.status(run_id)
             self._recover(run, reason)

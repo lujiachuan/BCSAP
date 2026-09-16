@@ -286,17 +286,28 @@ class InitializationWorker(QThread):
             self.pvStatus.emit(0, 0, ["仪器执行服务不可达，未执行 PV 检查。"], 0)
             return False
 
-        # 全局只读部署模式：记在客户端一份，页面据此不给"能按但按不动"的按钮。
-        # 真正的强制点在执行层，这里只是让界面别撒谎。
-        instrument_api.set_read_only(bool(status.get("read_only")))
+        # 写保护状态记在客户端一份，页面据此不给"能按但按不动"的按钮。
+        # 真正的强制点在执行层；配置损坏保护仍允许从设置页修复映射。
+        read_only_reason = status.get("read_only_reason")
+        instrument_api.set_read_only(
+            bool(status.get("read_only")),
+            allow_mapping_repair=read_only_reason == "configuration",
+        )
+        instrument_message = "仪器执行服务可达"
+        if read_only_reason == "configuration":
+            instrument_message += "（PV 映射损坏保护，可在系统设置修复）"
+        elif status.get("read_only"):
+            instrument_message += "（全局只读模式）"
         self.stepChanged.emit(
             "instrument",
-            "good",
-            "仪器执行服务可达（全局只读模式）"
-            if status.get("read_only")
-            else "仪器执行服务可达",
+            "warn" if read_only_reason == "configuration" else "good",
+            instrument_message,
         )
-        self.serviceChanged.emit("instrument", "good", "就绪")
+        self.serviceChanged.emit(
+            "instrument",
+            "warn" if read_only_reason == "configuration" else "good",
+            "配置保护" if read_only_reason == "configuration" else "就绪",
+        )
         self.stepChanged.emit("pv", "running", "正在检查受控 PV…")
         try:
             # 设备访问走真实 CA，服务端第一次健康检查要等设备是否在线（最长约 5s），

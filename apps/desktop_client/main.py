@@ -282,12 +282,17 @@ class MainWindow(QMainWindow):
                 page.initializationRequested.connect(self._start_initialization)
                 page.serviceCardRequested.connect(self._show_service_details)
                 self._workbench_page = page
-            scroll = QScrollArea(objectName="pageScroll")
-            scroll.setWidgetResizable(True)
-            scroll.setFrameShape(QFrame.Shape.NoFrame)
-            scroll.viewport().setAutoFillBackground(False)
-            scroll.setWidget(page)
-            page_index = self.pages.addWidget(scroll)
+            if key in {"manual", "scan", "tuning"}:
+                # 三个实验控制页自己管理可用空间；再套外层滚动会形成双滚动，
+                # 关键的开始/停止按钮也会被推到视口之外。
+                page_index = self.pages.addWidget(page)
+            else:
+                scroll = QScrollArea(objectName="pageScroll")
+                scroll.setWidgetResizable(True)
+                scroll.setFrameShape(QFrame.Shape.NoFrame)
+                scroll.viewport().setAutoFillBackground(False)
+                scroll.setWidget(page)
+                page_index = self.pages.addWidget(scroll)
             self._page_rows[row] = page_index
             self._row_of_key[key] = row
 

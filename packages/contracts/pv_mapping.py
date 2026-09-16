@@ -24,6 +24,7 @@ _NUMERIC_FIELDS = (
     "max_rate",
     "settle_tol",
     "settle_timeout",
+    "safe_value",
 )
 
 
@@ -45,6 +46,8 @@ class PvMappingEntry(BaseModel):
 
     # ---- 分组与回读配对 ----
     group: str = ""
+    device_id: str = ""
+    device_label: str = ""
     readback_signal: str = ""
     # ---- 变化速率信号的配对（如磁铁 ``CurrentRateSet``）----
     # 为空表示该设备没有独立的速率设定信号；成组回落时靠它把速率真正下发下去，
@@ -64,6 +67,13 @@ class PvMappingEntry(BaseModel):
     # 界面只呈现被标记过的量，避免"凡是可写的都列成变量"。
     tunable: bool = False
     beam_target: bool = False
+    scan_axis: bool = False
+    scan_detector: bool = False
+
+    # ---- 低代码展示与安全收尾 ----
+    visible: bool = True
+    display_order: int = 0
+    safe_value: float | None = None
 
     # ---- 执行层写入校验参数（None = 该项不校验）----
     min_value: float | None = None

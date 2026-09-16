@@ -134,15 +134,15 @@ class ScanPageTests(unittest.TestCase):
 
         self.assertIn("终点必须大于起点", self.page.scan_summary.text())
 
-    def test_start_is_refused_when_range_has_one_point(self) -> None:
-        # 终点大于起点，但按步长只落得下 1 个点
+    def test_start_is_refused_when_range_is_zero(self) -> None:
+        # 起止相同，无论步长如何都只会生成 1 个点
         self.page.start_value.setValue(100.0)
-        self.page.end_value.setValue(100.5)
+        self.page.end_value.setValue(100.0)
         self.page.step_value.setValue(10.0)
 
         self.page.start_scan()
 
-        self.assertIn("两个采集点", self.page.state_label.text())
+        self.assertIn("终点必须大于起点", self.page.state_label.text())
         self.assertIsNone(self.page._run_id)
 
     def test_start_is_refused_above_point_limit(self) -> None:

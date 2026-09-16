@@ -14,6 +14,7 @@ from PySide6.QtCore import QSettings
 from apps.desktop_client.pages import SystemSettingsPage
 from apps.instrument_service import pv_mapping
 from apps.instrument_service.app import create_app
+from apps.instrument_service.pv_health import create_simulated_gateway
 from apps.instrument_service.runtime import InstrumentRuntime
 from packages.contracts import PvMappingConfig, PvMappingEntry
 
@@ -128,6 +129,41 @@ class PersistenceTests(unittest.TestCase):
         Path(os.environ["SPECTRUM_PV_MAPPING"]).write_text("{ not json", encoding="utf-8")
         self.assertEqual(pv_mapping.load_config(), pv_mapping.default_config())
 
+    def test_runtime_loader_fails_closed_on_corrupted_existing_file(self) -> None:
+        Path(os.environ["SPECTRUM_PV_MAPPING"]).write_text("{ not json", encoding="utf-8")
+
+        with self.assertRaises(pv_mapping.PvMappingLoadError):
+            pv_mapping.load_config_checked()
+
+    def test_corrupted_mapping_can_be_repaired_without_disabling_deployment_guard(self) -> None:
+        Path(os.environ["SPECTRUM_PV_MAPPING"]).write_text("{ not json", encoding="utf-8")
+        runtime = InstrumentRuntime(
+            gateway_factory=create_simulated_gateway,
+            read_only=False,
+        )
+        self.addCleanup(runtime.close)
+        app = create_app(runtime)
+
+        status = route_endpoint(app, "/control/v1/status", "GET")()
+        self.assertEqual(status.read_only_reason, "configuration")
+        put_mapping = route_endpoint(app, "/control/v1/pv-mapping", "PUT")
+        put_mapping(pv_mapping.default_config())
+
+        self.assertFalse(runtime.read_only)
+        self.assertEqual(runtime.config_error, "")
+
+        protected = InstrumentRuntime(
+            gateway_factory=create_simulated_gateway,
+            read_only=True,
+        )
+        self.addCleanup(protected.close)
+        protected_put = route_endpoint(
+            create_app(protected), "/control/v1/pv-mapping", "PUT"
+        )
+        with self.assertRaises(HTTPException) as caught:
+            protected_put(pv_mapping.default_config())
+        self.assertEqual(caught.exception.status_code, 400)
+
     def test_file_with_wrong_shape_returns_defaults(self) -> None:
         Path(os.environ["SPECTRUM_PV_MAPPING"]).write_text(
             json.dumps({"version": 1, "entries": "不是列表"}), encoding="utf-8"
@@ -162,10 +198,59 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(len(config.entries), 1)
         self.assertEqual(config.entries[0].pv, "SR:Q1:Current")
 
+    def test_runtime_loader_backfills_new_scan_capabilities_for_builtin_signals(self) -> None:
+        entries = [item.model_dump() for item in pv_mapping.default_config().entries]
+        magnet = next(
+            item for item in entries if item["signal"] == "magnet.m1.current_setpoint"
+        )
+        magnet.pop("scan_axis")
+        magnet.pop("safe_value")
+        Path(os.environ["SPECTRUM_PV_MAPPING"]).write_text(
+            json.dumps({"version": 1, "entries": entries}), encoding="utf-8"
+        )
+
+        loaded = next(
+            item
+            for item in pv_mapping.load_config_checked().entries
+            if item.signal == "magnet.m1.current_setpoint"
+        )
+
+        self.assertTrue(loaded.scan_axis)
+        self.assertEqual(loaded.safe_value, 0.0)
+
     def test_save_leaves_no_temp_files(self) -> None:
         pv_mapping.save_config(config_with(entry()))
         leftovers = list(Path(self._directory.name).glob(".pv_mapping-*"))
         self.assertEqual(leftovers, [])
+
+    def test_second_save_keeps_last_known_good_backup(self) -> None:
+        first = config_with(entry(pv="BL:FIRST"))
+        second = config_with(entry(pv="BL:SECOND"))
+        path = pv_mapping.save_config(first)
+
+        pv_mapping.save_config(second)
+
+        backup = path.with_suffix(path.suffix + ".bak")
+        self.assertEqual(
+            PvMappingConfig.model_validate(json.loads(backup.read_text(encoding="utf-8"))),
+            first,
+        )
+
+    def test_repair_does_not_replace_good_backup_with_corrupted_file(self) -> None:
+        first = config_with(entry(pv="BL:FIRST"))
+        second = config_with(entry(pv="BL:SECOND"))
+        third = config_with(entry(pv="BL:THIRD"))
+        path = pv_mapping.save_config(first)
+        pv_mapping.save_config(second)
+        path.write_text("{ broken", encoding="utf-8")
+
+        pv_mapping.save_config(third)
+
+        backup = path.with_suffix(path.suffix + ".bak")
+        self.assertEqual(
+            PvMappingConfig.model_validate(json.loads(backup.read_text(encoding="utf-8"))),
+            first,
+        )
 
 
     def test_rate_signal_must_exist_and_be_writable(self) -> None:
@@ -247,6 +332,14 @@ class MappingApiTests(unittest.TestCase):
         self.assertEqual(issues[0]["field"], "pv")
         # 校验失败不得写盘
         self.assertEqual(pv_mapping.load_config(), pv_mapping.default_config())
+
+    def test_put_is_blocked_while_device_group_is_active(self) -> None:
+        self.runtime.locks.acquire({"磁铁电源"}, owner="scan-1")
+
+        with self.assertRaises(HTTPException) as caught:
+            self.put_mapping(config_with(entry()), confirm_shrink=True)
+
+        self.assertEqual(caught.exception.status_code, 409)
 
     def test_added_row_becomes_visible_in_health_check(self) -> None:
         added = config_with(

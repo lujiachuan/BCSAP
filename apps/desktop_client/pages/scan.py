@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime
 
 from PySide6.QtCore import QTimer
@@ -257,14 +258,22 @@ class ScanPage(QWidget):
             )
         )
         layout.addWidget(self._build_controls())
-        layout.addWidget(self._build_retract_row())
-        layout.addWidget(self._build_export_row())
 
         plot_panel = Panel("实时谱图", "曲线优先")
         self.plot = SpectrumPlot("磁铁电流 I / A", "法拉第杯电流 / nA")
         plot_panel.body.addWidget(self.plot, 1)
+        self.advanced_panel = QWidget()
+        advanced_layout = QVBoxLayout(self.advanced_panel)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.setSpacing(6)
+        advanced_layout.addWidget(self._build_retract_row())
+        advanced_layout.addWidget(self._build_export_row())
+        self.advanced_panel.setVisible(False)
         plot_panel.body.addWidget(self._build_plot_tools())
+        plot_panel.body.addWidget(self.advanced_panel)
         plot_panel.body.addWidget(self._build_status_bar())
+        self.auto_retract.toggled.connect(self._sync_stop_caption)
+        self._sync_stop_caption(self.auto_retract.isChecked())
         layout.addWidget(plot_panel, 1)
         self._update_scan_summary()
 
@@ -414,7 +423,7 @@ class ScanPage(QWidget):
         self.retract_rate = self._double_spin(2.0, 0.1, MAX_RETRACT_RATE_A_PER_S, 0.5, " A/s")
         layout.addWidget(self._field("回落速率", self.retract_rate))
 
-        self.auto_retract = QCheckBox("扫描结束自动回落")
+        self.auto_retract = QCheckBox("完成或停止后自动回落")
         self.auto_retract.setChecked(True)
         self.auto_retract.setToolTip(
             "由执行服务在任务完成前执行：先写各路速率、再写各路电流、逐路等回读到位。"
@@ -478,6 +487,10 @@ class ScanPage(QWidget):
         apply_yrange.clicked.connect(self._apply_yrange)
         layout.addWidget(apply_yrange)
         layout.addStretch()
+        advanced = QPushButton("高级设置 / 导出", objectName="plotToolButton")
+        advanced.setCheckable(True)
+        advanced.toggled.connect(self.advanced_panel.setVisible)
+        layout.addWidget(advanced)
         export_png = QPushButton("导出 PNG", objectName="plotToolButton")
         export_png.clicked.connect(self._export_png)
         layout.addWidget(export_png)
@@ -532,6 +545,14 @@ class ScanPage(QWidget):
     def _toggle_mass_details(self, visible: bool) -> None:
         self.mass_details.setVisible(visible)
         self.mass_settings_button.setText("收起质量标定" if visible else "展开质量标定")
+
+    def _sync_stop_caption(self, retract: bool) -> None:
+        self.stop_button.setText("安全停止" if retract else "停止（不回落）")
+        self.stop_button.setToolTip(
+            "等待当前点收尾并自动回落到安全值"
+            if retract
+            else "等待当前点收尾后停止，设备保持在当前位置"
+        )
 
     @staticmethod
     def _field(label: str, widget: QWidget) -> QWidget:
@@ -611,7 +632,9 @@ class ScanPage(QWidget):
             return 1 if end == start else 0
         if (end - start > 0) != (step > 0):
             return 0
-        return int(abs(end - start) / abs(step)) + 1
+        ratio = abs(end - start) / abs(step)
+        count = int(ratio) + 1
+        return count if math.isclose(ratio, int(ratio), abs_tol=1e-12) else count + 1
 
     def _update_scan_summary(self, *_args) -> None:
         start = self.start_value.value()

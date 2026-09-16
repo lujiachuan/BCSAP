@@ -35,6 +35,7 @@ GUARDED_WRITE_PATHS = (
     "/control/v1/magnets/retract",
     "/control/v1/scan/runs",
     "/control/v1/tuning/runs",
+    "/control/v1/recovery",
 )
 WRITE_METHODS = {"PUT", "POST", "PATCH", "DELETE"}
 

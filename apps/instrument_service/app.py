@@ -1,5 +1,7 @@
 """仪器执行服务的 HTTP 应用。"""
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
 
 from packages.contracts import (
@@ -44,22 +46,40 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
     ``runtime`` 可注入，测试时用临时配置建立独立运行时。
     """
 
-    app = FastAPI(title="仪器执行服务", version="0.1.0")
     state = runtime if runtime is not None else InstrumentRuntime()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        state.recover_startup()
+        yield
+
+    app = FastAPI(title="仪器执行服务", version="0.1.0", lifespan=lifespan)
 
     @app.get("/control/v1/status", response_model=ServiceStatus)
     def get_status() -> ServiceStatus:
         config = state.config
         read_only = state.read_only
         detail = f"真实 EPICS 通道访问；PV 映射 {len(config.entries)} 条"
-        if read_only:
+        status = "ready"
+        if state.config_error:
+            status = "degraded"
+            detail += f"；配置不可用，已进入只读保护：{state.config_error}"
+        if state.deployment_read_only:
             detail += "；**全局只读模式**（部署参数启用，所有写入被拒绝）"
+        if state.startup_recoveries:
+            status = "degraded"
+            detail += f"；有 {len(state.startup_recoveries)} 个重启恢复项待人工确认"
         return ServiceStatus(
             service="instrument-service",
-            status="ready",
+            status=status,
             version=app.version,
             detail=detail,
             read_only=read_only,
+            read_only_reason=(
+                "deployment"
+                if state.deployment_read_only
+                else ("configuration" if state.config_error else None)
+            ),
         )
 
     @app.get("/control/v1/health/live", response_model=ServiceStatus)
@@ -73,6 +93,22 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
     @app.get("/control/v1/pvs/health")
     def get_pv_health():
         return state.check_health()
+
+    @app.get("/control/v1/recovery")
+    def get_recovery_items():
+        return {"items": state.startup_recoveries}
+
+    @app.post("/control/v1/recovery/{run_id}/acknowledge")
+    def acknowledge_recovery_item(run_id: str, note: str = ""):
+        try:
+            return state.acknowledge_startup_recovery(run_id, note)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/control/v1/recovery/acknowledge-all")
+    def acknowledge_all_recovery_items(payload: dict):
+        note = str(payload.get("note") or "")
+        return {"items": state.acknowledge_all_startup_recoveries(note)}
 
     @app.post("/control/v1/signals/read", response_model=SignalSnapshot)
     def post_signals_read(request: SignalSnapshotRequest) -> SignalSnapshot:
@@ -100,7 +136,7 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
 
         带 ``command_id`` 的重复请求返回首次结果，不会重复写设备。
         """
-        return state.signals.write(request)
+        return state.write_signal(request)
 
     @app.post("/control/v1/signals/write-batch", response_model=SignalBatchWriteResponse)
     def post_signals_write_batch(
@@ -329,7 +365,7 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
         写到多少"，把 128 条存成 3 条会让没列出的设备全部失去映射（实测踩过一次：
         一个测试忘了把请求换成桩，直接把现场映射覆盖成 3 条测试数据）。
         """
-        if state.read_only:
+        if state.deployment_read_only:
             # 映射决定"谁能写、写到多少"——只读部署下改它等于绕过只读本身，
             # 所以这里按写操作拒绝，而不是当成普通配置读写放行
             raise HTTPException(
@@ -339,6 +375,9 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
                     "需要改映射请去掉只读参数并重启服务。"
                 ),
             )
+        blocker = state.mapping_update_blocker()
+        if blocker:
+            raise HTTPException(status_code=409, detail=blocker)
         issues = pv_mapping.validate_config(config)
         if issues:
             payload = PvMappingValidationError(
@@ -349,12 +388,19 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
         if shrink and not confirm_shrink:
             raise HTTPException(status_code=400, detail=shrink)
         try:
-            pv_mapping.save_config(config)
-        except OSError as exc:
-            raise HTTPException(
-                status_code=500, detail=f"PV 映射写入失败：{exc}"
-            ) from exc
-        state.apply(config)
+            owner = state.acquire_mapping_update(config)
+        except DeviceBusy as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        try:
+            try:
+                pv_mapping.save_config(config)
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=500, detail=f"PV 映射写入失败：{exc}"
+                ) from exc
+            state.apply(config)
+        finally:
+            state.release_mapping_update(owner)
         return state.config
 
     return app

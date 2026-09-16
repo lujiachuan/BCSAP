@@ -338,6 +338,18 @@ def _with_roles(entries: list[PvMappingEntry]) -> tuple[PvMappingEntry, ...]:
                     entry.signal, role_for(entry.signal, entry.writable)
                 ),
                 "beam_target": beam_target_for(entry.signal),
+                "scan_axis": (
+                    entry.signal.startswith("magnet.")
+                    and entry.signal.endswith(".current_setpoint")
+                ),
+                "scan_detector": beam_target_for(entry.signal),
+                "safe_value": (
+                    0.0
+                    if entry.writable
+                    and role_for(entry.signal, entry.writable) == "setpoint"
+                    and not entry.signal.endswith(".current_rate_setpoint")
+                    else None
+                ),
             }
         )
         for entry in entries

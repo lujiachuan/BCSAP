@@ -115,5 +115,10 @@ def retract_signals(
         )
     detail = f"，{len(applied)} 路回读已到位" if applied else ""
     if notes:
-        detail += "（" + "；".join(notes) + "）"
+        return RetractOutcome(
+            ok=False,
+            message=f"电流已回落到 {current_a:g}，但速率未完全应用：" + "；".join(notes),
+            applied=applied,
+            state_unknown=state_unknown,
+        )
     return RetractOutcome(ok=True, message=f"已回落到 {current_a:g}{detail}", applied=applied)
