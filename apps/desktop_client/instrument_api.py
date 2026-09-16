@@ -141,11 +141,13 @@ class _JsonRequestThread(QThread):
 class SignalReadThread(_JsonRequestThread):
     """批量读取受控信号快照。"""
 
-    def __init__(self, base_url: str, signals: list[str] | None = None) -> None:
+    def __init__(
+        self, base_url: str, signals: list[str] | None = None, timeout: float | None = None
+    ) -> None:
         super().__init__(
             base_url.rstrip("/") + SIGNALS_READ_PATH,
             {"signals": list(signals or [])},
-            READ_TIMEOUT_S,
+            READ_TIMEOUT_S if timeout is None else float(timeout),
         )
 
 
@@ -418,10 +420,18 @@ def request_magnet_retract(
 
 
 def request_read(
-    base_url: str | None = None, signals: list[str] | None = None
+    base_url: str | None = None,
+    signals: list[str] | None = None,
+    timeout: float | None = None,
 ) -> SignalReadThread:
-    """启动一次快照读取；调用方负责避免重复发起（页面用「在飞就跳过」策略）。"""
-    thread = SignalReadThread(base_url or instrument_base_url(), signals)
+    """启动一次快照读取；调用方负责避免重复发起（页面用「在飞就跳过」策略）。
+
+    ``timeout`` 缺省用轮询超时（8 s）。**一次读上百路**（例如设置页的 caget 检测）
+    要给它更长的值：真机上逐个 PV 建连可能就要好几秒。
+    """
+    thread = SignalReadThread(
+        base_url or instrument_base_url(), signals, timeout=timeout
+    )
     thread.start()
     return thread
 

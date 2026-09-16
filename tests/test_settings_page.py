@@ -13,9 +13,10 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QObject, QSettings, Qt, Signal
 from PySide6.QtWidgets import QApplication, QPushButton
 
+from apps.desktop_client import instrument_api
 from apps.desktop_client.initialization import (
     CACHE_SETTINGS_KEY,
     InitializationWorker,
@@ -23,7 +24,12 @@ from apps.desktop_client.initialization import (
     default_cache_root,
 )
 from apps.desktop_client.pages import SystemSettingsPage
-from apps.desktop_client.pages.settings import PV_SIGNAL_COLUMN
+from apps.desktop_client.pages.settings import (
+    PV_PROBE_TIMEOUT_S,
+    PV_SIGNAL_COLUMN,
+    PV_STATUS_COLUMN,
+    PV_VALUE_COLUMN,
+)
 
 DEFAULT_SERVICE_URLS = {
     "data": "http://127.0.0.1:8000",
@@ -328,6 +334,347 @@ class PvMappingSafetyFieldTests(CacheDirSettingsTests):
         page._clear_all_pv_marks()
 
         self.assertIn("分组：气体流量", page.pv_table.item(0, PV_SIGNAL_COLUMN).toolTip())
+
+
+class PvProbeTests(CacheDirSettingsTests):
+    """PV 映射页的连接状态 / 当前值 / 查找 / 筛选（现场要求：看得见每一路通不通）。
+
+    关键约束：检测结果只读、不参与保存；**某一路连不上不该让整张表看起来不可用**，
+    失败的批次也不能替操作员猜"是连不上还是没读到"。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.reads: list[dict] = []
+
+    def loaded_page(self, *entries: dict) -> SystemSettingsPage:
+        page = self.make_page()
+        self.stub_reads(page)
+        page._render_pv_mapping({"version": 1, "entries": list(entries)})
+        return page
+
+    def stub_reads(self, page: SystemSettingsPage) -> None:
+        """把读请求换成记录参数、不联网的桩。"""
+        original = instrument_api.request_read
+
+        def fake_read(*_args, **kwargs):
+            self.reads.append(dict(kwargs))
+            return _NeverEnds()
+
+        instrument_api.request_read = fake_read
+        self.addCleanup(setattr, instrument_api, "request_read", original)
+
+    def three_entries(self) -> list[dict]:
+        return [
+            mapping_entry("gas.ar.flow_setpoint"),
+            mapping_entry("magnet.m1.current_setpoint", required=False),
+            mapping_entry(
+                "detector.fc1.beam_current", writable=False, required=True, unit="nA"
+            ),
+        ]
+
+    # ---------------- 列与"不参与保存" ----------------
+    def test_probe_columns_are_present_and_read_only(self) -> None:
+        page = self.loaded_page(*self.three_entries())
+
+        headers = [
+            page.pv_table.horizontalHeaderItem(index).text()
+            for index in range(page.pv_table.columnCount())
+        ]
+        self.assertEqual(headers[-2:], ["连接", "当前值"])
+        for row in range(page.pv_table.rowCount()):
+            for column in (PV_STATUS_COLUMN, PV_VALUE_COLUMN):
+                item = page.pv_table.item(row, column)
+                self.assertFalse(
+                    item.flags() & Qt.ItemFlag.ItemIsEditable, f"{row}/{column} 不该可编辑"
+                )
+
+    def test_probe_columns_never_reach_the_saved_payload(self) -> None:
+        page = self.loaded_page(*self.three_entries())
+        page._probe_pvs()
+        page._on_pv_probe(
+            {
+                "ok": True,
+                "payload": {
+                    "readings": [
+                        {"signal": "gas.ar.flow_setpoint", "value": 100.0,
+                         "unit": "sccm", "connected": True},
+                    ]
+                },
+            }
+        )
+
+        entries = page._collect_pv_mapping()["entries"]
+
+        for entry in entries:
+            self.assertNotIn("连接", entry)
+            self.assertNotIn("当前值", entry)
+            self.assertNotIn("status", entry)
+            self.assertNotIn("value", entry)
+
+    # ---------------- 检测行为 ----------------
+    def test_probe_only_asks_for_visible_rows(self) -> None:
+        """上百路全读在真机上要好几秒：先筛再读，只读当前可见行。"""
+        page = self.loaded_page(*self.three_entries())
+
+        page.pv_filter.setCurrentIndex(1)  # 只看未连接 → 还没测过，一行都不显示
+        page._probe_pvs()
+        self.assertEqual(self.reads, [], "没有可见行时不该发请求")
+
+        page.pv_search.setText("magnet")
+        page.pv_filter.setCurrentIndex(0)
+        page._probe_pvs()
+
+        self.assertEqual(len(self.reads), 1)
+        self.assertEqual(self.reads[0]["signals"], ["magnet.m1.current_setpoint"])
+        self.assertEqual(self.reads[0]["timeout"], PV_PROBE_TIMEOUT_S)
+
+    def test_probe_writes_status_value_and_reason_per_row(self) -> None:
+        page = self.loaded_page(*self.three_entries())
+        page._probe_pvs()
+
+        page._on_pv_probe(
+            {
+                "ok": True,
+                "payload": {
+                    "readings": [
+                        {"signal": "gas.ar.flow_setpoint", "value": 120.5,
+                         "unit": "sccm", "connected": True},
+                        {"signal": "magnet.m1.current_setpoint", "value": None,
+                         "unit": "A", "connected": False, "detail": "PV 未连接"},
+                        # detector 这一路服务没返回：不能当成"没连上"，要标"未测"
+                    ]
+                },
+            }
+        )
+
+        self.assertEqual(page._pv_text(0, PV_STATUS_COLUMN), "已连接")
+        self.assertIn("120.5", page._pv_text(0, PV_VALUE_COLUMN))
+        self.assertEqual(page._pv_text(1, PV_STATUS_COLUMN), "未连接")
+        self.assertEqual(page._pv_text(1, PV_VALUE_COLUMN), "—")
+        self.assertIn("PV 未连接", page.pv_table.item(1, PV_STATUS_COLUMN).toolTip())
+        self.assertEqual(page._pv_text(2, PV_STATUS_COLUMN), "未测")
+        # 汇总与提示：一路连不上不代表整张表不能用；"未测"要单独计数
+        self.assertIn("1 已连接", page.pv_summary.text())
+        self.assertIn("1 未连接", page.pv_summary.text())
+        self.assertIn("未测 1 行", page.pv_summary.text())
+        self.assertIn("不影响扫谱与调束", page.pv_feedback.text())
+
+    def test_probe_failure_marks_rows_untested_instead_of_guessing(self) -> None:
+        page = self.loaded_page(*self.three_entries())
+        page._probe_pvs()
+
+        page._on_pv_probe({"ok": False, "message": "连接被拒绝"})
+
+        for row in range(3):
+            self.assertEqual(page._pv_text(row, PV_STATUS_COLUMN), "未测")
+        self.assertEqual(page.pv_feedback.property("state"), "error")
+        self.assertIn("连接被拒绝", page.pv_feedback.text())
+
+    def test_render_resets_probe_cells(self) -> None:
+        """重新载入映射后旧的"已连接/当前值"不再成立，必须清掉。"""
+        page = self.loaded_page(*self.three_entries())
+        page._probe_pvs()
+        page._on_pv_probe(
+            {
+                "ok": True,
+                "payload": {
+                    "readings": [
+                        {"signal": "gas.ar.flow_setpoint", "value": 1.0,
+                         "unit": "sccm", "connected": True},
+                    ]
+                },
+            }
+        )
+
+        page._render_pv_mapping({"version": 2, "entries": [mapping_entry("gas.he.flow_setpoint")]})
+
+        self.assertEqual(page._pv_text(0, PV_STATUS_COLUMN), "")
+        self.assertEqual(page._pv_text(0, PV_VALUE_COLUMN), "")
+
+    def test_saving_reloads_and_reprobes(self) -> None:
+        page = self.loaded_page(*self.three_entries())
+        page._save_pv_mapping()
+
+        page._finish_pv_request(
+            {"ok": True, "config": {"version": 1, "entries": self.three_entries()},
+             "message": "", "issues": []}
+        )
+
+        self.assertEqual(len(self.reads), 1, "保存之后应自动重测一次")
+
+    def test_double_click_probes_only_that_row(self) -> None:
+        page = self.loaded_page(*self.three_entries())
+
+        page._on_pv_cell_double_clicked(1, PV_SIGNAL_COLUMN)
+
+        self.assertEqual(self.reads[0]["signals"], ["magnet.m1.current_setpoint"])
+
+    # ---------------- 查找与筛选 ----------------
+    def test_search_matches_label_signal_and_pv(self) -> None:
+        page = self.loaded_page(
+            mapping_entry("gas.ar.flow_setpoint", label="Ar 流量设定", pv="Part1:Flow:Ar:SP"),
+            mapping_entry("magnet.m1.current_setpoint", label="磁铁1 电流设定",
+                          pv="BD:DipoleMagnet:01:CurrentSet"),
+        )
+
+        def visible() -> list[int]:
+            return [
+                row
+                for row in range(page.pv_table.rowCount())
+                if not page.pv_table.isRowHidden(row)
+            ]
+
+        page.pv_search.setText("ar 流量")
+        self.assertEqual(visible(), [0], "按设备参数（标题）匹配")
+        page.pv_search.setText("DipoleMagnet")
+        self.assertEqual(visible(), [1], "按 PV 名匹配")
+        page.pv_search.setText("gas.ar")
+        self.assertEqual(visible(), [0], "按业务信号匹配")
+        page.pv_search.setText("")
+        self.assertEqual(visible(), [0, 1], "清空后全显示")
+
+    def test_filter_only_unconnected(self) -> None:
+        page = self.loaded_page(*self.three_entries())
+        page._probe_pvs()  # 先发一次检测：结果只会写进"本次检测的行"
+        page._on_pv_probe(
+            {
+                "ok": True,
+                "payload": {
+                    "readings": [
+                        {"signal": "gas.ar.flow_setpoint", "value": 1.0,
+                         "unit": "sccm", "connected": True},
+                        {"signal": "magnet.m1.current_setpoint", "value": None,
+                         "unit": "A", "connected": False, "detail": "PV 未连接"},
+                        {"signal": "detector.fc1.beam_current", "value": 8.3,
+                         "unit": "nA", "connected": True},
+                    ]
+                },
+            }
+        )
+
+        page.pv_filter.setCurrentIndex(1)  # 只看未连接
+
+        hidden = [
+            row for row in range(page.pv_table.rowCount())
+            if page.pv_table.isRowHidden(row)
+        ]
+        self.assertEqual(hidden, [0, 2])
+
+    def test_filter_only_required_follows_the_flag(self) -> None:
+        page = self.loaded_page(*self.three_entries())
+
+        page.pv_filter.setCurrentIndex(3)  # 只看必需
+
+        visible = [
+            row for row in range(page.pv_table.rowCount())
+            if not page.pv_table.isRowHidden(row)
+        ]
+        self.assertEqual(visible, [0, 2])
+
+    def test_copy_selected_rows_puts_three_columns_on_the_clipboard(self) -> None:
+        page = self.loaded_page(*self.three_entries())
+        page.pv_table.selectRow(1)
+
+        page._copy_pv_rows()
+
+        text = QApplication.clipboard().text()
+        self.assertIn("magnet.m1.current_setpoint", text)
+        self.assertIn("PV:magnet.m1.current_setpoint", text)
+
+    def test_copy_without_selection_only_reports(self) -> None:
+        page = self.loaded_page(*self.three_entries())
+        page.pv_table.clearSelection()
+
+        page._copy_pv_rows()
+
+        self.assertIn("先选中", page.pv_feedback.text())
+
+
+class PvProbeServicePayloadTests(CacheDirSettingsTests):
+    """用**真服务端**（内存网关 → FastAPI 路由）返回的 payload 渲染页面。
+
+    手写读数容易"照着页面实现写"，这条走真实契约：`POST /control/v1/signals/read`
+    返回什么，页面就得能显示成什么（字段名、单位、connected 语义一变就红）。
+    """
+
+    def test_real_service_payload_renders_status_and_value(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from apps.instrument_service.app import create_app
+        from apps.instrument_service.pv_health import create_simulated_gateway
+        from apps.instrument_service.runtime import InstrumentRuntime
+        from apps.instrument_service.scan_store import ScanStore
+        from packages.contracts import PvMappingConfig, SignalSnapshotRequest
+        from tests.test_signal_io import route_endpoint
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        config = PvMappingConfig.model_validate(
+            {
+                "version": 1,
+                "entries": [
+                    {
+                        "signal": "gas.ar.flow_setpoint",
+                        "label": "Ar 流量设定",
+                        "pv": "Part1:Flow_S:CS200A:Setpoint",
+                        "unit": "sccm",
+                        "writable": True,
+                        "required": True,
+                        "min_value": 0.0,
+                        "max_value": 500.0,
+                        "max_step": 50.0,
+                        "readback_signal": "gas.ar.flow_readback",
+                    },
+                    {
+                        "signal": "gas.ar.flow_readback",
+                        "label": "Ar 瞬时流量",
+                        "pv": "Part1:Flow_R:CS200A:InstantSCCM",
+                        "unit": "sccm",
+                        "writable": False,
+                        "required": True,
+                    },
+                ],
+            }
+        )
+        runtime = InstrumentRuntime(
+            config,
+            gateway_factory=create_simulated_gateway,
+            store=ScanStore(Path(directory.name)),
+        )
+        self.addCleanup(runtime.close)
+        endpoint = route_endpoint(create_app(runtime), "/control/v1/signals/read", "POST")
+        snapshot = endpoint(
+            SignalSnapshotRequest(
+                signals=["gas.ar.flow_setpoint", "gas.ar.flow_readback"]
+            )
+        ).model_dump()
+
+        page = self.make_page()
+        original = instrument_api.request_read
+        instrument_api.request_read = lambda *a, **k: _NeverEnds()
+        self.addCleanup(setattr, instrument_api, "request_read", original)
+        page._render_pv_mapping({"version": 1, "entries": config.model_dump()["entries"]})
+        page._probe_pvs()
+
+        page._on_pv_probe({"ok": True, "payload": snapshot})
+
+        self.assertEqual(page._pv_text(0, PV_STATUS_COLUMN), "已连接")
+        self.assertEqual(page._pv_text(1, PV_STATUS_COLUMN), "已连接")
+        # 值来自模拟网关的种子值，带映射里的单位
+        self.assertIn("sccm", page._pv_text(0, PV_VALUE_COLUMN))
+        self.assertIn("2 已连接", page.pv_summary.text())
+
+
+class _NeverEnds(QObject):
+    """假请求线程：connect 之后不回调（检测结果由测试直接喂给页面）。"""
+
+    completed = Signal(object)
+    finished = Signal()
+
+    def start(self) -> None:
+        return None
 
 
 if __name__ == "__main__":

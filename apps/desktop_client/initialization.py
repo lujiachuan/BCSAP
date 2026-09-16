@@ -207,7 +207,7 @@ class InitializationWorker(QThread):
 
     stepChanged = Signal(str, str, str)
     serviceChanged = Signal(str, str, str)
-    pvStatus = Signal(int, int, list)
+    pvStatus = Signal(int, int, list, int)
     essentialReady = Signal()
     syncProgress = Signal(int, int)
     completed = Signal(bool, str)
@@ -283,7 +283,7 @@ class InitializationWorker(QThread):
             self.stepChanged.emit("pv", "warn", "已跳过")
             self.serviceChanged.emit("instrument", "error", "不可达")
             self.serviceChanged.emit("epics", "idle", "未检查")
-            self.pvStatus.emit(0, 0, ["仪器执行服务不可达，未执行 PV 检查。"])
+            self.pvStatus.emit(0, 0, ["仪器执行服务不可达，未执行 PV 检查。"], 0)
             return False
 
         # 全局只读部署模式：记在客户端一份，页面据此不给"能按但按不动"的按钮。
@@ -309,16 +309,23 @@ class InitializationWorker(QThread):
             total = int(summary["total"])
             connected = int(summary["connected"])
             required_failed = int(summary["required_failed"])
-            state = "good" if required_failed == 0 else "error"
+            # PV 没连全**不拦路**（现场很难保证上百路全可达）：状态报 warn、把明细写出来，
+            # 入口照常开放。真正缺到本次要用的那几路时，执行层会在启动时点名拒绝。
+            state = "good" if required_failed == 0 else "warn"
             details = _collect_pv_details(result)
-            self.pvStatus.emit(connected, total, details)
-            self.stepChanged.emit("pv", state, f"{connected} / {total} PV 已连接")
+            self.pvStatus.emit(connected, total, details, required_failed)
+            text = f"{connected} / {total} PV 已连接"
+            if required_failed:
+                text += f"（{required_failed} 路标记为必需未连接）"
+            self.stepChanged.emit("pv", state, text)
             self.serviceChanged.emit("epics", state, f"{connected} / {total}")
-            return required_failed == 0
+            return True
         except Exception as exc:
+            # 连健康检查都发不出去（服务半死/超时）：报错误但仍**不锁控制入口**——
+            # 与本函数开头"服务可达即放行"同一口径，避免一个子系统把整台机器锁住
             self.stepChanged.emit("pv", "error", f"检查失败：{exc}")
             self.serviceChanged.emit("epics", "error", "检查失败")
-            return False
+            return True
 
     def _check_data_service(self) -> bool:
         self.stepChanged.emit("data", "running", "正在连接…")

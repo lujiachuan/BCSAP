@@ -128,6 +128,30 @@ class TuningPageCatalogTests(unittest.TestCase):
 
         self.assertEqual(self.signals(page), ["magnet.m1.current_setpoint"])
 
+    def test_parameter_table_shows_titles_not_pv_names(self) -> None:
+        """表格只显示设备参数的**标题**：PV 名对操作员没有信息量，还把表挤窄。
+
+        要核对 PV 的走「系统设置 → PV 映射」（那里有连接状态与当前值）；
+        表格里只把业务信号与 PV 留在 tooltip 上，方便顺手看一眼。
+        """
+        page = self.make_page(marked_mapping())
+
+        headers = [
+            page.parameter_table.horizontalHeaderItem(index).text()
+            for index in range(page.parameter_table.columnCount())
+        ]
+        self.assertEqual(headers, ["启用", "设备参数", "下限", "上限", "当前回读"])
+        self.assertNotIn("PV", headers)
+
+        cell = page.parameter_table.item(0, 1)
+        self.assertEqual(cell.text(), "magnet.m1.current_setpoint")
+        self.assertIn("业务信号：magnet.m1.current_setpoint", cell.toolTip())
+        self.assertIn("PV：PV:magnet.m1.current_setpoint", cell.toolTip())
+        # 范围与回读列都跟着左移了一格：控件还在原来的位置上
+        self.assertIsNotNone(page.parameter_table.cellWidget(0, 2))
+        self.assertIsNotNone(page.parameter_table.cellWidget(0, 3))
+        self.assertIsNotNone(page.parameter_table.cellWidget(0, 4))
+
     def test_rate_setpoint_and_switch_are_not_offered(self) -> None:
         page = self.make_page(marked_mapping())
 

@@ -41,6 +41,7 @@ class AppStatusModel(QObject):
 
         self.pv_total = 0
         self.pv_connected = 0
+        self.pv_required_failed = 0
         self.pv_details: list[str] = []
         self.sync_current = 0
         self.sync_total = 0
@@ -65,9 +66,16 @@ class AppStatusModel(QObject):
         self._steps[key].update({"state": state, "detail": detail, "at": _now()})
         self.updated.emit()
 
-    def set_pv(self, connected: int, total: int, details: list[str] | None = None) -> None:
+    def set_pv(
+        self,
+        connected: int,
+        total: int,
+        details: list[str] | None = None,
+        required_failed: int = 0,
+    ) -> None:
         self.pv_connected = connected
         self.pv_total = total
+        self.pv_required_failed = required_failed
         if details is not None:
             self.pv_details = details
         self.updated.emit()
@@ -115,12 +123,31 @@ class AppStatusModel(QObject):
         return self._services["epics"]["state"] == "good"
 
     @property
+    def pv_note(self) -> str:
+        """PV 连接情况的一句话说明（可能带"未连接"信息，也可能是空串）。"""
+        if not self.pv_total:
+            return ""
+        text = f"{self.pv_connected} / {self.pv_total} 路受控 PV 已连接"
+        if self.pv_required_failed:
+            text += f"（{self.pv_required_failed} 路标记为必需）"
+        return text
+
+    @property
     def data_ready(self) -> bool:
         return self._services["data"]["state"] == "good"
 
     @property
     def can_control(self) -> bool:
-        return self.instrument_ready and self.pv_ready
+        """能不能进控制页：只看**仪器执行服务是否可达**。
+
+        这里**故意不看 PV 连接数**：现场很难保证上百路 PV 全部可达，而"有一路连不上"
+        并不等于"不能控制"——扫谱/调束各自只需要自己那几路（轴、目标、变量），
+        真正缺哪一路由执行层在启动时按名字拒绝并说明。把整页入口锁掉会让操作员
+        在"我明明只用得到磁铁"的情况下什么也做不了（现场反馈，2026-09-14）。
+        PV 未连接仍然如实展示（``pv_note`` / 工作台状态卡 / 初始化步骤），
+        但它是**提示**，不是拦路的理由。
+        """
+        return self.instrument_ready
 
     @property
     def blocking_reasons(self) -> list[str]:
@@ -128,10 +155,18 @@ class AppStatusModel(QObject):
         if not self.instrument_ready:
             state = self._services["instrument"]["state"]
             reasons.append("仪器执行服务" + ("未就绪" if state == "error" else "未检查/连接中"))
-        if not self.pv_ready:
-            state = self._services["epics"]["state"]
-            reasons.append("关键 PV" + ("未连接" if state == "error" else "未确认/检查中"))
         return reasons
+
+    @property
+    def warnings(self) -> list[str]:
+        """不拦路、但要看一眼的提示（目前只有 PV 连接情况）。"""
+        notes: list[str] = []
+        if self.pv_total and self.pv_connected < self.pv_total:
+            notes.append(
+                f"受控 PV {self.pv_connected} / {self.pv_total} 已连接："
+                "用不到的可以不管，缺到本次要用的那几路时执行层会在启动时点名拒绝"
+            )
+        return notes
 
     @property
     def can_sync_continue(self) -> bool:
@@ -145,6 +180,7 @@ class AppStatusModel(QObject):
             self._steps[key] = {"state": "idle", "detail": "", "at": ""}
         self.pv_total = 0
         self.pv_connected = 0
+        self.pv_required_failed = 0
         self.pv_details = []
         self.sync_current = 0
         self.sync_total = 0

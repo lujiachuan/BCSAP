@@ -174,9 +174,9 @@ class TuningPage(QWidget):
         splitter.setChildrenCollapsible(False)
 
         variables = Panel("优化变量", "勾选参与调束的参数并设定范围")
-        self.parameter_table = QTableWidget(0, 6)
+        self.parameter_table = QTableWidget(0, 5)
         self.parameter_table.setHorizontalHeaderLabels(
-            ["启用", "设备参数", "PV", "下限", "上限", "当前回读"]
+            ["启用", "设备参数", "下限", "上限", "当前回读"]
         )
         self.parameter_table.verticalHeader().setVisible(False)
         variables.body.addWidget(self.parameter_table, 1)
@@ -661,12 +661,12 @@ class TuningPage(QWidget):
             check.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
             check.setCheckState(Qt.CheckState.Unchecked)
             self.parameter_table.setItem(row, 0, check)
-            self.parameter_table.setItem(
-                row, 1, QTableWidgetItem(str(entry.get("label", entry.get("signal"))))
-            )
-            self.parameter_table.setItem(
-                row, 2, QTableWidgetItem(str(entry.get("pv", "")))
-            )
+            # 只显示设备参数的**标题**（label）：PV 名对操作员没有信息量，还把表格挤窄。
+            # 想核对 PV 的走「系统设置 → PV 映射」（那里有连接状态与当前值），
+            # 表格里保留成 tooltip 只是顺手，不作为主要入口。
+            name = QTableWidgetItem(str(entry.get("label", entry.get("signal"))))
+            name.setToolTip(f"业务信号：{entry.get('signal', '')}\nPV：{entry.get('pv', '')}")
+            self.parameter_table.setItem(row, 1, name)
 
             low = entry.get("min_value")
             high = entry.get("max_value")
@@ -680,11 +680,11 @@ class TuningPage(QWidget):
                 )
             low_spin.setValue(float(low) if low is not None else 0.0)
             high_spin.setValue(float(high) if high is not None else 0.0)
-            self.parameter_table.setCellWidget(row, 3, low_spin)
-            self.parameter_table.setCellWidget(row, 4, high_spin)
+            self.parameter_table.setCellWidget(row, 2, low_spin)
+            self.parameter_table.setCellWidget(row, 3, high_spin)
             readback = QLabel("--")
             readback.setObjectName("mutedText")
-            self.parameter_table.setCellWidget(row, 5, readback)
+            self.parameter_table.setCellWidget(row, 4, readback)
             self._rows.append(
                 {
                     "entry": entry,

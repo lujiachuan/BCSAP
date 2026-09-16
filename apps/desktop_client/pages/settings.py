@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -9,6 +10,7 @@ from PySide6.QtCore import QSettings, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -53,10 +55,25 @@ DEFAULT_SERVICE_URLS = {
 # 方案文档 6.2：映射是执行服务持有的受控配置，客户端只通过 API 读写，
 # 不直接访问 IOC；保存由执行服务校验并立即生效。
 # 设备访问统一走真实 EPICS Channel Access，没有模式开关；无 IOC 时健康检查会如实报未连接。
-# 表格列：设备参数 / 业务信号 / PV 名称 / 单位 / 可写 / 必需
-PV_COLUMNS = ("设备参数", "业务信号", "PV 名称", "单位", "可写", "必需")
+# 表格列：设备参数 / 业务信号 / PV 名称 / 单位 / 可写 / 必需 + 两列**检测结果**
+# （连接 / 当前值）：后两列是 caget 的现场快照，只读、不参与保存。
+PV_COLUMNS = ("设备参数", "业务信号", "PV 名称", "单位", "可写", "必需", "连接", "当前值")
 # 业务信号列：行的身份，也是「未显示的安全字段」的载体（保存时按行合并回去）
 PV_SIGNAL_COLUMN = 1
+PV_STATUS_COLUMN = 6
+PV_VALUE_COLUMN = 7
+
+# 表格上方的"只看"筛选：现场最常用的三种
+PV_FILTERS = (
+    ("all", "全部"),
+    ("down", "只看未连接"),
+    ("writable", "只看可写"),
+    ("required", "只看必需"),
+    ("untested", "只看未测"),
+)
+
+# caget 检测的超时：上百路 PV 在真机上逐个读可能要好几秒，8 s 的轮询超时不够用
+PV_PROBE_TIMEOUT_S = 30.0
 
 # 角色只作只读提示用；控件生成仍在手动页里按 role 决定
 _ROLE_LABELS = {
@@ -195,6 +212,13 @@ class SystemSettingsPage(QWidget):
         self._pv_request: PvMappingRequestThread | None = None
         self._pv_loaded = False
         self._pv_config_version = 1
+        # PV 检测（caget）状态：进行中标志、在飞请求、本次检测的行、上次检测时刻
+        self._pv_probe_in_flight = False
+        self._pv_probe_request = None
+        self._pv_probe_rows: list[int] = []
+        self._pv_probe_started = 0.0
+        self._pv_last_probe = ""
+        self._pv_pending_reprobe = False
         layout = page_layout(self)
         layout.addWidget(
             PageHeading("系统设置", "配置服务连接、编辑 PV 映射、设定日志级别与外观。")
@@ -442,6 +466,38 @@ class SystemSettingsPage(QWidget):
         self.pv_table.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
         )
+        # 双击一行 = 只重读这一路（现场排查单个通道时不必把 128 路全读一遍）
+        self.pv_table.cellDoubleClicked.connect(self._on_pv_cell_double_clicked)
+
+        # 工具行：查找 + 筛选 + 检测 + 复制。检测只读**当前可见行**：
+        # 上百路 PV 全读一遍在真机上要好几秒，先筛再读才是现场想要的顺序。
+        tools = QHBoxLayout()
+        tools.setSpacing(8)
+        self.pv_search = QLineEdit()
+        self.pv_search.setPlaceholderText("查找：设备参数 / 业务信号 / PV 名，可只输一段")
+        self.pv_search.setClearButtonEnabled(True)
+        self.pv_search.textChanged.connect(lambda _text: self._apply_pv_filter())
+        tools.addWidget(self.pv_search, 2)
+        self.pv_filter = QComboBox()
+        for key, label in PV_FILTERS:
+            self.pv_filter.addItem(label, key)
+        self.pv_filter.currentIndexChanged.connect(lambda _index: self._apply_pv_filter())
+        tools.addWidget(self.pv_filter)
+        self.pv_probe_button = QPushButton("测试连接并读取")
+        self.pv_probe_button.setToolTip(
+            "对当前**可见行**做一次 caget：连接状态 + 当前值（没连上的如实标出来，"
+            "不会因为一路连不上就说整张表不可用）"
+        )
+        self.pv_probe_button.clicked.connect(lambda: self._probe_pvs())
+        tools.addWidget(self.pv_probe_button)
+        self.pv_copy_button = QPushButton("复制选中行")
+        self.pv_copy_button.setToolTip("把选中行的「设备参数 / 业务信号 / PV 名」贴到剪贴板")
+        self.pv_copy_button.clicked.connect(self._copy_pv_rows)
+        tools.addWidget(self.pv_copy_button)
+        panel.body.addLayout(tools)
+        self.pv_summary = QLabel("", objectName="mutedText")
+        self.pv_summary.setWordWrap(True)
+        panel.body.addWidget(self.pv_summary)
         panel.body.addWidget(self.pv_table)
 
         actions = QHBoxLayout()
@@ -466,8 +522,12 @@ class SystemSettingsPage(QWidget):
             "都会按新映射执行；「可写」决定允许下发设定值，「必需」决定该 PV 掉线时"
             "是否判定设备不可用。写入仍受参数边界与设备联锁约束。"
             "本机没有 IOC 时可先启动仓库里 sim/ 的模拟 IOC 联调。"
-            "\n表格只列常用的 6 个字段；分组、角色、回读配对、边界、最大单步、最大速率"
-            "和稳定判据由执行服务持有，保存时按行原样保留（悬停「业务信号」可查看）。"
+            "\n「连接 / 当前值」两列是点「测试连接并读取」后的现场快照（caget），"
+            "只读、不参与保存；双击某一行可以只重读那一路。"
+            "\n其余安全字段（分组、角色、回读配对、边界、最大单步、最大速率、稳定判据）"
+            "由执行服务持有，保存时按行原样保留（悬停「业务信号」可查看）。"
+            "**某一路连不上不影响扫谱/调束入口**：各自只用得到自己那几路，缺哪一路"
+            "由执行服务在启动时点名拒绝。"
         )
         note.setWordWrap(True)
         panel.body.addWidget(note)
@@ -524,6 +584,11 @@ class SystemSettingsPage(QWidget):
             return
         self._render_pv_mapping(result["config"])
         self._pv_loaded = True
+        if self._pv_pending_reprobe:
+            # 映射刚改过：PV 名可能变了，原来的"已连接/当前值"对新名字不再成立，
+            # 自动重测一次；失败也不影响保存结果（提示里会说）。
+            self._pv_pending_reprobe = False
+            self._probe_pvs()
 
     def _render_pv_mapping(self, config: dict) -> None:
         entries = config.get("entries", [])
@@ -539,8 +604,209 @@ class SystemSettingsPage(QWidget):
             self._remember_pv_entry(row, entry)
         for row in range(self.pv_table.rowCount()):
             self._clear_pv_row_marks(row)
+            self._reset_pv_probe_cells(row)
         self._set_pv_feedback("good", f"已载入 {len(entries)} 条映射。")
         self.pv_save_button.setEnabled(not instrument_api.is_read_only())
+        self._apply_pv_filter()
+
+    # ---- PV 映射：查找 / 筛选 / 检测（caget）----
+
+    def _pv_filter_key(self) -> str:
+        return str(self.pv_filter.currentData() or "all")
+
+    def _row_matches_filter(self, row: int) -> bool:
+        """一行是否该显示：先按"只看"筛，再按关键字匹配三个可读列。"""
+        key = self._pv_filter_key()
+        status = self._pv_text(row, PV_STATUS_COLUMN)
+        if key == "down" and status != "未连接":
+            return False
+        if key == "untested" and status not in ("", "未测"):
+            return False
+        if key == "writable" and not self._pv_flag(row, 4):
+            return False
+        if key == "required" and not self._pv_flag(row, 5):
+            return False
+        needle = self.pv_search.text().strip().lower()
+        if not needle:
+            return True
+        haystack = " ".join(
+            self._pv_text(row, column) for column in (0, PV_SIGNAL_COLUMN, 2)
+        ).lower()
+        return needle in haystack
+
+    def _apply_pv_filter(self) -> None:
+        """按查找词与"只看"隐藏行，并刷新汇总。
+
+        用 ``setRowHidden`` 而不是重建表格：编辑到一半的单元格（尤其是新增行的草稿）
+        不能被筛选动作弄丢。
+        """
+        total = self.pv_table.rowCount()
+        visible = 0
+        for row in range(total):
+            keep = self._row_matches_filter(row)
+            self.pv_table.setRowHidden(row, not keep)
+            visible += int(keep)
+        self._refresh_pv_summary(visible)
+
+    def _refresh_pv_summary(self, visible: int | None = None) -> None:
+        total = self.pv_table.rowCount()
+        if visible is None:
+            visible = sum(
+                1 for row in range(total) if not self.pv_table.isRowHidden(row)
+            )
+        tested = sum(
+            1
+            for row in range(total)
+            if self._pv_text(row, PV_STATUS_COLUMN) in ("已连接", "未连接")
+        )
+        connected = sum(
+            1
+            for row in range(total)
+            if self._pv_text(row, PV_STATUS_COLUMN) == "已连接"
+        )
+        parts = [f"共 {total} 行", f"当前可见 {visible} 行"]
+        if tested:
+            parts.append(
+                f"已检测 {tested}：{connected} 已连接 / {tested - connected} 未连接"
+            )
+        else:
+            parts.append("还没检测过：点「测试连接并读取」")
+        untested = total - tested
+        if tested and untested:
+            parts.append(f"未测 {untested} 行")
+        if self._pv_last_probe:
+            parts.append(f"上次检测 {self._pv_last_probe}")
+        self.pv_summary.setText(" · ".join(parts))
+
+    def _visible_pv_signals(self, rows: list[int] | None = None) -> list[tuple[int, str]]:
+        """可见行里**填了业务信号**的那些（新加的空行不参与检测）。"""
+        picked: list[tuple[int, str]] = []
+        candidates = rows if rows is not None else range(self.pv_table.rowCount())
+        for row in candidates:
+            if rows is None and self.pv_table.isRowHidden(row):
+                continue
+            signal = self._pv_text(row, PV_SIGNAL_COLUMN)
+            if signal:
+                picked.append((row, signal))
+        return picked
+
+    def _probe_pvs(self, rows: list[int] | None = None) -> None:
+        """对可见行（或指定行）做一次 caget：连接状态 + 当前值。"""
+        if self._pv_probe_in_flight:
+            self._set_pv_feedback("warn", "上一次检测还没回来，请稍候。")
+            return
+        picked = self._visible_pv_signals(rows)
+        if not picked:
+            self._set_pv_feedback("warn", "当前没有可检测的行（填上业务信号，或放宽筛选）。")
+            return
+        self._pv_probe_rows = [row for row, _signal in picked]
+        self._pv_probe_in_flight = True
+        self.pv_probe_button.setEnabled(False)
+        self.pv_probe_button.setText(f"检测中（{len(picked)} 路）…")
+        self._pv_probe_started = time.monotonic()
+        request = instrument_api.request_read(
+            signals=[signal for _row, signal in picked],
+            timeout=PV_PROBE_TIMEOUT_S,
+        )
+        request.completed.connect(self._on_pv_probe)
+        self._pv_probe_request = request
+
+    def _on_pv_probe(self, payload: dict) -> None:
+        self._pv_probe_in_flight = False
+        self._pv_probe_request = None
+        self.pv_probe_button.setEnabled(True)
+        self.pv_probe_button.setText("测试连接并读取")
+        elapsed = time.monotonic() - self._pv_probe_started
+        if not payload.get("ok"):
+            # 整批读失败（服务不可达/超时）时**不猜**每一路的连接状态：
+            # 把原因写在提示里，表格里的状态保持"未测"。
+            for row in self._pv_probe_rows:
+                self._set_pv_probe_cells(row, "未测", "", str(payload.get("message", "")))
+            self._set_pv_feedback("error", f"检测失败：{payload.get('message', '')}")
+            self._pv_last_probe = ""
+            self._refresh_pv_summary()
+            return
+
+        readings = instrument_api.readings_by_signal(payload.get("payload"))
+        missing = 0
+        for row in self._pv_probe_rows:
+            signal = self._pv_text(row, PV_SIGNAL_COLUMN)
+            reading = readings.get(signal)
+            if reading is None:
+                missing += 1
+                self._set_pv_probe_cells(row, "未测", "", "执行服务没有返回这一路")
+                continue
+            connected = bool(reading.get("connected"))
+            detail = str(reading.get("detail") or "")
+            value = reading.get("value")
+            unit = str(reading.get("unit") or self._pv_text(row, 3))
+            if connected and value is not None:
+                text = f"{float(value):.6g} {unit}".strip()
+            else:
+                text = "—"
+            note = detail or ("PV 未连接" if not connected else "")
+            self._set_pv_probe_cells(
+                row, "已连接" if connected else "未连接", text, note
+            )
+        self._pv_last_probe = time.strftime("%H:%M:%S")
+        connected_count = sum(
+            1
+            for row in self._pv_probe_rows
+            if self._pv_text(row, PV_STATUS_COLUMN) == "已连接"
+        )
+        self._set_pv_feedback(
+            "good" if connected_count == len(self._pv_probe_rows) else "warn",
+            f"已检测 {len(self._pv_probe_rows)} 路：{connected_count} 已连接 / "
+            f"{len(self._pv_probe_rows) - connected_count} 未连接"
+            + (f"（{missing} 路服务未返回）" if missing else "")
+            + f" · 耗时 {elapsed:.1f} s。"
+            "没连上的只要不是本次要用的那几路，不影响扫谱与调束。",
+        )
+        self._apply_pv_filter()
+
+    def _on_pv_cell_double_clicked(self, row: int, _column: int) -> None:
+        self._probe_pvs(rows=[row])
+
+    def _reset_pv_probe_cells(self, row: int) -> None:
+        self._set_pv_probe_cells(row, "", "", "还没检测：点「测试连接并读取」")
+
+    def _set_pv_probe_cells(
+        self, row: int, status: str, value: str, note: str = ""
+    ) -> None:
+        """写「连接 / 当前值」两列：文本 + 颜色 + 明细提示（都不参与保存）。"""
+        tokens = current_palette()
+        for column, text in ((PV_STATUS_COLUMN, status), (PV_VALUE_COLUMN, value)):
+            item = QTableWidgetItem(text)
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            if note:
+                item.setToolTip(note)
+            self.pv_table.setItem(row, column, item)
+        color = {
+            "已连接": tokens["statusGood"],
+            "未连接": tokens["statusError"],
+        }.get(status)
+        if color:
+            for column in (PV_STATUS_COLUMN, PV_VALUE_COLUMN):
+                item = self.pv_table.item(row, column)
+                if item is not None:
+                    item.setForeground(QColor(color))
+
+    def _copy_pv_rows(self) -> None:
+        rows = sorted({index.row() for index in self.pv_table.selectedIndexes()})
+        if not rows:
+            self._set_pv_feedback("warn", "先选中要复制的行。")
+            return
+        lines = [
+            "\t".join(
+                self._pv_text(row, column)
+                for column in (0, PV_SIGNAL_COLUMN, 2)
+            )
+            for row in rows
+        ]
+        QApplication.clipboard().setText("\n".join(lines))
+        self._set_pv_feedback(
+            "good", f"已复制 {len(lines)} 行（设备参数 / 业务信号 / PV 名）。"
+        )
 
     # ---- PV 映射：未显示的安全字段 ----
 
@@ -575,8 +841,10 @@ class SystemSettingsPage(QWidget):
         self._set_pv_flag(row, 4, True)
         self._set_pv_flag(row, 5, True)
         self._remember_pv_entry(row, None)
+        self._reset_pv_probe_cells(row)
         self.pv_table.setCurrentCell(row, PV_SIGNAL_COLUMN)
         self.pv_table.editItem(self.pv_table.item(row, PV_SIGNAL_COLUMN))
+        self._refresh_pv_summary()
 
     def _remove_pv_rows(self) -> None:
         rows = sorted({index.row() for index in self.pv_table.selectedIndexes()})
@@ -586,6 +854,7 @@ class SystemSettingsPage(QWidget):
         for row in reversed(rows):
             self.pv_table.removeRow(row)
         self._set_pv_feedback("idle", f"已删除 {len(rows)} 行，点击“保存映射”生效。")
+        self._refresh_pv_summary()
 
     def _save_pv_mapping(self) -> None:
         if instrument_api.is_read_only():
@@ -596,6 +865,7 @@ class SystemSettingsPage(QWidget):
             return
         self._clear_all_pv_marks()
         payload = self._collect_pv_mapping()
+        self._pv_pending_reprobe = True
         self._set_pv_feedback("idle", "正在保存…")
         self._start_pv_request(payload=payload)
 

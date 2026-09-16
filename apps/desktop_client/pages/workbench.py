@@ -179,7 +179,7 @@ class WorkbenchPage(QWidget):
 
     def set_control_enabled(self, enabled: bool) -> None:
         self._control_enabled = enabled
-        reason = "" if enabled else "仪器服务或关键 PV 未就绪，暂不可执行扫谱与调束"
+        reason = "" if enabled else "仪器执行服务未就绪，暂不可执行扫谱与调束"
         for button in (self.scan_button, self.tuning_button):
             button.setEnabled(enabled)
             button.setToolTip(reason)
@@ -191,9 +191,11 @@ class WorkbenchPage(QWidget):
         if state == "good":
             text, object_name = "●  设备就绪", "goodStatus"
         elif state == "error":
-            text, object_name = "●  设备不可用于控制", "errorStatus"
+            # "error" 现在是**健康检查发不出去**（服务半死/超时），不是"有 PV 没连上"
+            text, object_name = "●  设备检查失败", "errorStatus"
         else:
-            text, object_name = "●  设备状态待确认", "warnStatus"
+            # warn = 部分 PV 未连接：如实提示，但不拦路（用不到的可以不管）
+            text, object_name = "●  部分 PV 未连接", "warnStatus"
         self.device_status.setText(text)
         self.device_status.setObjectName(object_name)
         self.device_status.style().unpolish(self.device_status)
@@ -206,15 +208,19 @@ class WorkbenchPage(QWidget):
             self.hero_title.setText("设备与关键服务就绪")
             self.hero_caption.setText("可执行扫谱与自动调束；数据服务同步状态见下方状态卡。")
             return
-        if instrument == "error" or epics == "error":
-            blocked: list[str] = []
-            if instrument != "good":
-                blocked.append("仪器执行服务未就绪")
-            if epics != "good":
-                blocked.append("关键 PV 未连接")
+        if instrument == "error":
             self.hero_title.setText("暂不可执行扫谱与调束")
             self.hero_caption.setText(
-                "阻塞原因：" + "、".join(blocked) + "。请先处理下方服务状态或点击“重新检查”。"
+                "阻塞原因：仪器执行服务未就绪。请先处理下方服务状态或点击“重新检查”。"
+            )
+            return
+        if epics in {"warn", "error"}:
+            # 有 PV 没连上**不再锁入口**：扫谱/调束只用得到各自那几路，
+            # 缺哪一路由执行层在启动时点名拒绝。这里只说清现状。
+            self.hero_title.setText("可执行扫谱与调束（部分 PV 未连接）")
+            self.hero_caption.setText(
+                "有受控 PV 没连上：用不到的可以不管；缺到本次要用的那几路时，"
+                "执行服务会在启动时点名拒绝。明细见「系统设置 → PV 映射」。"
             )
             return
         self.hero_title.setText("正在检查设备与关键服务…")

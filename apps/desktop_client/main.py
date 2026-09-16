@@ -383,8 +383,10 @@ class MainWindow(QMainWindow):
         self._model.set_service(key, state, text)
         self._sync_one_service_view(key)
 
-    def _on_pv_status(self, connected: int, total: int, details: list) -> None:
-        self._model.set_pv(connected, total, details)
+    def _on_pv_status(
+        self, connected: int, total: int, details: list, required_failed: int = 0
+    ) -> None:
+        self._model.set_pv(connected, total, details, required_failed)
 
     def _on_sync_progress(self, current: int, total: int) -> None:
         self._model.set_sync_progress(current, total)
@@ -428,8 +430,14 @@ class MainWindow(QMainWindow):
     # ---------- 进入判定与操作资格 ----------
 
     def _apply_control_eligibility(self) -> None:
-        """手动控制/扫谱/调束入口启用与否由模型推导，页面不自行拼条件。"""
+        """控制页入口启用与否由模型推导，页面不自行拼条件。
+
+        **只有"仪器执行服务不可达"才拦路**：PV 连不全只作提示（写进工具提示与工作台），
+        因为扫谱/调束各自只用得到自己那几路，缺哪一路由执行层在启动时点名拒绝。
+        把整页入口锁掉，会让"我只用磁铁、气压没接上"这种正常现场什么也做不了。
+        """
         can_control = self._model.can_control
+        warnings = self._model.warnings
         for page_key in ("manual", "scan", "tuning"):
             row = self._row_of_key.get(page_key)
             if row is None:
@@ -437,10 +445,16 @@ class MainWindow(QMainWindow):
             item = self.navigation.item(row)
             if can_control:
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEnabled)
-                item.setToolTip(_PAGE_SPEC_BY_KEY[page_key].label)
+                tooltip = _PAGE_SPEC_BY_KEY[page_key].label
+                if warnings:
+                    tooltip += "\n（提示：" + "；".join(warnings) + "）"
+                item.setToolTip(tooltip)
             else:
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
-                item.setToolTip("仪器服务或关键 PV 未就绪，暂不可用")
+                reasons = self._model.blocking_reasons or ["未检查"]
+                item.setToolTip(
+                    "暂不可执行扫谱与调束：" + "；".join(reasons) + "（控制页需要执行服务）"
+                )
         if self._workbench_page is not None:
             self._workbench_page.set_control_enabled(can_control)
         row = self.navigation.currentRow()
