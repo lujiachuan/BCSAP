@@ -75,6 +75,11 @@ PV_FILTERS = (
 # caget 检测的超时：上百路 PV 在真机上逐个读可能要好几秒，8 s 的轮询超时不够用
 PV_PROBE_TIMEOUT_S = 30.0
 
+# 条目数骤减的拦截阈值（与执行服务 pv_mapping.shrink_warning 同一套数字）：
+# 现有条目不少于 10 条、而新映射不到一半时，先提醒一次，再点一次才真的存。
+PV_SHRINK_MIN_ENTRIES = 10
+PV_SHRINK_RATIO = 0.5
+
 # 角色只作只读提示用；控件生成仍在手动页里按 role 决定
 _ROLE_LABELS = {
     "setpoint": "设定值",
@@ -219,6 +224,9 @@ class SystemSettingsPage(QWidget):
         self._pv_probe_started = 0.0
         self._pv_last_probe = ""
         self._pv_pending_reprobe = False
+        # 已载入的条目数（判断"这次保存是不是把映射存残了"的基准）与确认状态
+        self._pv_loaded_count = 0
+        self._pv_shrink_confirmed = False
         layout = page_layout(self)
         layout.addWidget(
             PageHeading("系统设置", "配置服务连接、编辑 PV 映射、设定日志级别与外观。")
@@ -554,9 +562,11 @@ class SystemSettingsPage(QWidget):
         self._set_pv_feedback("idle", "正在读取 PV 映射…")
         self._start_pv_request(payload=None)
 
-    def _start_pv_request(self, payload: dict | None) -> None:
+    def _start_pv_request(self, payload: dict | None, confirm_shrink: bool = False) -> None:
         self.pv_save_button.setEnabled(False)
-        self._pv_request = PvMappingRequestThread(self._instrument_base_url(), payload)
+        self._pv_request = PvMappingRequestThread(
+            self._instrument_base_url(), payload, confirm_shrink=confirm_shrink
+        )
         self._pv_request.completed.connect(self._finish_pv_request)
         self._pv_request.finished.connect(self._release_pv_request)
         self._pv_request.start()
@@ -593,6 +603,8 @@ class SystemSettingsPage(QWidget):
     def _render_pv_mapping(self, config: dict) -> None:
         entries = config.get("entries", [])
         self._pv_config_version = int(config.get("version", 1))
+        self._pv_loaded_count = len(entries)
+        self._pv_shrink_confirmed = False
         self.pv_table.setRowCount(len(entries))
         for row, entry in enumerate(entries):
             self._set_pv_text(row, 0, entry.get("label", ""))
@@ -856,6 +868,22 @@ class SystemSettingsPage(QWidget):
         self._set_pv_feedback("idle", f"已删除 {len(rows)} 行，点击“保存映射”生效。")
         self._refresh_pv_summary()
 
+    def _shrink_warning(self, payload: dict) -> str:
+        """条目数骤减的提醒文案（空串表示正常）。
+
+        与执行服务同一条策略（服务端也会拒），这里先拦一道是为了**把话说在操作员
+        眼前**、也省一次白跑的请求：保存一整份映射时条目数腰斩，几乎总是"表格只
+        显示了一部分"或"传错了文件"，而不是真的想删掉一半设备。
+        """
+        current = self._pv_loaded_count
+        proposed = len(payload.get("entries") or [])
+        if current < PV_SHRINK_MIN_ENTRIES or proposed >= current * PV_SHRINK_RATIO:
+            return ""
+        return (
+            f"新映射只有 {proposed} 条，而当前是 {current} 条（不足一半）："
+            "这通常意味着把残缺的一份表存了回来，存下去会让没列出的设备全部失去映射。"
+        )
+
     def _save_pv_mapping(self) -> None:
         if instrument_api.is_read_only():
             # 只读部署下执行服务会 400（映射决定写入边界，改它等于改安全配置）
@@ -863,11 +891,20 @@ class SystemSettingsPage(QWidget):
                 "warn", "全局只读模式：执行服务禁用了所有写入，PV 映射不可保存。"
             )
             return
-        self._clear_all_pv_marks()
         payload = self._collect_pv_mapping()
+        warning = self._shrink_warning(payload)
+        if warning and not self._pv_shrink_confirmed:
+            # 第一次只提醒；再点一次才真的存（并要求服务端带 confirm_shrink）
+            self._pv_shrink_confirmed = True
+            self._set_pv_feedback(
+                "warn", warning + " 确认要这样保存，请再点一次「保存映射」。"
+            )
+            return
+        self._clear_all_pv_marks()
         self._pv_pending_reprobe = True
         self._set_pv_feedback("idle", "正在保存…")
-        self._start_pv_request(payload=payload)
+        self._start_pv_request(payload=payload, confirm_shrink=self._pv_shrink_confirmed)
+        self._pv_shrink_confirmed = False
 
     def _collect_pv_mapping(self) -> dict:
         """写回配置：表格里显示的 6 个字段来自表格，其余安全字段按行原样保留。

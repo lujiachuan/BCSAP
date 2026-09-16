@@ -122,6 +122,30 @@ def config_path() -> Path:
     return root / "SpectrumPlatform" / "pv_mapping.json"
 
 
+# 条目数骤减的保护阈值：新配置少于「现有条目的一半」、且现有条目不少于 10 时，
+# 认定这是"把残缺的表存了回来"（客户端只渲染了一部分、脚本传错了文件……），
+# 必须显式带 confirm_shrink=true 才接受。
+# 为什么服务端也要拦：映射决定"谁能写、写到多少"，存坏了整台机器的控制都会失灵，
+# 而**任何客户端**（含脚本、测试）都能调这个接口。实测踩过：一个测试用例忘了把
+# 网络请求换成桩，直接把 128 条映射存成了 3 条测试数据（2026-09-16）。
+SHRINK_GUARD_MIN_ENTRIES = 10
+SHRINK_GUARD_RATIO = 0.5
+
+
+def shrink_warning(current: int, proposed: int) -> str | None:
+    """条目数骤减时给出一句可展示的原因；正常收缩返回 ``None``。"""
+    if current < SHRINK_GUARD_MIN_ENTRIES:
+        return None
+    if proposed >= current * SHRINK_GUARD_RATIO:
+        return None
+    return (
+        f"新映射只有 {proposed} 条，而当前有 {current} 条（不足一半）。"
+        "这通常意味着把残缺的一份表存了回来（界面只显示了一部分、或脚本传错了文件），"
+        "存下去会让没列出的设备全部失去映射。"
+        "确实要这样改，请显式带 confirm_shrink=true 再提交。"
+    )
+
+
 def load_config() -> PvMappingConfig:
     """读取配置；文件不存在、损坏或没有可用条目时回退默认值（不抛异常，保证服务可启动）。
 

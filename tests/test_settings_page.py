@@ -24,6 +24,7 @@ from apps.desktop_client.initialization import (
     default_cache_root,
 )
 from apps.desktop_client.pages import SystemSettingsPage
+from apps.desktop_client.pages import settings as settings_module
 from apps.desktop_client.pages.settings import (
     PV_PROBE_TIMEOUT_S,
     PV_SIGNAL_COLUMN,
@@ -47,6 +48,27 @@ class CacheDirSettingsTests(unittest.TestCase):
         self.root = Path(self._tmp.name)
         self.settings_path = self.root / "settings.ini"
         self.settings = QSettings(str(self.settings_path), QSettings.Format.IniFormat)
+        # 设置页自己就会发映射请求（显示时拉一次、保存时 PUT）：测试里一律换成假线程。
+        # **不换就会真的打到 127.0.0.1:8765**——2026-09-16 踩过：一条新用例忘了换，
+        # 把现场 128 条映射覆盖成了 3 条测试数据。tests/conftest.py 另有一道护栏，
+        # 这里换桩是"不该发生的事根本不发生"。
+        self.mapping_requests: list[dict] = []
+        original = settings_module.PvMappingRequestThread
+
+        def fake_thread(base_url, payload=None, confirm_shrink=False):
+            self.mapping_requests.append(
+                {
+                    "base_url": base_url,
+                    "payload": payload,
+                    "confirm_shrink": confirm_shrink,
+                }
+            )
+            return _NeverEnds()
+
+        settings_module.PvMappingRequestThread = fake_thread
+        self.addCleanup(
+            setattr, settings_module, "PvMappingRequestThread", original
+        )
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -589,6 +611,78 @@ class PvProbeTests(CacheDirSettingsTests):
         page._copy_pv_rows()
 
         self.assertIn("先选中", page.pv_feedback.text())
+
+    # ---------------- 条目数骤减的拦截 ----------------
+    def many_entries(self, count: int = 12) -> list[dict]:
+        return [mapping_entry(f"gas.s{index}.flow_setpoint") for index in range(count)]
+
+    def test_saving_a_truncated_table_asks_once_before_writing(self) -> None:
+        """整份映射存成一小撮是最容易犯且后果最重的错：先提醒，再点一次才存。
+
+        实测缘由见 tests/conftest.py 顶部注释（一条用例真把 128 条存成了 3 条）。
+        """
+        page = self.loaded_page(*self.many_entries(12))
+        for row in reversed(range(5, 12)):  # 12 → 5 条，不足一半（倒序删，否则索引会移位）
+            page.pv_table.removeRow(row)
+
+        page._save_pv_mapping()  # 第一次：只提醒
+
+        self.assertEqual(self.mapping_requests, [], "第一次不该真的发请求")
+        self.assertEqual(page.pv_feedback.property("state"), "warn")
+        self.assertIn("不足一半", page.pv_feedback.text())
+        self.assertIn("再点一次", page.pv_feedback.text())
+
+        page._save_pv_mapping()  # 第二次：带着确认去存
+
+        self.assertEqual(len(self.mapping_requests), 1)
+        self.assertTrue(self.mapping_requests[0]["confirm_shrink"])
+        self.assertEqual(len(self.mapping_requests[0]["payload"]["entries"]), 5)
+
+    def test_normal_shrink_does_not_ask(self) -> None:
+        """从 12 条改成 8 条是正常的删减，不该拿确认框烦人。"""
+        page = self.loaded_page(*self.many_entries(12))
+        for row in reversed(range(8, 12)):  # 12 → 8 条
+            page.pv_table.removeRow(row)
+
+        page._save_pv_mapping()
+
+        self.assertEqual(len(self.mapping_requests), 1)
+        self.assertFalse(self.mapping_requests[0]["confirm_shrink"])
+
+    def test_tiny_mapping_is_not_guarded(self) -> None:
+        """本来就只有几行时（现场小规模联调）不该套这条。"""
+        page = self.loaded_page(*self.three_entries())
+        for row in reversed(range(1, 3)):  # 3 → 1 条
+            page.pv_table.removeRow(row)
+
+        page._save_pv_mapping()
+
+        self.assertEqual(len(self.mapping_requests), 1)
+        self.assertFalse(self.mapping_requests[0]["confirm_shrink"])
+
+    def test_confirmation_state_resets_after_a_successful_save(self) -> None:
+        """确认只对那一次生效：存完再裁一次仍要重新确认。"""
+        page = self.loaded_page(*self.many_entries(24))
+        for row in reversed(range(10, 24)):  # 24 → 10 条
+            page.pv_table.removeRow(row)
+        page._save_pv_mapping()
+        page._save_pv_mapping()
+        self.assertEqual(len(self.mapping_requests), 1)
+
+        page._finish_pv_request(
+            {
+                "ok": True,
+                "config": {"version": 1, "entries": self.many_entries(10)},
+                "message": "",
+                "issues": [],
+            }
+        )
+        for row in reversed(range(4, 10)):  # 10 → 4 条，又不足一半
+            page.pv_table.removeRow(row)
+        page._save_pv_mapping()
+
+        self.assertEqual(len(self.mapping_requests), 1, "确认过的那次不该被复用")
+        self.assertIn("不足一半", page.pv_feedback.text())
 
 
 class PvProbeServicePayloadTests(CacheDirSettingsTests):

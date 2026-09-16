@@ -754,6 +754,36 @@ $env:QT_QPA_PLATFORM='offscreen'
 
 ---
 
+### 8.13 事故与修复：测试把现场 PV 映射覆盖成了 3 条（2026-09-16）
+
+**现象**：现场反馈"EPICS 为什么检查失败，就剩 3 条 PV 了，原来的 100 多条呢"。
+
+**取证**（三条独立证据，都指向同一个原因）：
+
+| 证据 | 内容 |
+|---|---|
+| 映射文件内容 | `C:\Users\81169\AppData\Roaming\SpectrumPlatform\pv_mapping.json` 里正好是 3 条：`PV:gas.ar.flow_setpoint`、`PV:magnet.m1.current_setpoint`、`PV:detector.fc1.beam_current`——**`PV:` 前缀是测试构造数据的特征**（`tests/test_settings_page.py::mapping_entry()` 生成 `"PV:" + signal`） |
+| 文件时间戳 | `st_ctime == st_mtime == 2026-09-16 09:34:25`：文件是**那一刻被创建**的（此前不存在，服务一直用内置默认映射），目录里也只有这一个文件 |
+| 服务状态 | `/control/v1/status` 的 detail 写着「PV 映射 3 条」，健康检查因此 `required_failed>0` → 客户端报 EPICS 失败 |
+
+**根因**：`PvProbeTests.test_saving_reloads_and_reprobes`（本轮新增的用例）调用了设置页的 `_save_pv_mapping()`，但那一类只把「读信号」换成桩，**没换 `PvMappingRequestThread`**。于是这条用例真的向 `127.0.0.1:8765` 发了 PUT，把运行中服务的映射换成了 `three_entries()` 那 3 条测试数据；执行服务照单全收（`save_config` + `state.apply`），现场映射当场没了。
+
+**修复（三层，缺一层都还会再犯）**：
+
+1. **测试不再碰真服务**：`tests/conftest.py` 新增 autouse 护栏——对本机开发服务端口（8765 / 8767 / 8000）的**写类请求**（映射保存、单点/成组写入、回落、扫谱/调束启动与确认）直接拦下并记违规，用例结束时断言违规为空（**必须让用例红**：请求线程自己会把异常吞成 `ok=False`，不额外断言就等于"悄悄少写一次配置"）。读取类（状态、快照、健康检查、目录、任务查询）刻意放行——很多用例本来就靠"页面发一次读请求然后失败"验证降级路径，拦掉它们只会把 90 多个无关用例弄红、反而掩盖真正危险的那类。
+2. **设置页整类用例都换桩**：把 `PvMappingRequestThread` 的桩提到 `CacheDirSettingsTests.setUp`（所有设置页用例的基类），并记录每次请求的参数供断言——原先连"显示页面就会发一次 GET"这种也被真发了。
+3. **条目数骤减要显式确认**（服务端强制 + 界面先说一句）：
+   - 服务端：`PUT /control/v1/pv-mapping` 在当前条目 ≥10、而新配置不足一半时返回 **400**，要求带 `?confirm_shrink=true`；策略写在 `pv_mapping.shrink_warning()` 里（`SHRINK_GUARD_MIN_ENTRIES=10`、`SHRINK_GUARD_RATIO=0.5`）。**这条保护必须在服务端**：任何客户端（脚本、新写的用例）都绕不过去——本次事故正是被它拦得住的。
+   - 客户端：`_save_pv_mapping` 先自查一次，提示「新映射只有 N 条，而当前是 M 条（不足一半）……确认要这样保存，请再点一次」；再点一次才带 `confirm_shrink` 提交，确认状态用完即清。
+
+**恢复现场**：把内置默认映射（128 条）PUT 回服务 → `/control/v1/status` 恢复「PV 映射 128 条」、健康检查 `ready 128/128 connected / required_failed=0`；磁盘文件内容即默认映射（原状态是"无文件、用内置默认"，两者等价）。客户端上如果还显示 3 条，在「系统设置 → PV 映射」点一次「重新载入」（或重启客户端）即可。
+
+**验证**：`tests/test_pv_mapping.py` 新增 3 例（骤减被拒且不换内存配置、小映射不套这条、阈值本身：128→65 放行 / 128→60 拦、现有 9 条不套 / 现有 10 条砍到 4 拦）+ `tests/test_settings_page.py` 新增 4 例（骤减先提醒再点一次才发请求、正常删减不烦人、小映射不套、确认只对一次生效）+ `tests/conftest.py` 护栏；全量 `pytest tests` → **701 passed, 253 subtests**。
+
+**如实记录的两点**：① 现场原有的映射内容**无法从这次覆盖中恢复**——被覆盖前磁盘上并没有这个文件（服务用的是内置默认映射），所以"恢复"等于把内置默认写回，没有丢现场自定义内容；② 这次事故是本轮我自己引入的（新用例缺桩），修复里最关键的其实是**第 3 层服务端拦截**——只靠"测试写对"挡不住下一个忘了换桩的人。
+
+---
+
 ## 9. 建议实施顺序
 ### P0：先修正确性和安全
 

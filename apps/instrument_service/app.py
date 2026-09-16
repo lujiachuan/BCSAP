@@ -318,10 +318,16 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
         return state.config
 
     @app.put("/control/v1/pv-mapping", response_model=PvMappingConfig)
-    def put_pv_mapping(config: PvMappingConfig) -> PvMappingConfig:
+    def put_pv_mapping(
+        config: PvMappingConfig, confirm_shrink: bool = False
+    ) -> PvMappingConfig:
         """校验并保存 PV 映射，成功后立即对后续读写生效。
 
         校验失败返回 400 + 逐行问题清单，客户端按行标红。
+
+        **条目数骤减要显式确认**（``?confirm_shrink=true``）：映射决定"谁能写、
+        写到多少"，把 128 条存成 3 条会让没列出的设备全部失去映射（实测踩过一次：
+        一个测试忘了把请求换成桩，直接把现场映射覆盖成 3 条测试数据）。
         """
         if state.read_only:
             # 映射决定"谁能写、写到多少"——只读部署下改它等于绕过只读本身，
@@ -339,6 +345,9 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
                 config_version=pv_mapping.CONFIG_VERSION, issues=issues
             )
             raise HTTPException(status_code=400, detail=payload.model_dump())
+        shrink = pv_mapping.shrink_warning(len(state.config.entries), len(config.entries))
+        if shrink and not confirm_shrink:
+            raise HTTPException(status_code=400, detail=shrink)
         try:
             pv_mapping.save_config(config)
         except OSError as exc:

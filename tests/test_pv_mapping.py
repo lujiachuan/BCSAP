@@ -228,7 +228,8 @@ class MappingApiTests(unittest.TestCase):
         updated = config_with(
             entry(signal="quadrupole.q1.current", label="Q1 电流", pv="SR:Q1:Current")
         )
-        saved = self.put_mapping(updated)
+        # 这一条就是要把 128 条换成 1 条：按新加的骤减保护必须显式确认
+        saved = self.put_mapping(updated, confirm_shrink=True)
 
         self.assertEqual(saved.entries[0].pv, "SR:Q1:Current")
         self.assertEqual(self.get_mapping().entries[0].pv, "SR:Q1:Current")
@@ -257,7 +258,7 @@ class MappingApiTests(unittest.TestCase):
                 required=False,
             )
         )
-        self.put_mapping(added)
+        self.put_mapping(added, confirm_shrink=True)
 
         health = route_endpoint(self.app, "/control/v1/pvs/health", "GET")()
         self.assertEqual(health.summary.total, 1)
@@ -269,13 +270,54 @@ class MappingApiTests(unittest.TestCase):
             entry(),
             entry(signal="steerer.x", label="X 偏转", pv="BL:STEER:X", unit="V"),
         )
-        self.put_mapping(trimmed)
+        self.put_mapping(trimmed, confirm_shrink=True)
 
         health = route_endpoint(self.app, "/control/v1/pvs/health", "GET")()
         self.assertEqual(
             [item.signal for item in health.items],
             ["quadrupole.q1.current", "steerer.x"],
         )
+
+    def test_sudden_shrink_is_refused_until_explicitly_confirmed(self) -> None:
+        """把 128 条存成几条要显式确认：映射存残了会让没列出的设备全部失去映射。
+
+        实测缘由：一个用例忘了把请求换成桩，直接向运行中的执行服务 PUT 了 3 条测试
+        数据，把现场映射覆盖掉了（2026-09-16）。所以这条保护放在**服务端**，
+        任何客户端（含脚本）都绕不过去。
+        """
+        tiny = config_with(entry())
+
+        with self.assertRaises(HTTPException) as caught:
+            self.put_mapping(tiny)
+
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("不足一半", str(caught.exception.detail))
+        self.assertIn("confirm_shrink", str(caught.exception.detail))
+        # 没确认就不得换内存里的配置
+        self.assertEqual(len(self.get_mapping().entries), 128)
+
+        self.put_mapping(tiny, confirm_shrink=True)
+
+        self.assertEqual(len(self.get_mapping().entries), 1)
+
+    def test_small_mapping_is_not_guarded(self) -> None:
+        """本来就只有几条时不套这条保护（单设备台架 / 小规模联调）。"""
+        small = config_with(
+            entry(), entry(signal="steerer.y", label="Y 偏转", pv="BL:STEER:Y", unit="V")
+        )
+        self.runtime.apply(small)
+
+        self.put_mapping(config_with(entry()))
+
+        self.assertEqual(len(self.get_mapping().entries), 1)
+
+    def test_shrink_threshold_matches_the_policy(self) -> None:
+        """阈值本身也钉住：现有条目少于 10 条不套；砍掉一半以上才拦。"""
+        self.assertIsNone(pv_mapping.shrink_warning(128, 65))
+        self.assertIsNotNone(pv_mapping.shrink_warning(128, 60))
+        self.assertIsNone(pv_mapping.shrink_warning(9, 1))
+        self.assertIsNone(pv_mapping.shrink_warning(10, 5))
+        self.assertIsNotNone(pv_mapping.shrink_warning(10, 4))
 
 
 class SettingsPageRoundTripTests(unittest.TestCase):

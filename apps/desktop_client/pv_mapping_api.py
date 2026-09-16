@@ -33,10 +33,13 @@ class PvMappingRequestThread(QThread):
 
     completed = Signal(object)
 
-    def __init__(self, base_url: str, payload: dict | None) -> None:
+    def __init__(
+        self, base_url: str, payload: dict | None, confirm_shrink: bool = False
+    ) -> None:
         super().__init__()
         self._base_url = base_url
         self._payload = payload
+        self._confirm_shrink = bool(confirm_shrink)
         _RUNNING.add(self)
         self.finished.connect(self._forget)
 
@@ -45,6 +48,9 @@ class PvMappingRequestThread(QThread):
 
     def run(self) -> None:
         url = self._base_url.rstrip("/") + PV_MAPPING_PATH
+        if self._payload is not None and self._confirm_shrink:
+            # 条目数骤减时服务端要这个显式确认，否则 400（见执行服务 app.py 的注释）
+            url += "?confirm_shrink=true"
         try:
             if self._payload is None:
                 request = urllib.request.Request(url)

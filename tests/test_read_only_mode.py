@@ -628,7 +628,9 @@ class SettingsPageReadOnlyTests(_ClientCase):
         self.stub(
             settings_module,
             "PvMappingRequestThread",
-            lambda url, payload=None: self.saved.append(payload) or _FakeThread(),
+            lambda url, payload=None, confirm_shrink=False: (
+                self.saved.append(payload) or _FakeThread()
+            ),
         )
         self.page = settings_module.SystemSettingsPage(
             QSettings(
