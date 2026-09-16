@@ -345,7 +345,7 @@ class DeviceSpec:
         self.device = device
         self.namespace = _namespace_of(device)
         self.entries = entries
-        self.label = _common_label(
+        self.label = str(entries[0].get("device_label") or "") or _common_label(
             [str(e.get("label") or e.get("signal") or "") for e in entries]
         )
         self.setpoints: list[dict] = []
@@ -390,8 +390,13 @@ class DeviceSpec:
 def build_device_specs(entries: list[dict]) -> list[DeviceSpec]:
     """把映射条目按设备归并，保持设备首次出现的顺序。"""
     buckets: dict[str, list[dict]] = {}
-    for entry in entries:
-        buckets.setdefault(_device_of(str(entry.get("signal") or "")), []).append(entry)
+    for entry in sorted(entries, key=lambda item: int(item.get("display_order") or 0)):
+        if not entry.get("visible", True):
+            continue
+        device = str(entry.get("device_id") or "") or _device_of(
+            str(entry.get("signal") or "")
+        )
+        buckets.setdefault(device, []).append(entry)
     return [DeviceSpec(device, items) for device, items in buckets.items()]
 
 
@@ -428,10 +433,16 @@ def _all_off_plan(entries: list[dict]) -> list[tuple[str, float]]:
     顺序反了会出现「输出仍开着、而设定值已经退到 0」的中间状态——对高压电源
     来说这是最不该出现的组合。脉冲类信号（启动/停止/复位/灭弧）不参与：
     它们是一次性触发，写 0 没有语义，反而可能触发另一次动作。
+    被 ``rate_signal`` 引用的变化速率同样不参与：它是保护参数，不是关断目标。
     """
+    rate_signals = {
+        str(entry.get("rate_signal") or "")
+        for entry in entries
+        if entry.get("rate_signal")
+    }
     by_role: dict[str, list[dict]] = {}
     for entry in entries:
-        if entry.get("writable"):
+        if entry.get("writable") and str(entry.get("signal") or "") not in rate_signals:
             by_role.setdefault(str(entry.get("role") or ""), []).append(entry)
 
     plan: list[tuple[str, float]] = []
@@ -440,8 +451,9 @@ def _all_off_plan(entries: list[dict]) -> list[tuple[str, float]]:
             if role == "toggle":
                 safe = 0.0
             else:
+                configured = entry.get("safe_value")
                 low = entry.get("min_value")
-                safe = float(low) if low is not None else 0.0
+                safe = float(configured if configured is not None else (low or 0.0))
             plan.append((str(entry["signal"]), safe))
     return plan
 
@@ -509,6 +521,12 @@ class _TopBar(QFrame):
         self.reset_layout_button.setToolTip("清掉卡片的位置记忆，回到默认三列网格")
         self.reset_layout_button.clicked.connect(page.reset_layout)
         layout.addWidget(self.reset_layout_button)
+
+        self.recovery_button = QPushButton("确认重启恢复", objectName="dangerButton")
+        self.recovery_button.setVisible(False)
+        self.recovery_button.setToolTip("服务重启时有未完成任务；现场核对设备后再释放设备组")
+        self.recovery_button.clicked.connect(page.confirm_startup_recovery)
+        layout.addWidget(self.recovery_button)
 
         self.all_off_button = QPushButton("全部关断", objectName="dangerButton")
         self.all_off_button.clicked.connect(page.confirm_all_off)
@@ -765,8 +783,14 @@ class _DraggableFrame(QFrame):
     **为什么不用 `saveGeometry` / `restoreGeometry`**：那两个 API 只对顶层窗口
     有效，对画布里的子控件是空操作（实测 `restoreGeometry` 返回 False 且几何
     一点不变）——上一版就是这样，拖了半天其实从没存下来过。这里改成直接存
-    ``[x, y, w, h]``，并在恢复时用当前画布尺寸校验：放不进画布的存档一律丢弃，
-    否则卡片会被摆到看不见的地方。
+    ``[x, y, w, h]``。
+
+    **越界存档不丢弃，纵向放开、横向锁死**：早期版本恢复时用当前画布尺寸
+    严格校验，放不下的存档一律丢弃——实测把卡片拖到画布边缘外（Qt 允许子控件
+    越出父控件）会存下 ``x=-2`` 这类坐标，下次启动整张卡片被丢弃、回到默认
+    网格，看起来就是"布局没保存"。修复原则：**上下放开**（画布带纵向滚动条，
+    卡片拖到下方靠滚轮查看是正常用法，越界存档恢复时保留 y，不压缩内容）；
+    **左右锁死**（水平越出画布就看不见了，保存与恢复都把 x 钳回画布内）。
     """
 
     HIT_HEADER = 32
@@ -801,6 +825,24 @@ class _DraggableFrame(QFrame):
             self.setCursor(Qt.CursorShape.ArrowCursor)
 
     # ---- 持久化 ----
+    def _clamp_into_canvas(self) -> None:
+        """松手时把卡片横向收进画布内（左右锁死），纵向放开并撑高画布。
+
+        拖动/缩放时 Qt 不阻止子控件越出父控件边界，松手时坐标可能已经出画布
+        （实测存过 ``x=-2``）。越界坐标存进存档后，恢复端只能丢弃或钳制，
+        等于这次拖动白费。规则：**x 钳回画布内**（水平越出就看不见了）；
+        **y 只钳负值**——纵向拖到画布下方是正常用法，画布带滚动条，松手时把
+        画布最低高度撑到能看到这张卡片，否则滚动区域不够、卡片"显示不全"。
+        """
+        canvas = self.parentWidget()
+        if canvas is None:
+            return
+        x = max(0, min(self.x(), max(0, canvas.width() - self.width())))
+        y = max(0, self.y())
+        self.move(x, y)
+        if y + self.height() > canvas.height():
+            canvas.setMinimumHeight(max(canvas.minimumHeight(), y + self.height() + CANVAS_MARGIN))
+
     def save_geometry(self) -> None:
         settings = layout_settings()
         settings.setValue(
@@ -809,10 +851,14 @@ class _DraggableFrame(QFrame):
         )
 
     def restore_geometry(self, canvas: QWidget | None = None) -> bool:
-        """按存档恢复位置，返回是否真的恢复了（False 表示沿用默认网格位置）。
+        """按存档恢复位置，返回是否真的恢复了（False 表示没有可用存档）。
 
-        存档只在**完整落在当前画布内**时才用：画布大小会随窗口变，跨尺寸沿用
-        旧坐标会把卡片摆到画布外——看起来就是"卡片不见了"。
+        规则与拖动一致：**x 钳回画布内（左右锁死）**，**y 保留越界值（纵向
+        放开，画布滚动查看）**。早期版本对"放不下"的存档直接丢弃——而卡片
+        构建可能发生在画布布局完成前（canvas 还是初始 862x640），"放不下"
+        的判定会把用户排好的卡片整张丢掉，表现为每次打开 exe 布局都回到
+        默认；改成钳制后又把 y 压进画布高度，内容挤成一屏还撑不开滚动区域。
+        现在只锁横向，纵向交给滚动条。
         """
         settings = layout_settings()
         value = settings.value(f"{LAYOUT_SETTINGS_PREFIX}{self._key}/rect")
@@ -824,10 +870,10 @@ class _DraggableFrame(QFrame):
             canvas = self.parentWidget()
         if canvas is None:
             return False
-        if x < 0 or y < 0 or width < self.MIN_W or height < self.MIN_H:
-            return False
-        if x + width > canvas.width() or y + height > canvas.height():
-            return False
+        width = max(self.MIN_W, width)
+        height = max(self.MIN_H, height)
+        x = max(0, min(x, max(0, canvas.width() - width)))
+        y = max(0, y)
         self.setGeometry(x, y, width, height)
         return True
 
@@ -857,7 +903,14 @@ class _DraggableFrame(QFrame):
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         pos = event.position().toPoint()
         if self._drag_offset is not None:
-            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            target = event.globalPosition().toPoint() - self._drag_offset
+            # 拖动中实时锁死左右边界，纵向放开（下方越界靠滚动查看）
+            canvas = self.parentWidget()
+            if canvas is not None:
+                target.setX(
+                    max(0, min(target.x(), max(0, canvas.width() - self.width())))
+                )
+            self.move(target)
         elif self._resize_origin is not None and self._resize_geom is not None:
             delta = event.globalPosition().toPoint() - self._resize_origin
             new_w = max(self.MIN_W, self._resize_geom.width() + delta.x())
@@ -878,6 +931,7 @@ class _DraggableFrame(QFrame):
         self._drag_offset = None
         self._resize_origin = None
         self._resize_geom = None
+        self._clamp_into_canvas()
         self.save_geometry()
         super().mouseReleaseEvent(event)
 
@@ -1675,15 +1729,16 @@ class ManualControlPage(QWidget):
         self._entries: list[dict] = []
         self._read_in_flight = False
         self._pending: tuple[_DeviceRow, str, float] | None = None
-        self._all_off_queue: list[tuple[str, float]] = []
         self._all_off_active = False
-        self._all_off_rejected = 0
         self._mapping_loaded = False
+        self._recovery_loaded = False
         # 客户端滚动缓冲：服务端没有时序库，趋势只能自己留（见 trend_buffer 说明）
         self.trend = TrendBuffer()
         self.trend_panel: _TrendPanel | None = None
         # 顶栏变化量要跨快照比较，记一下最近一次读数
         self._topbar_signals: list[dict] = []
+        # 卡片布局是否已按真实画布尺寸恢复过（防止 hidden 构建时尺寸误判）
+        self._layout_restored = False
 
         layout = page_layout(self)
         layout.addWidget(
@@ -1706,11 +1761,14 @@ class ManualControlPage(QWidget):
         # 自由画布：卡片可拖拽移动、右下角 resize，位置持久化
         self._canvas = QWidget(objectName="manualCanvas")
         self._canvas.setAutoFillBackground(False)
-        self._canvas.setMinimumSize(MIN_HOLDER_WIDTH + 2 * CANVAS_MARGIN, 640)
+        self._canvas.setMinimumSize(
+            2 * COLUMN_MIN_WIDTH + COLUMN_SPACING + 2 * CANVAS_MARGIN, 640
+        )
         self.scroll.setWidget(self._canvas)
         self._frames: list[_DraggableFrame] = []
         self._grid_x = 0
         self._grid_y = 0
+        self._layout_columns = COLUMN_COUNT
         self._build_columns()
 
         self._poll_timer = QTimer(self)
@@ -1814,6 +1872,45 @@ class ManualControlPage(QWidget):
             self.all_off_button.setEnabled(writable > 0)
         self._poll()
 
+    def _load_startup_recoveries(self) -> None:
+        self._recovery_request = instrument_api.request_recovery_items()
+        self._recovery_request.completed.connect(self._on_startup_recoveries)
+
+    def _on_startup_recoveries(self, payload: dict) -> None:
+        if not payload.get("ok"):
+            self._recovery_loaded = False
+            return
+        items = list((payload.get("payload") or {}).get("items") or [])
+        self.topbar.recovery_button.setVisible(bool(items))
+        if items:
+            groups = sorted({group for item in items for group in item.get("groups", [])})
+            self.topbar.set_message(
+                f"发现 {len(items)} 个重启恢复项，设备组仍锁定：{'、'.join(groups)}。"
+                "请先核对设备实际状态。",
+                "error",
+            )
+
+    def confirm_startup_recovery(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "确认设备状态",
+            "请确认已在现场核对所有重启遗留任务涉及的设备实际状态。\n"
+            "确认后将释放这些设备组，允许新的手动、扫谱和调束操作。",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.topbar.recovery_button.setEnabled(False)
+        request = instrument_api.request_acknowledge_all_recoveries()
+        request.completed.connect(self._on_startup_recovery_acknowledged)
+
+    def _on_startup_recovery_acknowledged(self, payload: dict) -> None:
+        self.topbar.recovery_button.setEnabled(True)
+        if not payload.get("ok"):
+            self.topbar.set_message(f"恢复确认失败：{payload.get('message', '')}", "error")
+            return
+        self.topbar.recovery_button.setVisible(False)
+        self.topbar.set_message("重启恢复项已确认，相关设备组已释放。", "good")
+
     def _lock_read_only_controls(self) -> None:
         """把本页所有会写设备的控件压住，并在成组卡片上说明原因。"""
         for row in self._rows:
@@ -1825,8 +1922,23 @@ class ManualControlPage(QWidget):
 
     def _build_rows(self) -> None:
         self._clear_body()
+        # 页面可见时构建，restore 用的就是真实画布尺寸，可信；hidden 构建则
+        # 留给 showEvent 在画布布局完成后统一恢复。
+        self._layout_restored = self.isVisible()
+        self._layout_columns = (
+            2 if self.isVisible() and self.scroll.viewport().width() < MIN_HOLDER_WIDTH else 3
+        )
+        self._canvas.setMinimumWidth(
+            self._layout_columns * COLUMN_MIN_WIDTH
+            + (self._layout_columns - 1) * COLUMN_SPACING
+            + 2 * CANVAS_MARGIN
+        )
         groups: dict[str, list[dict]] = {}
-        for entry in self._entries:
+        for entry in sorted(
+            self._entries, key=lambda item: int(item.get("display_order") or 0)
+        ):
+            if not entry.get("visible", True):
+                continue
             groups.setdefault(str(entry.get("group") or "未分组"), []).append(entry)
 
         built = [(name, build_device_specs(entries)) for name, entries in groups.items()]
@@ -1837,6 +1949,17 @@ class ManualControlPage(QWidget):
         self._add_trend_card()
 
         assignment = assign_columns(built)
+        if self._layout_columns == 2:
+            heights = self._column_y[:2]
+            assignment = {}
+            for name, specs in sorted(
+                built,
+                key=lambda item: sum(spec.row_height() for spec in item[1]),
+                reverse=True,
+            ):
+                column = 0 if heights[0] <= heights[1] else 1
+                assignment[name] = column
+                heights[column] += 52 + sum(spec.row_height() for spec in specs) + CARD_GAP
         for name, specs in built:
             if all(signal in consumed for signal in (s for spec in specs for s in spec.signals())):
                 continue  # 整组都在顶栏大字里了，不再占画布
@@ -1959,21 +2082,27 @@ class ManualControlPage(QWidget):
         （这一处漏掉过一次，结果是除趋势卡片外所有设备卡片都"消失"了）。
         """
         frame = _DraggableFrame(panel, key=key, parent=self._canvas)
-        column = max(0, min(COLUMN_COUNT - 1, column))
+        viewport_width = self.scroll.viewport().width()
+        active_columns = self._layout_columns
+        column = max(0, min(active_columns - 1, column))
         frame.setProperty("layoutColumn", column)
         available = max(
-            MIN_HOLDER_WIDTH + 2 * CANVAS_MARGIN,
-            self.scroll.viewport().width(),
+            active_columns * COLUMN_MIN_WIDTH
+            + (active_columns - 1) * COLUMN_SPACING
+            + 2 * CANVAS_MARGIN,
+            viewport_width,
         )
         column_width = max(
             COLUMN_MIN_WIDTH,
-            (available - 2 * CANVAS_MARGIN - (COLUMN_COUNT - 1) * COLUMN_SPACING)
-            // COLUMN_COUNT,
+            (available - 2 * CANVAS_MARGIN - (active_columns - 1) * COLUMN_SPACING)
+            // active_columns,
         )
         grid_x = CANVAS_MARGIN + column * (column_width + COLUMN_SPACING)
         frame.setGeometry(grid_x, self._column_y[column], column_width, height)
-        # 存档只在放得进当前画布时才生效；否则沿用上面的默认网格位置
-        frame.restore_geometry(self._canvas)
+        # 存档放得进画布就恢复；画布未布局（hidden 构建）时即使恢复成功位置
+        # 也不准，标记留给 showEvent 用真实尺寸再恢复一次。
+        if frame.restore_geometry(self._canvas) and self.isVisible():
+            self._layout_restored = True
         frame.show()
         frame.raise_()
         self._frames.append(frame)
@@ -2040,9 +2169,6 @@ class ManualControlPage(QWidget):
             "warn",
         )
         thread.completed.connect(self._on_write_result)
-        # 队列推进挂 finished 而不是 completed：completed 触发时写线程仍在运行，
-        # 此刻发起下一次写入会被串行保护挡掉。finished 在 completed 之后发出。
-        thread.finished.connect(self._pump_all_off)
 
     def _on_write_result(self, payload: dict) -> None:
         pending = self._pending
@@ -2056,7 +2182,6 @@ class ManualControlPage(QWidget):
         if not payload.get("ok"):
             reason = f"请求失败：{payload.get('message', '')}"
             row.mark_rejected(reason)
-            self._count_all_off_rejection()
             self.topbar.set_message(f"{quantity} · {reason}", "error")
             return
         result = payload.get("payload") or {}
@@ -2078,13 +2203,7 @@ class ManualControlPage(QWidget):
         else:
             reason = f"被拒绝：{result.get('reason', '未知原因')}"
             row.mark_rejected(reason)
-            self._count_all_off_rejection()
             self.topbar.set_message(f"{quantity} · {reason}", "error")
-
-    def _count_all_off_rejection(self) -> None:
-        """批量关断途中的被拒项要计数——「已下发完毕」不等于「都到位了」。"""
-        if self._all_off_active:
-            self._all_off_rejected += 1
 
     # ------------------------------------------------------------------
     # 全部关断
@@ -2107,69 +2226,78 @@ class ManualControlPage(QWidget):
         self.start_all_off()
 
     def start_all_off(self) -> None:
-        queue = _all_off_plan(self._entries)
-        if not queue:
+        plan = _all_off_plan(self._entries)
+        if not plan:
             return
-        self._all_off_queue = queue
+        writes = [
+            {"signal": signal, "value": value, "ramp": True}
+            for signal, value in plan
+        ]
+        thread = instrument_api.request_batch_write(
+            writes, note="全部关断：先断输出，再退到各路安全值", atomic=True
+        )
+        if thread is None:
+            self.topbar.set_message("上一次写入还没结束，请稍候再试。", "warn")
+            return
         self._all_off_active = True
-        self._all_off_rejected = 0
         self.all_off_button.setEnabled(False)
-        self.topbar.set_message(f"全部关断：共 {len(queue)} 项，逐条下发中…", "warn")
-        self._pump_all_off()
+        self.topbar.set_message(f"全部关断：共 {len(plan)} 项，整批校验并下发中…", "warn")
+        thread.completed.connect(self._on_all_off_result)
 
-    def _pump_all_off(self) -> None:
-        """逐条下发全部关断队列（写入串行，必须一条完成再发下一条）。
-
-        这个函数也挂在**每一次**普通写入的 ``finished`` 上（用来推进队列），
-        所以没有批量在跑时必须立刻返回——否则会把刚显示出来的下发结果覆盖成
-        「全部关断已下发完毕」。
-        """
-        while self._all_off_queue:
-            signal, value = self._all_off_queue.pop(0)
-            row = self._rows_by_signal.get(signal)
-            if row is None:
-                continue
-            thread = instrument_api.request_write(signal, value)
-            if thread is None:
-                # 上一次写入尚未收尾，放回队首等下一次 finished 再试
-                self._all_off_queue.insert(0, (signal, value))
-                return
-            self._pending = (row, signal, value)
-            thread.completed.connect(self._on_write_result)
-            thread.finished.connect(self._pump_all_off)
-            return
-
-        if not self._all_off_active:
-            return
+    def _on_all_off_result(self, payload: dict) -> None:
         self._all_off_active = False
         self.all_off_button.setEnabled(True)
-        if self._all_off_rejected:
-            self.topbar.set_message(
-                f"全部关断下发完毕，但 {self._all_off_rejected} 项被拒绝——"
-                "设备未全部回到安全值，请逐条核对。",
-                "error",
-            )
-        else:
-            self.topbar.set_message("全部关断已下发完毕。", "good")
+        if not payload.get("ok"):
+            self.topbar.set_message(f"全部关断未执行：{payload.get('message', '')}", "error")
+            return
+        result = payload.get("payload") or {}
+        state = "good" if result.get("ok") else "error"
+        self.topbar.set_message(result.get("message") or "全部关断完成。", state)
 
     # ------------------------------------------------------------------
     # 主窗口协议
     # ------------------------------------------------------------------
     def is_operation_active(self) -> bool:
         """全部关断序列进行中即视为有任务，退出时需确认。"""
-        return bool(self._all_off_queue) or instrument_api.is_write_busy()
+        return self._all_off_active or instrument_api.is_write_busy()
 
     def safe_stop(self) -> None:
         """退出前停止继续下发（已下发的那一条无法撤回，如实保留）。"""
-        self._all_off_queue.clear()
+        if self._all_off_active:
+            self.topbar.set_message("全部关断正在服务端执行，不能从客户端中途拆分取消。", "warn")
 
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
+        desired_columns = 3 if self.scroll.viewport().width() >= MIN_HOLDER_WIDTH else 2
+        if self._entries and desired_columns != self._layout_columns:
+            self._build_rows()
+        if self._entries and not self._layout_restored:
+            self._restore_saved_layout()
         self._poll_timer.start()
         self._poll()
+        if not self._recovery_loaded:
+            self._recovery_loaded = True
+            self._load_startup_recoveries()
+
+    def _restore_saved_layout(self) -> None:
+        """页面显示、画布尺寸就绪后统一恢复卡片布局。
+
+        卡片常在页面显示前就构建完成（映射请求在 __init__ 发出），那时画布
+        还是初始尺寸，恢复会被误判为"放不下"或钳到错误位置。等真正显示、
+        画布按窗口尺寸布局好后再恢复一次，用同一份存档、真实尺寸重新钳制。
+        """
+        for frame in self._frames:
+            frame.restore_geometry(self._canvas)
+        # 恢复出的卡片可能比默认网格更靠下（纵向越界存档），把画布最低高度
+        # 撑到能看到全部内容，否则滚动区域不够、底部卡片"显示不全"。
+        bottom = max(
+            (frame.y() + frame.height() for frame in self._frames), default=0
+        )
+        self._canvas.setMinimumHeight(max(640, bottom + CANVAS_MARGIN))
+        self._layout_restored = True
 
     def hideEvent(self, event) -> None:  # noqa: N802
         self._poll_timer.stop()

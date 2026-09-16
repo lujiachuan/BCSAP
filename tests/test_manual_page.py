@@ -1,6 +1,6 @@
 """手动控制测试页：三列分列、设备折行、滚轮与步进档、开关按钮同步、全部关断。
 
-这些用例不连执行服务：页面装配与队列逻辑都是纯本地的，构造行控件用
+这些用例不连执行服务：页面装配与批量关断逻辑都是纯本地的，构造行控件用
 直接的配置字典，避免测试依赖网络。
 """
 
@@ -342,6 +342,29 @@ class DeviceMergeTests(unittest.TestCase):
 
         self.assertEqual([spec.device for spec in specs], ["hv.b", "hv.a"])
 
+    def test_explicit_device_id_groups_signals_without_name_convention(self) -> None:
+        specs = manual.build_device_specs(
+            [
+                entry("custom.set", device_id="supply-1", device_label="自定义电源"),
+                entry("other.read", device_id="supply-1", device_label="自定义电源"),
+            ]
+        )
+
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0].device, "supply-1")
+        self.assertEqual(specs[0].label, "自定义电源")
+
+    def test_hidden_entries_are_not_rendered_and_order_is_configurable(self) -> None:
+        specs = manual.build_device_specs(
+            [
+                entry("dev.b.read", display_order=20),
+                entry("dev.hidden.read", visible=False, display_order=0),
+                entry("dev.a.read", display_order=10),
+            ]
+        )
+
+        self.assertEqual([spec.device for spec in specs], ["dev.a", "dev.b"])
+
     def test_writable_entry_with_unknown_role_is_presented_read_only(self) -> None:
         spec = manual.build_device_specs([entry("x.y", writable=True, role="")])[0]
 
@@ -540,6 +563,13 @@ class AllOffPlanTests(unittest.TestCase):
 
         self.assertEqual(plan, [("s1", 0.0)])
 
+    def test_setpoint_prefers_explicit_safe_value(self) -> None:
+        plan = manual._all_off_plan(
+            [entry("s1", writable=True, role="setpoint", min_value=0.0, safe_value=12.0)]
+        )
+
+        self.assertEqual(plan, [("s1", 12.0)])
+
     def test_pulse_signals_are_excluded(self) -> None:
         """脉冲写 0 没有语义，还可能触发另一次动作，必须排除。"""
         plan = manual._all_off_plan(
@@ -550,6 +580,25 @@ class AllOffPlanTests(unittest.TestCase):
         )
 
         self.assertEqual([signal for signal, _ in plan], ["t1"])
+
+    def test_rate_protection_signal_is_not_zeroed_by_all_off(self) -> None:
+        plan = manual._all_off_plan(
+            [
+                entry(
+                    "magnet.m1.current_setpoint",
+                    writable=True,
+                    role="setpoint",
+                    rate_signal="magnet.m1.current_rate_setpoint",
+                ),
+                entry(
+                    "magnet.m1.current_rate_setpoint",
+                    writable=True,
+                    role="setpoint",
+                ),
+            ]
+        )
+
+        self.assertEqual([signal for signal, _ in plan], ["magnet.m1.current_setpoint"])
 
     def test_read_only_signals_are_excluded(self) -> None:
         self.assertEqual(manual._all_off_plan([entry("r1")]), [])
@@ -1057,48 +1106,45 @@ class PageTests(unittest.TestCase):
         self.assertIn("被拒绝：超过上限 5100 V", self.page.status_label.text())
         self.assertEqual(row.readback_label.property("state"), "error")
 
-    def test_operation_active_and_safe_stop_cover_all_off_queue(self) -> None:
+    def test_operation_active_covers_server_side_all_off(self) -> None:
         self.assertFalse(self.page.is_operation_active())
 
-        self.page._all_off_queue = [("g", 0.0)]
+        self.page._all_off_active = True
         self.assertTrue(self.page.is_operation_active())
 
         self.page.safe_stop()
 
-        self.assertEqual(self.page._all_off_queue, [])
-        self.assertFalse(self.page.is_operation_active())
+        self.assertTrue(self.page.is_operation_active())
+        self.assertIn("服务端执行", self.page.status_label.text())
 
-    def test_normal_write_finish_does_not_clobber_the_message(self) -> None:
-        """普通写入的收尾也会走 _pump_all_off，没有批量在跑时它必须什么都不做，
-        否则刚显示出来的「已下发 …」会被覆盖成「全部关断已下发完毕」。"""
-        self.page._on_mapping({"ok": True, "config": {"entries": dw_entries()}})
-        row = self.page._rows[0]
-        self.page._pending = (row, DW_SETPOINT, 2000.0)
-        self.page._on_write_result(
-            {"ok": True, "payload": {"accepted": True, "applied": 2000.0}}
-        )
-
-        self.page._pump_all_off()
-
-        self.assertIn("已下发 2000 V", self.page.status_label.text())
-        self.assertFalse(self.page._all_off_active)
-
-    def test_all_off_reports_how_many_items_were_rejected(self) -> None:
-        """「已下发完毕」不等于「都到位了」：被拒项必须计入结果。"""
-        self.page._on_mapping({"ok": True, "config": {"entries": dw_entries()}})
-        row = self.page._rows[0]
+    def test_all_off_reports_server_batch_failure(self) -> None:
         self.page._all_off_active = True
-        self.page._all_off_rejected = 0
-        self.page._pending = (row, DW_SETPOINT, 0.0)
-        self.page._on_write_result(
-            {"ok": True, "payload": {"accepted": False, "reason": "设备不在远程"}}
+        self.page._on_all_off_result(
+            {
+                "ok": True,
+                "payload": {"ok": False, "message": "整批未下发：设备不在远程"},
+            }
         )
 
-        self.page._pump_all_off()
-
-        self.assertEqual(self.page._all_off_rejected, 1)
-        self.assertIn("1 项被拒绝", self.page.status_label.text())
+        self.assertIn("整批未下发", self.page.status_label.text())
         self.assertTrue(self.page.all_off_button.isEnabled())
+
+    def test_all_off_is_sent_as_one_atomic_batch(self) -> None:
+        self.page._on_mapping({"ok": True, "config": {"entries": dw_entries()}})
+        sent: dict = {}
+
+        def fake(writes, *, note="", atomic=True, base_url=None):
+            sent.update({"writes": writes, "note": note, "atomic": atomic})
+            return _GroupPanelThread()
+
+        with mock.patch.object(instrument_api, "request_batch_write", fake):
+            self.page.start_all_off()
+
+        self.assertTrue(sent["atomic"])
+        self.assertEqual(
+            [item["signal"] for item in sent["writes"]],
+            [DW_SWITCH, DW_SETPOINT],
+        )
 
 
 class SeriesHelperTests(unittest.TestCase):
@@ -1495,25 +1541,77 @@ class LayoutPersistenceTests(unittest.TestCase):
             (300, 120, 420, 200),
         )
 
-    def test_a_rect_outside_the_canvas_is_ignored(self) -> None:
-        """跨窗口尺寸沿用旧坐标会把卡片摆到看不见的地方——必须丢弃。"""
+    def test_a_rect_outside_the_canvas_is_clamped_back_in(self) -> None:
+        """跨窗口尺寸沿用旧坐标会被钳回画布内，而不是摆到看不见的地方。"""
         self.settings.setValue(
             f"{manual.LAYOUT_SETTINGS_PREFIX}测试卡片/rect", [1200, 10, 900, 400]
         )
 
         frame = self.make_frame()
 
-        self.assertNotEqual(frame.x(), 1200)
+        # 画布 1400 宽、卡片 900 宽 → x 钳到右缘 500；y 与尺寸不变
+        self.assertEqual(
+            (frame.x(), frame.y(), frame.width(), frame.height()),
+            (500, 10, 900, 400),
+        )
 
-    def test_a_negative_or_tiny_rect_is_ignored(self) -> None:
-        for rect in ([-50, 10, 420, 200], [10, -50, 420, 200], [10, 10, 100, 200],
-                     [10, 10, 420, 50]):
+    def test_a_negative_or_tiny_rect_is_clamped(self) -> None:
+        """负坐标钳到 0，小于最小尺寸的卡片放大到最小尺寸。"""
+        min_w = manual._DraggableFrame.MIN_W
+        min_h = manual._DraggableFrame.MIN_H
+        cases = (
+            ([-50, 10, 420, 200], (0, 10, 420, 200)),
+            ([10, -50, 420, 200], (10, 0, 420, 200)),
+            ([10, 10, 100, 200], (10, 10, min_w, 200)),
+            ([10, 10, 420, 50], (10, 10, 420, min_h)),
+        )
+        for rect, expected in cases:
             with self.subTest(rect=rect):
                 self.settings.setValue(
                     f"{manual.LAYOUT_SETTINGS_PREFIX}测试卡片/rect", rect
                 )
                 frame = self.make_frame()
-                self.assertNotEqual((frame.x(), frame.y()), (rect[0], rect[1]))
+                self.assertEqual(
+                    (frame.x(), frame.y(), frame.width(), frame.height()),
+                    expected,
+                )
+
+    def test_vertical_overflow_is_kept_horizontal_is_clamped(self) -> None:
+        """纵向越界存档保留 y（画布滚动查看），横向越界钳回画布内。"""
+        self.settings.setValue(
+            f"{manual.LAYOUT_SETTINGS_PREFIX}测试卡片/rect", [1200, 800, 460, 200]
+        )
+        self.page._canvas.resize(862, 640)
+        frame = self.make_frame()
+        # x 钳回画布内（862-460=402）；y=800 超出画布高度但保留，靠滚动条查看
+        self.assertEqual((frame.x(), frame.y()), (402, 800))
+        # 画布最低高度被撑到能看到这张卡片
+        self.assertGreaterEqual(
+            self.page._canvas.minimumHeight(), 800 + 200 + manual.CANVAS_MARGIN
+        )
+
+    def test_saved_layout_is_restored_after_canvas_is_laid_out(self) -> None:
+        """卡片在页面显示前构建时，恢复被钳到初始画布内；显示后统一恢复到位。
+
+        真实时序：映射请求在 __init__ 发出，用户停留在初始化页时卡片已构建，
+        那时 canvas 还是初始尺寸（862x640），存档 (700,700) 放不下会被钳制。
+        页面显示、画布按窗口尺寸布局后再恢复一次，位置就对了。
+        """
+        # 存档在真实画布（1400x900）内放得下，但在 hidden 初始画布（862x640）放不下
+        self.settings.setValue(
+            f"{manual.LAYOUT_SETTINGS_PREFIX}测试卡片/rect", [700, 700, 460, 200]
+        )
+        # 不 resize canvas：保持 hidden 构建时的初始尺寸
+        self.page._canvas.resize(862, 640)
+        frame = self.make_frame()
+        # 横向钳回画布内（左右锁死）；纵向保留越界值（画布滚动查看）
+        self.assertEqual((frame.x(), frame.y()), (862 - 460, 700))
+
+        # 页面显示、画布布局完成 → 统一恢复
+        self.page._canvas.resize(1400, 900)
+        self.page._restore_saved_layout()
+
+        self.assertEqual((frame.x(), frame.y()), (700, 700))
 
     def test_restore_reports_whether_it_applied(self) -> None:
         frame = self.make_frame()

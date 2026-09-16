@@ -23,6 +23,8 @@ LIGHT = {
     "surfacePanel": "#ffffff",
     "panelBg": "#ffffff",
     "panelBorder": "#d7dee7",
+    # 手动控制页卡片专用边框：比 panelBorder 深，卡片边界才看得出
+    "manualCardBorder": "#b3c1ce",
     "tableHeaderBg": "#f6f8fa",
     "tableHeaderText": "#5e6f80",
     "gridColor": "#e5ebef",
@@ -124,6 +126,8 @@ DARK = {
     "surfacePanel": "#1d2733",
     "panelBg": "#1d2733",
     "panelBorder": "#2e3c4b",
+    # 手动控制页卡片专用边框：比 panelBorder 亮一档，深色下也看得出边界
+    "manualCardBorder": "#43566b",
     "tableHeaderBg": "#212d3a",
     "tableHeaderText": "#9db0c0",
     "gridColor": "#2b3947",

@@ -86,9 +86,8 @@ QFrame#panel { background: $surfacePanel; border: 1px solid $panelBorder;
                border-radius: ${radiusPanel}px; }
 /* 手控页是高密度仪器界面：更小圆角、更轻边界，浅深主题使用同一组令牌。 */
 QFrame#manualTopbar, QFrame#manualGroup {
-    background: $surfacePanel; border: 1px solid $panelBorder;
+    background: $surfacePanel; border: 2px solid $manualCardBorder;
     border-radius: ${radiusControl}px; }
-QFrame#manualGroup[hazard="true"] { border-left: 2px solid $statusWarn; }
 QFrame#manualFrame, QWidget#manualCanvas { background: transparent; border: none; }
 QFrame#noticePanel { background: $noticeBg; border: 1px solid $panelBorder;
                      border-radius: ${radiusCard}px; }
