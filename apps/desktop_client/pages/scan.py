@@ -1149,8 +1149,10 @@ class ScanPage(QWidget):
         self._export_fallback_used = False
         self._export_format = fmt
         self._set_scan_state("正在读取设备快照，随后请选择保存位置…", "warn")
-        thread = instrument_api.request_read(signals=list(EXPORT_SIGNALS))
-        thread.completed.connect(self._on_export_snapshot)
+        instrument_api.request_read(
+            signals=list(EXPORT_SIGNALS),
+            on_completed=self._on_export_snapshot,
+        )
 
     def _on_export_snapshot(self, payload: dict) -> None:
         """快照到手（或读失败）后选路径落盘。
@@ -1173,9 +1175,10 @@ class ScanPage(QWidget):
             return
         self._export_fallback_used = True
         self._set_scan_state(f"按信号读取快照失败（{reason}），正在回退为全量读取…", "warn")
-        retry = instrument_api.request_read()
-        retry.completed.connect(
-            lambda payload, why=reason: self._on_export_fallback(payload, why)
+        instrument_api.request_read(
+            on_completed=(
+                lambda payload, why=reason: self._on_export_fallback(payload, why)
+            )
         )
 
     def _on_export_fallback(self, payload: dict, reason: str) -> None:

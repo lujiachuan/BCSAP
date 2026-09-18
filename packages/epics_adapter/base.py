@@ -17,6 +17,7 @@ class Reading:
     received_time: datetime
     severity: int = 0
     connected: bool = True
+    detail: str | None = None
 
 
 class EpicsGateway(Protocol):
@@ -29,4 +30,3 @@ class EpicsGateway(Protocol):
     def write(self, signal: str, value: float, command_id: UUID) -> Reading: ...
 
     def snapshot(self, signals: list[str]) -> dict[str, Reading]: ...
-

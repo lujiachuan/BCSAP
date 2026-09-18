@@ -24,6 +24,71 @@ from apps.desktop_client.pages import manual
 from apps.desktop_client.pages.registry import page_specs
 
 
+class RequestReadLifecycleTests(unittest.TestCase):
+    """快读请求必须先绑回调再启动，避免本机快速响应丢完成信号。"""
+
+    def test_completion_callback_is_connected_before_thread_start(self) -> None:
+        events: list[str] = []
+
+        class FakeSignal:
+            def connect(self, _callback) -> None:
+                events.append("connect")
+
+        class FakeReader:
+            def __init__(self, *_args, **_kwargs) -> None:
+                self.completed = FakeSignal()
+
+            def start(self) -> None:
+                events.append("start")
+
+        with mock.patch.object(instrument_api, "SignalReadThread", FakeReader):
+            instrument_api.request_read(on_completed=lambda _payload: None)
+
+        self.assertEqual(events, ["connect", "start"])
+
+
+class ManualPollingLifecycleTests(unittest.TestCase):
+    """手动页能从遗留的“在飞”假状态自行恢复。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        with mock.patch.object(manual.ManualControlPage, "_load_mapping"):
+            self.page = manual.ManualControlPage()
+        self.page._mapping_loaded = True
+
+    def tearDown(self) -> None:
+        self.page.deleteLater()
+
+    def test_stopped_reader_does_not_block_the_next_poll(self) -> None:
+        class StoppedReader:
+            @staticmethod
+            def isRunning() -> bool:
+                return False
+
+        class RunningReader:
+            @staticmethod
+            def isRunning() -> bool:
+                return True
+
+        calls: list[dict] = []
+
+        def fake_read(**kwargs):
+            calls.append(kwargs)
+            return RunningReader()
+
+        self.page._read_in_flight = True
+        self.page._reader = StoppedReader()
+        with mock.patch.object(instrument_api, "request_read", fake_read):
+            self.page._poll()
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["on_completed"], self.page._on_snapshot)
+        self.assertTrue(self.page._read_in_flight)
+
+
 class _GroupPanelSignal:
     """成组下发请求线程的 completed 信号替身。"""
 
@@ -204,6 +269,43 @@ def wheel_delta(setpoint: dict, level: int, start: float) -> float:
     before = spin.value()
     wheel(spin, 1)
     return spin.value() - before
+
+
+class SpinButtonSymbolsTests(unittest.TestCase):
+    """行内/成组设定框一律不带上下箭头：滚轮与方向键已能调值。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_wheel_spin_box_has_no_arrow_buttons(self) -> None:
+        spin = manual._WheelSpinBox()
+        self.assertEqual(
+            spin.buttonSymbols(),
+            manual.QAbstractSpinBox.ButtonSymbols.NoButtons,
+        )
+
+    def test_setpoint_editor_spin_has_no_arrow_buttons(self) -> None:
+        editor = manual._SetpointEditor(
+            {"signal": "x.a", "label": "A 电压设定", "min_value": 0.0,
+             "max_value": 5000.0, "unit": "V"},
+            lambda value: None,
+        )
+        self.assertEqual(
+            editor.spin.buttonSymbols(),
+            manual.QAbstractSpinBox.ButtonSymbols.NoButtons,
+        )
+
+    def test_magnet_group_spins_have_no_arrow_buttons(self) -> None:
+        panel = manual._MagnetGroupPanel(
+            None, [("组1", ["m1", "m2"])], []  # type: ignore[arg-type]
+        )
+        for spin in (panel.current_spin, panel.rate_spin):
+            with self.subTest(spin=spin):
+                self.assertEqual(
+                    spin.buttonSymbols(),
+                    manual.QAbstractSpinBox.ButtonSymbols.NoButtons,
+                )
 
 
 class StepLevelRatioTests(unittest.TestCase):
@@ -534,6 +636,12 @@ class SlotLabelTests(unittest.TestCase):
     def test_row_budget_fits_the_real_window(self) -> None:
         """客户端窗口 1745 宽：减侧栏、页面边距与滚动条后，三列必须放得下。"""
         available = 1745 - 168 - 36 - 14
+
+        self.assertLessEqual(manual.MIN_HOLDER_WIDTH, available)
+
+    def test_row_budget_fits_the_smallest_floor_screen(self) -> None:
+        """现场最小屏 1600x1000（可用约 1346px）下三列也无需横向滚动。"""
+        available = 1600 - 168 - 36 - 14 - 36  # 侧栏 + 页边距 + 滚动条 + 富余
 
         self.assertLessEqual(manual.MIN_HOLDER_WIDTH, available)
 
@@ -1581,14 +1689,31 @@ class LayoutPersistenceTests(unittest.TestCase):
         self.settings.setValue(
             f"{manual.LAYOUT_SETTINGS_PREFIX}测试卡片/rect", [1200, 800, 460, 200]
         )
-        self.page._canvas.resize(862, 640)
+        canvas_width = (2 * manual.COLUMN_MIN_WIDTH + manual.COLUMN_SPACING
+               + 2 * manual.CANVAS_MARGIN)
+        self.page._canvas.resize(canvas_width, 640)
         frame = self.make_frame()
-        # x 钳回画布内（862-460=402）；y=800 超出画布高度但保留，靠滚动条查看
-        self.assertEqual((frame.x(), frame.y()), (402, 800))
+        # x 钳回画布内；y=800 超出画布高度但保留，靠滚动条查看
+        self.assertEqual((frame.x(), frame.y()), (canvas_width - 460, 800))
         # 画布最低高度被撑到能看到这张卡片
         self.assertGreaterEqual(
             self.page._canvas.minimumHeight(), 800 + 200 + manual.CANVAS_MARGIN
         )
+
+    def test_restore_keeps_content_minimum_width(self) -> None:
+        """旧存档宽度低于内容最小需求（如设备名列加宽后）时，恢复不能裁掉右侧内容。"""
+        panel = manual._GroupPanel("测试卡片")
+        wide = QLabel("宽内容")
+        wide.setFixedWidth(500)
+        panel.body.addWidget(wide)
+        frame = self.page._place_panel(panel, key="测试卡片", column=0, height=150)
+        # 存档宽度 400 远小于内容需求
+        self.settings.setValue(
+            f"{manual.LAYOUT_SETTINGS_PREFIX}测试卡片/rect", [100, 100, 400, 200]
+        )
+        ok = frame.restore_geometry(self.page._canvas)
+        self.assertTrue(ok)
+        self.assertGreaterEqual(frame.width(), panel.minimumSizeHint().width())
 
     def test_saved_layout_is_restored_after_canvas_is_laid_out(self) -> None:
         """卡片在页面显示前构建时，恢复被钳到初始画布内；显示后统一恢复到位。
@@ -1601,11 +1726,13 @@ class LayoutPersistenceTests(unittest.TestCase):
         self.settings.setValue(
             f"{manual.LAYOUT_SETTINGS_PREFIX}测试卡片/rect", [700, 700, 460, 200]
         )
-        # 不 resize canvas：保持 hidden 构建时的初始尺寸
-        self.page._canvas.resize(862, 640)
+        # 不 resize canvas：保持 hidden 构建时的初始尺寸（随 COLUMN_MIN_WIDTH 变化）
+        canvas_width = (2 * manual.COLUMN_MIN_WIDTH + manual.COLUMN_SPACING
+               + 2 * manual.CANVAS_MARGIN)
+        self.page._canvas.resize(canvas_width, 640)
         frame = self.make_frame()
         # 横向钳回画布内（左右锁死）；纵向保留越界值（画布滚动查看）
-        self.assertEqual((frame.x(), frame.y()), (862 - 460, 700))
+        self.assertEqual((frame.x(), frame.y()), (canvas_width - 460, 700))
 
         # 页面显示、画布布局完成 → 统一恢复
         self.page._canvas.resize(1400, 900)

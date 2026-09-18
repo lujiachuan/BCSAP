@@ -314,7 +314,7 @@ class InitializationWorker(QThread):
             # 因此这里不能用默认的 3s，否则设备缺席时只会得到一个 socket 超时，
             # 而不是「0 / 7 PV 已连接」+ 逐项原因。
             result = _request_json(
-                self.instrument_url + "/control/v1/pvs/health", timeout=10.0
+                self.instrument_url + "/control/v1/pvs/health", timeout=30.0
             )
             summary = result["summary"]
             total = int(summary["total"])
@@ -536,7 +536,7 @@ class InitializationPage(QWidget):
 
 def _collect_pv_details(result: dict) -> list[str]:
     """把 PV 健康接口结果整理为可展示的失败明细（名称 + 原因）。"""
-    raw = result.get("details")
+    raw = result.get("items")
     if not isinstance(raw, list) or not raw:
         summary = result.get("summary", {})
         failed = int(summary.get("required_failed", 0))

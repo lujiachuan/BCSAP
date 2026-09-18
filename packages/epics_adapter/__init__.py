@@ -6,11 +6,14 @@ from .channel_access import (
     ca_library_candidates,
     load_ca_library,
 )
+from .command_line import CommandLineEpicsGateway, FailoverEpicsGateway
 from .simulated import SimulatedEpicsGateway
 
 __all__ = [
     "ChannelAccessGateway",
+    "CommandLineEpicsGateway",
     "EpicsGateway",
+    "FailoverEpicsGateway",
     "Reading",
     "SimulatedEpicsGateway",
     "ca_library_candidates",

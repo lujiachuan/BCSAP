@@ -59,7 +59,7 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
     def get_status() -> ServiceStatus:
         config = state.config
         read_only = state.read_only
-        detail = f"真实 EPICS 通道访问；PV 映射 {len(config.entries)} 条"
+        detail = f"EPICS caget/caput 命令行访问；PV 映射 {len(config.entries)} 条"
         status = "ready"
         if state.config_error:
             status = "degraded"

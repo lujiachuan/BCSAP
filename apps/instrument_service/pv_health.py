@@ -16,27 +16,25 @@ from packages.contracts import (
     PvMappingConfig,
 )
 from packages.epics_adapter import (
-    ChannelAccessGateway,
+    CommandLineEpicsGateway,
     EpicsGateway,
     SimulatedEpicsGateway,
 )
 
 from . import pv_mapping
 
-
 def create_gateway(config: PvMappingConfig) -> EpicsGateway:
-    """按受控映射创建真实 EPICS Channel Access 网关。
+    """按受控映射创建真实 EPICS 网关。
+
+    固定使用 ``CommandLineEpicsGateway``：每次读写启动独立的 caget/caput，
+    不创建 ca.dll 长连接，避免连接状态卡死后只能靠外部 caget 唤醒。
 
     设备访问只有这一条路径：没有可用 IOC 时健康检查会如实报未连接，不会退化成模拟。
     开发/联调请起 ``sim/`` 下的本地模拟 IOC。
-
-    ``ca.dll`` 的定位由 ``packages.epics_adapter`` 自动完成（环境变量
-    ``SPECTRUM_CA_LIB_DIR`` 可覆盖）；加载失败的原因会逐项写进健康明细。
     """
-    return ChannelAccessGateway(
-        paths={entry.signal: entry.pv for entry in config.entries},
-        units={entry.signal: entry.unit for entry in config.entries},
-    )
+    paths = {entry.signal: entry.pv for entry in config.entries}
+    units = {entry.signal: entry.unit for entry in config.entries}
+    return CommandLineEpicsGateway(paths=paths, units=units)
 
 
 def create_simulated_gateway(config: PvMappingConfig | None = None) -> SimulatedEpicsGateway:
@@ -69,8 +67,10 @@ def check_pv_health(
     optional_failed = 0
 
     connect_error: str | None = None
+    readings: dict = {}
     try:
         gateway.connect()
+        readings = gateway.snapshot([entry.signal for entry in config.entries])
     except Exception as exc:  # noqa: BLE001  连接层异常统一转为逐项明细
         connect_error = str(exc)
 
@@ -79,9 +79,9 @@ def check_pv_health(
         try:
             if connect_error is not None:
                 raise ConnectionError(connect_error)
-            reading = gateway.read(entry.signal)
+            reading = readings[entry.signal]
             connected = reading.connected
-            detail = None if connected else "PV 未连接"
+            detail = None if connected else (reading.detail or "PV 未连接")
             severity = reading.severity
         except (ConnectionError, KeyError, TimeoutError, PermissionError) as exc:
             connected = False

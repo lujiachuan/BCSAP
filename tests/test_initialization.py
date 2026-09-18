@@ -21,6 +21,7 @@ from apps.desktop_client.initialization import (
     CacheUnavailable,
     InitializationWorker,
     LocalDataCache,
+    _collect_pv_details,
     cache_root_from_settings,
     default_cache_root,
     ensure_cache_root,
@@ -39,6 +40,24 @@ class InitializationApiTests(unittest.TestCase):
         self.assertEqual(payload.status, "ready")
         self.assertEqual(payload.summary.connected, payload.summary.total)
         self.assertEqual(payload.summary.required_failed, 0)
+
+    def test_pv_health_items_are_exposed_as_details(self) -> None:
+        details = _collect_pv_details(
+            {
+                "items": [
+                    {
+                        "pv": "BL:Q1:ISET",
+                        "connected": False,
+                        "detail": "无法加载 EPICS Channel Access 库（ca.dll）",
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(
+            details,
+            ["BL:Q1:ISET：无法加载 EPICS Channel Access 库（ca.dll）"],
+        )
 
     def test_data_service_supports_full_then_incremental_sync(self) -> None:
         records = sync_records()

@@ -28,7 +28,7 @@ from packages.contracts import (
     SignalWriteRequest,
     SignalWriteResult,
 )
-from packages.epics_adapter import EpicsGateway
+from packages.epics_adapter import EpicsGateway, Reading
 
 # 斜坡分步上限：超出即拒绝而不是放宽 max_step（宁可拒绝也不静默违反安全约束）。
 MAX_RAMP_STEPS = 128
@@ -63,10 +63,8 @@ class SignalWriteService:
         # 都经过 write()，一个检查点就能覆盖全平台，不会漏掉某条新加的写路径。
         self._read_only = bool(read_only)
         self._lock = RLock()
-        # ChannelAccessGateway 的 read/write 不会自己建连：没先 connect() 时
-        # 读会返回「网关尚未连接」。服务里原本只有健康检查会 connect，
-        # 于是「没跑过健康检查就直接读」必然失败——扫描和调束都会在第 1 步报错。
-        # 这里自己做一次惰性建连，并在读数掉线时清标记以便下次重连。
+        # 读写前统一做一次惰性就绪检查：命令行网关借此确认 caget 存在，测试/诊断
+        # 网关也能完成各自初始化。读数掉线时清标记，让下一次操作重新检查环境。
         self._connect_ok = False
         self._entries: dict[str, PvMappingEntry] = {
             entry.signal: entry for entry in config.entries
@@ -105,7 +103,16 @@ class SignalWriteService:
     # ------------------------------------------------------------------
     def read_snapshot(self, signals: list[str] | None = None) -> SignalSnapshot:
         """批量读取。单个信号失败只标记该项未连接，不影响其余读数。"""
-        readings = [self._read_entry(entry) for entry in self.resolve(signals)]
+        entries = self.resolve(signals)
+        self._ensure_connected()
+        try:
+            batch = self._gateway.snapshot([entry.signal for entry in entries])
+        except Exception:  # noqa: BLE001  不支持批量的网关仍按原路径逐路读取
+            readings = [self._read_entry(entry) for entry in entries]
+        else:
+            readings = [
+                self._signal_reading(entry, batch.get(entry.signal)) for entry in entries
+            ]
         return SignalSnapshot(taken_at=_now(), readings=readings)
 
     def _ensure_connected(self) -> None:
@@ -131,6 +138,21 @@ class SignalWriteService:
                 writable=entry.writable,
                 detail=str(exc) or type(exc).__name__,
             )
+        return self._signal_reading(entry, reading)
+
+    def _signal_reading(
+        self, entry: PvMappingEntry, reading: Reading | None
+    ) -> SignalReading:
+        if reading is None:
+            return SignalReading(
+                signal=entry.signal,
+                pv=entry.pv,
+                value=None,
+                unit=entry.unit,
+                connected=False,
+                writable=entry.writable,
+                detail="网关未返回该信号",
+            )
         if not reading.connected:
             # 连接可能掉了：清掉标记，让下一次操作重新建连
             self._connect_ok = False
@@ -144,7 +166,7 @@ class SignalWriteService:
             severity=reading.severity,
             source_time=reading.source_time.isoformat(),
             received_time=reading.received_time.isoformat(),
-            detail=None if reading.connected else "PV 未连接",
+            detail=None if reading.connected else (reading.detail or "PV 未连接"),
         )
 
     def read_value(self, signal: str) -> float | None:
@@ -154,9 +176,8 @@ class SignalWriteService:
     def _read_signal(self, signal: str) -> float | None:
         """读一路现场值，并**确保连接已建立**。
 
-        必须走 ``_read_entry``：它内部会 ``_ensure_connected()``。真实 CA 网关在
-        冷启动时第一次访问要建连，绕过它的直读会**必然失败一次**——调束取启动前
-        快照时就会被误判成"读不到"并拒绝启动（实测踩到过：紧接着手工读同一路是好的）。
+        必须走 ``_read_entry``：它内部会 ``_ensure_connected()``，保证 caget 路径
+        已验证，并把命令失败统一转换成带原因的未连接读数。
         """
         try:
             return self._read_entry(self.entry(signal)).value

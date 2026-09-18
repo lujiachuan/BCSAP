@@ -823,8 +823,10 @@ class TuningPage(QWidget):
         if target:
             signals.append(target)
         self._read_in_flight = True
-        thread = instrument_api.request_read(signals=signals)
-        thread.completed.connect(self._on_readbacks)
+        instrument_api.request_read(
+            signals=signals,
+            on_completed=self._on_readbacks,
+        )
 
     def _on_readbacks(self, payload: dict) -> None:
         self._read_in_flight = False

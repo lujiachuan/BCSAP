@@ -16,18 +16,32 @@
   检索/分析电脑用同一份包即可：该机连不到控制网时 PV 健康检查会失败，扫谱与自动调束入口自动禁用。
 
 三、EPICS 连接（仅控制电脑需要）
-  程序通过 ctypes 直接调用 EPICS base 的 ca.dll，不依赖 pip 安装的 pyepics/caproto。
-  若 ca.dll 不在默认位置，请设置系统环境变量后重启客户端：
+  仪器执行服务固定通过 EPICS 命令行工具 caget.exe / caput.exe 访问 IOC，
+  不再建立 ca.dll 常驻连接。请先在普通命令提示符中确认下面两条命令都能执行：
 
-      SPECTRUM_CA_LIB_DIR = ca.dll 所在目录        （例如 D:\epics\base\bin\windows-x64）
-      或  EPICS_BASE      = EPICS base 根目录      （程序会自动推导 bin\<arch>）
+      where caget
+      where caput
+
+  服务会依次从系统 PATH、EPICS_BASE\bin\<EPICS_HOST_ARCH>、EPICS_BASE\bin 下的
+  架构子目录以及服务 exe 同目录查找。修改系统环境变量后必须彻底退出并重新启动客户端，
+  已经运行的客户端/服务不会自动获得新的 PATH。
 
   验证：浏览器打开 http://127.0.0.1:8765/control/v1/pvs/health
-        status = ready 表示受控 PV 全部连通；unavailable 表示连不上 IOC（或未设置上述变量）。
+        status = ready 表示受控 PV 全部连通；unavailable 表示命令不可用或连不上 IOC。
+
+  重要：把 CA 固定在目标 IOC 上
+    若控制网里有多台机器广播同名 PV，CA 会择优连接，可能读到“另一台 IOC”的值，
+    并持续打印警告 “Identical process variable names on multiple servers”。
+    请在控制电脑上设置系统环境变量后重启客户端：
+
+        EPICS_CA_AUTO_ADDR_LIST = NO
+        EPICS_CA_ADDR_LIST      = <目标 IOC 的 IP>        （例如 172.16.1.55，多个用空格分隔）
+
+    这样既锁定了数据来源，也消除了日志刷屏。
 
 四、常见问题
   * 数据服务显示不可达：检查服务器地址、端口（默认 8000）与防火墙放行。
-  * PV 全部未连接：确认本机在控制网内、IOC 在线，并已按第三节设置 ca.dll 路径。
+  * PV 全部未连接：确认 IOC 在线，且 where caget / where caput 都能找到命令；修改 PATH 后重启客户端。
   * 想让仪器服务开机常驻（不随界面退出）：见仓库 deploy\README.md 的 NSSM 章节。
   * 界面提示扫谱/调束不可用：说明仪器服务或关键 PV 未就绪，先看“系统设置”与服务状态栏。
 

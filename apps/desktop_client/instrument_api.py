@@ -17,6 +17,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from uuid import uuid4
 
 from PySide6.QtCore import QSettings, QThread, Signal
@@ -33,8 +34,9 @@ MAGNET_RETRACT_PATH = "/control/v1/magnets/retract"
 
 DEFAULT_INSTRUMENT_URL = "http://127.0.0.1:8765"
 
-# 读请求超时：128 路快照在本地回环上远快于此
-READ_TIMEOUT_S = 8.0
+# 读请求超时：现场命令行 CA 后备读取 128 路实测可能超过 10 秒；
+# 与设置页全量检测保持一致，不能让手动页先超时后把初始态误当成“全部未连接”。
+READ_TIMEOUT_S = 30.0
 # 写请求超时：带斜坡的写入要按 max_rate 分步等待，必须留足
 WRITE_TIMEOUT_S = 120.0
 # 扫谱启动：服务端只做校验并立即返回，不会等整场扫完
@@ -443,15 +445,23 @@ def request_read(
     base_url: str | None = None,
     signals: list[str] | None = None,
     timeout: float | None = None,
+    *,
+    on_completed: Callable[[dict], None] | None = None,
 ) -> SignalReadThread:
     """启动一次快照读取；调用方负责避免重复发起（页面用「在飞就跳过」策略）。
 
-    ``timeout`` 缺省用轮询超时（8 s）。**一次读上百路**（例如设置页的 caget 检测）
-    要给它更长的值：真机上逐个 PV 建连可能就要好几秒。
+    ``on_completed`` 会在启动线程前绑定。轮询页必须使用这个入口，不能先启动再
+    ``connect``：本机服务响应很快时，完成信号可能在调用方绑定前已经发出，页面会
+    永久停在“读取中”。
+
+    ``timeout`` 缺省用轮询超时（30 s）。**一次读上百路**时真机建连和命令行 CA
+    后备可能需要数秒，不能沿用普通界面请求的短超时。
     """
     thread = SignalReadThread(
         base_url or instrument_base_url(), signals, timeout=timeout
     )
+    if on_completed is not None:
+        thread.completed.connect(on_completed)
     thread.start()
     return thread
 

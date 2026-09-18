@@ -94,6 +94,29 @@ class SignalWriteServiceTests(unittest.TestCase):
         self.assertEqual(len(snapshot.readings), 2)
         self.assertTrue(all(r.connected for r in snapshot.readings))
 
+    def test_snapshot_uses_gateway_batch_read(self) -> None:
+        class BatchTrackingGateway(SimulatedEpicsGateway):
+            def __init__(self, values):
+                super().__init__(values)
+                self.snapshots = 0
+
+            def snapshot(self, signals):
+                self.snapshots += 1
+                return super().snapshot(signals)
+
+        gateway = BatchTrackingGateway(
+            {
+                "gas.ar.flow_setpoint": (0.0, "sccm"),
+                "gas.ar.flow_readback": (0.0, "sccm"),
+            }
+        )
+        service = SignalWriteService(gateway, self.config)
+
+        snapshot = service.read_snapshot([])
+
+        self.assertEqual(len(snapshot.readings), 2)
+        self.assertEqual(gateway.snapshots, 1)
+
     def test_unreadable_signal_is_marked_not_connected(self) -> None:
         """网关缺该信号时只把这一项标未连接，不能让整批读取失败。"""
         service = SignalWriteService(SimulatedEpicsGateway({}), self.config)

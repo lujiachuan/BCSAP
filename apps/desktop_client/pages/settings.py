@@ -826,8 +826,8 @@ class SystemSettingsPage(QWidget):
         request = instrument_api.request_read(
             signals=[signal for _row, signal in picked],
             timeout=PV_PROBE_TIMEOUT_S,
+            on_completed=self._on_pv_probe,
         )
-        request.completed.connect(self._on_pv_probe)
         self._pv_probe_request = request
 
     def _on_pv_probe(self, payload: dict) -> None:

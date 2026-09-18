@@ -53,6 +53,7 @@ from datetime import UTC, datetime
 from PySide6.QtCore import QPoint, QRect, QSettings, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -92,12 +93,12 @@ BIG_VALUE_PT = 11
 # 曾经 OUTPUT_WIDTH=80 而输出格实测要 104–114px，磁铁/溅射/气路三张卡片的
 # 按钮是被裁掉的；这里按需求给足，再靠收紧按钮内边距把总宽压回去。
 # 目标：三个 3 列在**现场最小屏 1600x1000**（可用约 1346px）下不用横向滚动。
-NAME_WIDTH = 80
+NAME_WIDTH = 96
 SPIN_WIDTH = 64
 SEND_WIDTH = 36
 MODE_SPIN_WIDTH = 60
-READBACK_WIDTH = 114
-OUTPUT_WIDTH = 104
+READBACK_WIDTH = 112
+OUTPUT_WIDTH = 102
 TOGGLE_WIDTH = 32
 PULSE_WIDTH = 28
 SLOT_SPACING = 4
@@ -114,7 +115,7 @@ SLOT_STACK_STEP = 24
 EMPTY = "—"
 
 # 一列的最小宽度：行宽 + 面板左右内边距 + 面板左右边框
-PANEL_MARGIN = 3
+PANEL_MARGIN = 6
 PANEL_BORDER = 2
 # 卡片位置/大小的存储前缀。v2 用的是 saveGeometry（对子控件无效，等于没存），
 # 这里换 v3 存 [x, y, w, h]，旧存档自然失效、不会再干扰布局。
@@ -465,6 +466,11 @@ class _WheelSpinBox(QDoubleSpinBox):
     但表格式页面里控件密集、点位小，必须能直接滚。放开是安全的：本页改值
     **不自动下发**，误滚只是改了一个待确认的数字。
     """
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        # 上下箭头跟输入框挤在一起；滚轮 / 方向键已能调值，箭头是多余的
+        self.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
 
     def wheelEvent(self, event) -> None:  # noqa: N802
         if not self.isEnabled():
@@ -871,6 +877,9 @@ class _DraggableFrame(QFrame):
         if canvas is None:
             return False
         width = max(self.MIN_W, width)
+        # 宽度下限按内容最小需求：卡片构建后内容宽度可能大于旧存档（如设备名
+        # 列加宽），照旧宽度恢复会把右侧按钮裁掉，这里取两者的较大值。
+        width = max(width, self.child.minimumSizeHint().width())
         height = max(self.MIN_H, height)
         x = max(0, min(x, max(0, canvas.width() - width)))
         y = max(0, y)
@@ -985,6 +994,7 @@ class _MagnetGroupPanel(_GroupPanel):
         row_layout.addWidget(self.group_combo, 1)
 
         self.current_spin = QDoubleSpinBox()
+        self.current_spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.current_spin.setDecimals(2)
         self.current_spin.setRange(-1e9, 1e9)
         self.current_spin.setFixedWidth(SPIN_WIDTH + 14)
@@ -996,6 +1006,7 @@ class _MagnetGroupPanel(_GroupPanel):
         self.rate_check.toggled.connect(self._on_rate_toggled)
         row_layout.addWidget(self.rate_check)
         self.rate_spin = QDoubleSpinBox()
+        self.rate_spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.rate_spin.setDecimals(2)
         self.rate_spin.setRange(0.0, 1e6)
         self.rate_spin.setFixedWidth(SPIN_WIDTH)
@@ -1728,6 +1739,7 @@ class ManualControlPage(QWidget):
         self._editors: list[_SetpointEditor] = []
         self._entries: list[dict] = []
         self._read_in_flight = False
+        self._reader: instrument_api.SignalReadThread | None = None
         self._pending: tuple[_DeviceRow, str, float] | None = None
         self._all_off_active = False
         self._mapping_loaded = False
@@ -2116,11 +2128,16 @@ class ManualControlPage(QWidget):
     # 轮询与写入
     # ------------------------------------------------------------------
     def _poll(self) -> None:
-        if self._read_in_flight or not self._mapping_loaded:
+        if not self._mapping_loaded:
             return
+        if self._read_in_flight:
+            # 正常情况下完成回调会清掉标记。若旧式“先启动、后绑定”丢过完成
+            # 信号，线程早已结束而标记仍为 True；这里允许下一拍自恢复。
+            if self._reader is not None and self._reader.isRunning():
+                return
+            self._read_in_flight = False
         self._read_in_flight = True
-        self._reader = instrument_api.request_read()
-        self._reader.completed.connect(self._on_snapshot)
+        self._reader = instrument_api.request_read(on_completed=self._on_snapshot)
 
     def _on_snapshot(self, payload: dict) -> None:
         self._read_in_flight = False
