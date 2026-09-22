@@ -140,17 +140,23 @@ class TuningPageCatalogTests(unittest.TestCase):
             page.parameter_table.horizontalHeaderItem(index).text()
             for index in range(page.parameter_table.columnCount())
         ]
-        self.assertEqual(headers, ["启用", "设备参数", "下限", "上限", "当前回读"])
+        self.assertEqual(
+            headers, ["启用", "设备参数", "下限", "上限", "起始值", "当前回读"]
+        )
         self.assertNotIn("PV", headers)
 
         cell = page.parameter_table.item(0, 1)
         self.assertEqual(cell.text(), "magnet.m1.current_setpoint")
         self.assertIn("业务信号：magnet.m1.current_setpoint", cell.toolTip())
         self.assertIn("PV：PV:magnet.m1.current_setpoint", cell.toolTip())
-        # 范围与回读列都跟着左移了一格：控件还在原来的位置上
+        # 下限/上限/起始值/回读列都在各自位置上
         self.assertIsNotNone(page.parameter_table.cellWidget(0, 2))
         self.assertIsNotNone(page.parameter_table.cellWidget(0, 3))
         self.assertIsNotNone(page.parameter_table.cellWidget(0, 4))
+        self.assertIsNotNone(page.parameter_table.cellWidget(0, 5))
+        # 左栏下方的范围标尺：每个变量一行（设备边界/设定区间/起始值/当前回读）
+        self.assertTrue(hasattr(page, "range_rows"))
+        self.assertEqual(page.range_rows.count(), 3)  # 名称 + 标尺 + 数值文本
 
     def test_rate_setpoint_and_switch_are_not_offered(self) -> None:
         page = self.make_page(marked_mapping())
@@ -258,9 +264,10 @@ class TuningGuardDisplayTests(unittest.TestCase):
 
         page._fill_changes()
 
+        # 列语义：启动前 / 最优轮 / 最后一轮 / 当前
         self.assertEqual(page.changes_table.item(0, 1).text(), "150.000")
         self.assertEqual(page.changes_table.item(0, 2).text(), "200.000")
-        self.assertEqual(page.changes_table.item(0, 3).text(), "+50.000")
+        self.assertEqual(page.changes_table.item(0, 3).text(), "200.000")
         self.assertIn("启动前快照", page.change_note.text())
 
     def test_change_note_says_when_there_is_no_snapshot(self) -> None:
@@ -451,7 +458,8 @@ class TuningFinalizeUiTests(unittest.TestCase):
         page = self.make_page(run_id=None)
 
         self.assertEqual(
-            list(page.finalize_buttons), ["apply_best", "restore_initial", "safe_values"]
+            list(page.finalize_buttons),
+            ["apply_best", "restore_initial", "start_values", "safe_values"],
         )
         self.assertTrue(all(not b.isEnabled() for b in page.finalize_buttons.values()))
 

@@ -19,16 +19,19 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import Qt, QTimer, QUrl, QRectF
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QMessageBox,
     QPlainTextEdit,
@@ -43,11 +46,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from apps.desktop_client import instrument_api, tuning_analysis, tuning_config
+from apps.desktop_client import instrument_api, plot_style, tuning_analysis, tuning_config
+from apps.desktop_client.components import (
+    CompactForm,
+    FoldSection,
+    RangeBar,
+    StatusStrip,
+    mark_compact,
+)
 from apps.desktop_client.pages.common import page_layout, primary_button
 from apps.desktop_client.pages.registry import PageSpec
 from apps.desktop_client.pv_mapping_api import PvMappingRequestThread
 from apps.desktop_client.spectrum_plot import SpectrumPlot
+from apps.desktop_client.theme import current_palette
 from apps.desktop_client.widgets import MetricCard, PageHeading, Panel
 
 POLL_INTERVAL_MS = 700
@@ -176,9 +187,8 @@ class TuningPage(QWidget):
         layout.addWidget(
             PageHeading(
                 "自动调束",
-                "优化器只提出候选参数；确认后才由执行服务做边界/最大单步/变化速率"
-                "校验并写入设备，再等读回稳定、测量目标。每轮的建议值、实际下发值、"
-                "实际回读值分开记录。",
+                "优化器只提候选：确认后由执行层做边界/单步/速率校验并写入设备，"
+                "等读回稳定再测目标；建议值、下发值、回读值分开记录。",
             )
         )
         self.tabs = QTabWidget()
@@ -195,48 +205,105 @@ class TuningPage(QWidget):
     # 页签 1：参数配置
     # ------------------------------------------------------------------
     def _configuration_tab(self) -> QWidget:
+        """参数配置页：左栏变量与范围标尺，右栏紧凑参数网格，页脚常驻开始按钮。
+
+        布局目标（1320×820 实测）：
+        右栏原本是"一行一个字段"的竖排表单（需要 810px，而视口只有 375px，必须滚轮），
+        现在改成两列网格 + 三段折叠卡（约 480px），配合页脚状态带，整页不再需要滚动。
+        """
         tab = QWidget()
-        outer = QHBoxLayout(tab)
+        outer = QVBoxLayout(tab)
         outer.setContentsMargins(0, 8, 0, 0)
-        outer.setSpacing(0)
+        outer.setSpacing(8)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
 
-        variables = Panel("优化变量", "勾选参与调束的参数并设定范围")
-        select_row = QHBoxLayout()
-        select_row.addStretch()
-        self.select_all_button = QPushButton("全选")
-        self.select_none_button = QPushButton("取消全选")
-        for btn in (self.select_all_button, self.select_none_button):
-            btn.setFlat(True)
-            select_row.addWidget(btn)
+        # ---------------- 左栏：优化变量 + 范围概况 ----------------
+        variables = Panel("优化变量", "勾选参与调束的参数；范围须落在设备边界内")
+        head_row = QHBoxLayout()
+        head_row.setContentsMargins(0, 0, 0, 0)
+        head_row.setSpacing(6)
+        self.variable_count_label = QLabel("正在读取设备参数…", objectName="mutedText")
+        head_row.addWidget(self.variable_count_label, 1)
+        self.select_all_button = QPushButton("全选", objectName="plotToolButton")
+        self.select_none_button = QPushButton("取消全选", objectName="plotToolButton")
         self.select_all_button.clicked.connect(lambda: self._set_all_variables(True))
         self.select_none_button.clicked.connect(lambda: self._set_all_variables(False))
-        variables.body.addLayout(select_row)
+        head_row.addWidget(self.select_all_button)
+        head_row.addWidget(self.select_none_button)
+        variables.body.addLayout(head_row)
+
         self.parameter_table = QTableWidget(0, 6)
         self.parameter_table.setHorizontalHeaderLabels(
             ["启用", "设备参数", "下限", "上限", "起始值", "当前回读"]
         )
         self.parameter_table.verticalHeader().setVisible(False)
+        self.parameter_table.verticalHeader().setDefaultSectionSize(28)
+        self.parameter_table.setAlternatingRowColors(True)
         self.parameter_table.itemChanged.connect(self._on_variable_item_changed)
-        variables.body.addWidget(self.parameter_table, 1)
+        table_header = self.parameter_table.horizontalHeader()
+        table_header.setFixedHeight(26)
+        table_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        table_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for column in (2, 3, 4, 5):
+            table_header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
+        self.parameter_table.setColumnWidth(0, 46)
+        self.parameter_table.setColumnWidth(2, 88)
+        self.parameter_table.setColumnWidth(3, 88)
+        self.parameter_table.setColumnWidth(4, 88)
+        self.parameter_table.setColumnWidth(5, 104)
+        variables.body.addWidget(self.parameter_table, 2)
+
+        # 范围概况：横向标尺（设备边界 ┃ 设定区间 ┃ 起始值 ┃ 当前回读）。
+        # 它填掉了左栏原来的空白，也把"范围贴边/越界"这类最常见的误配变成看得见的图形。
+        # 变量多时标尺自己滚动（上限 7 行左右），不跟变量表抢整页高度。
+        self.range_section = FoldSection(
+            "范围概况", summary="设备边界 ┃ 设定区间 ┃ 起始值 ┃ 当前回读"
+        )
+        range_host = QWidget()
+        self.range_rows = QGridLayout(range_host)
+        self.range_rows.setContentsMargins(0, 0, 0, 0)
+        self.range_rows.setHorizontalSpacing(8)
+        self.range_rows.setVerticalSpacing(2)
+        self.range_rows.setColumnStretch(1, 1)
+        self.range_scroll = QScrollArea(objectName="rangeScroll")
+        self.range_scroll.setWidgetResizable(True)
+        self.range_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.range_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.range_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.range_scroll.setWidget(range_host)
+        self.range_scroll.setMaximumHeight(190)
+        self.range_section.add_widget(self.range_scroll)
+        self.range_empty_label = QLabel("勾选变量后在这里显示范围标尺", objectName="mutedText")
+        self.range_section.add_widget(self.range_empty_label)
+        variables.body.addWidget(self.range_section, 1)
+
         self.variable_hint = QLabel("正在读取设备参数…", objectName="mutedText")
         self.variable_hint.setWordWrap(True)
         variables.body.addWidget(self.variable_hint)
         splitter.addWidget(variables)
 
-        strategy = Panel("目标与策略", "优化算法与搜索策略")
-        form_host = QWidget()
-        form_host.setAutoFillBackground(False)
-        form = QVBoxLayout(form_host)
-        form.setSpacing(8)
+        # ---------------- 右栏：三张紧凑参数卡 ----------------
+        strategy = Panel("目标与策略", "算法、搜索策略与安全保护")
+        self.setting_sections: dict[str, FoldSection] = {}
 
-        form.addWidget(QLabel("优化目标（最大化）", objectName="mutedText"))
+        # ---- 卡 1：目标与算法 ----
+        algo = FoldSection("目标与算法")
+        self.setting_sections["algorithm"] = algo
+        algo_form = CompactForm()
         self.target = QComboBox()
         self.target.currentIndexChanged.connect(self._on_target_changed)
-        form.addWidget(self.target)
+        algo_form.add("优化目标", self.target, key="target")
 
-        form.addWidget(QLabel("调束模式", objectName="mutedText"))
+        self.engine_combo = QComboBox()
+        for key, label in ENGINE_CHOICES:
+            self.engine_combo.addItem(label, key)
+        self.engine_combo.setToolTip(
+            "CMA-ES 推荐用于连续联合调参；其余为 Optuna 采样器"
+            "（TPE/CMA-ES/QMC/随机/网格），同一份历史观测可复用。"
+        )
+        algo_form.add("优化引擎", self.engine_combo, key="engine")
+
         self.mode_combo = QComboBox()
         for key, label in MODE_CHOICES:
             self.mode_combo.addItem(label, key)
@@ -245,26 +312,8 @@ class TuningPage(QWidget):
             "confirm：每轮等你点「确认并执行本轮」。auto 必须启用束流丢失保护。"
         )
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
-        form.addWidget(self.mode_combo)
-        self.auto_hint = QLabel("", objectName="mutedText")
-        self.auto_hint.setWordWrap(True)
-        self.auto_hint.setVisible(False)
-        form.addWidget(self.auto_hint)
+        algo_form.add("调束模式", self.mode_combo, key="mode")
 
-        form.addWidget(QLabel("优化引擎", objectName="mutedText"))
-        self.engine_combo = QComboBox()
-        for key, label in ENGINE_CHOICES:
-            self.engine_combo.addItem(label, key)
-        self.engine_combo.setToolTip(
-            "CMA-ES 推荐用于连续联合调参；其余为 Optuna 采样器"
-            "（TPE/CMA-ES/QMC/随机/网格），同一份历史观测可复用。"
-        )
-        form.addWidget(self.engine_combo)
-
-        # ---- 两阶段策略（改造报告 §5.2）----
-        # 逐参数阶段容易把每个变量都推到各自的局部最优，联合微调再在这些最优点
-        # 附近一起收一收；两者的轮次分配要现场可调。
-        form.addWidget(QLabel("优化策略", objectName="mutedText"))
         self.strategy = QComboBox()
         for key, label in STRATEGY_CHOICES:
             self.strategy.addItem(label, key)
@@ -273,67 +322,101 @@ class TuningPage(QWidget):
             "逐参数 → 联合微调：先一个变量一个变量调（其余保持不动），"
             "再在最优点附近联合微调"
         )
-        form.addWidget(self.strategy)
+        algo_form.add("优化策略", self.strategy, key="strategy")
 
         self.calls_spin = QSpinBox()
         self.calls_spin.setRange(1, 50)
         self.calls_spin.setValue(3)
-        self.calls_label = QLabel("逐参数阶段：每个变量用几轮", objectName="mutedText")
-        form.addWidget(self.calls_label)
-        form.addWidget(self.calls_spin)
+        self.calls_spin.setToolTip("逐参数阶段每个变量用几轮")
+        algo_form.add("逐参数轮次", mark_compact(self.calls_spin), key="calls")
+        self.calls_label = algo_form.labels["calls"]
 
         self.joint_frac_spin = QDoubleSpinBox()
         self.joint_frac_spin.setRange(1.0, 100.0)
         self.joint_frac_spin.setSingleStep(5.0)
         self.joint_frac_spin.setValue(20.0)
         self.joint_frac_spin.setSuffix(" %")
-        self.joint_frac_label = QLabel("联合微调范围（占各参数原范围）", objectName="mutedText")
-        form.addWidget(self.joint_frac_label)
-        form.addWidget(self.joint_frac_spin)
-
-        self.hold_spin = QDoubleSpinBox()
-        self.hold_spin.setRange(0.0, 600.0)
-        self.hold_spin.setSingleStep(1.0)
-        self.hold_spin.setValue(0.0)
-        self.hold_spin.setSuffix(" s")
-        form.addWidget(QLabel("每轮写完后额外保持", objectName="mutedText"))
-        form.addWidget(self.hold_spin)
+        self.joint_frac_spin.setToolTip("联合微调范围（占各参数原范围）")
+        algo_form.add("联合微调范围", mark_compact(self.joint_frac_spin), key="joint_frac")
+        self.joint_frac_label = algo_form.labels["joint_frac"]
 
         self.iterations_spin = QSpinBox()
         self.iterations_spin.setRange(1, 200)
         self.iterations_spin.setValue(15)
-        form.addWidget(QLabel("最大轮次", objectName="mutedText"))
-        form.addWidget(self.iterations_spin)
+        algo_form.add("最大轮次", mark_compact(self.iterations_spin), key="iterations")
+
+        self.auto_hint = QLabel("", objectName="mutedText")
+        self.auto_hint.setWordWrap(True)
+        self.auto_hint.setVisible(False)
+        algo.add_widget(algo_form)
+        algo.add_widget(self.auto_hint)
+        strategy.body.addWidget(algo)
+
+        # ---- 卡 2：采样与稳定 ----
+        sampling = FoldSection("采样与稳定")
+        self.setting_sections["sampling"] = sampling
+        sample_form = CompactForm()
 
         self.settle_spin = QDoubleSpinBox()
         self.settle_spin.setRange(0.5, 120.0)
         self.settle_spin.setSingleStep(0.5)
         self.settle_spin.setValue(20.0)
         self.settle_spin.setSuffix(" s")
-        form.addWidget(QLabel("回读稳定超时", objectName="mutedText"))
-        form.addWidget(self.settle_spin)
+        sample_form.add("回读稳定超时", mark_compact(self.settle_spin), key="settle")
 
         self.samples_spin = QSpinBox()
         self.samples_spin.setRange(1, 20)
         self.samples_spin.setValue(3)
-        form.addWidget(QLabel("每轮目标采样次数", objectName="mutedText"))
-        form.addWidget(self.samples_spin)
+        self.samples_spin.setToolTip("每轮目标采样次数，取中位数抗毛刺")
+        sample_form.add("目标采样次数", mark_compact(self.samples_spin), key="samples")
 
-        # ---- 高级参数（原 demo 的"调参参数"区）----
-        # 只开放**执行服务真的会用**的两个：观测噪声进 GP 的核，种子决定随机探索
-        # 路径（同一份配置 + 同一种子可复现）。原 demo 的"初始采样数"没有对应物：
-        # 平台的第一个候选固定取范围中心（见 packages/optimizer/bayes.py），
-        # 不做初始随机撒点——给一个不受任何代码影响的输入框只会误导操作员。
+        self.hold_spin = QDoubleSpinBox()
+        self.hold_spin.setRange(0.0, 600.0)
+        self.hold_spin.setSingleStep(1.0)
+        self.hold_spin.setValue(0.0)
+        self.hold_spin.setSuffix(" s")
+        self.hold_spin.setToolTip("每轮写完后额外保持，给慢变量留时间")
+        sample_form.add("每轮保持时间", mark_compact(self.hold_spin), key="hold")
+
+        self.patience_spin = QSpinBox()
+        self.patience_spin.setRange(0, 50)
+        self.patience_spin.setValue(5)
+        self.patience_spin.setToolTip(
+            "收敛早停：连续这么多轮没有产生新的历史最优就正常结束（0 = 不启用）。"
+            "省掉后半段原地踏步的轮次，适合现场时间紧张时使用。"
+        )
+        sample_form.add("收敛早停", mark_compact(self.patience_spin), key="patience")
+
+        self.stall_fraction_form_spin = QDoubleSpinBox()
+        self.stall_fraction_form_spin.setRange(0.1, 50.0)
+        self.stall_fraction_form_spin.setSingleStep(0.5)
+        self.stall_fraction_form_spin.setValue(5.0)
+        self.stall_fraction_form_spin.setSuffix(" %")
+        self.stall_fraction_form_spin.setDecimals(1)
+        self.stall_fraction_form_spin.setToolTip(
+            "过程建议里「近 10 轮目标提升不足 X%」的 X。"
+            "噪声大时调大（避免误报），要更早报警时调小。"
+        )
+        self.stall_fraction_form_spin.valueChanged.connect(lambda _v: self._refresh_advice())
+        sample_form.add("停滞阈值", mark_compact(self.stall_fraction_form_spin), key="stall")
+
+        self.startup_spin = QSpinBox()
+        self.startup_spin.setRange(0, 100)
+        self.startup_spin.setValue(5)
+        self.startup_spin.setToolTip(
+            "开始建模前先纯随机探索的轮数；仅 CMA-ES、TPE 生效，"
+            "Random/QMC/Grid/GP 不受影响。"
+        )
+        sample_form.add("随机探索轮次", mark_compact(self.startup_spin), key="startup")
+
         self.seed_spin = QSpinBox()
         self.seed_spin.setRange(0, 999999)
         self.seed_spin.setValue(0)
         self.seed_spin.setToolTip(
             "随机种子：同一份配置 + 同一种子可复现同一串候选；换种子会换探索路径"
         )
-        form.addWidget(QLabel("随机种子", objectName="mutedText"))
-        form.addWidget(self.seed_spin)
+        sample_form.add("随机种子", mark_compact(self.seed_spin), key="seed")
 
-        # 每次使用随机种子：勾选后忽略固定 seed_spin，开始时现场生成
         self.random_seed_check = QCheckBox("每次使用随机种子（忽略上面的固定种子）")
         self.random_seed_check.setChecked(False)
         self.random_seed_check.setToolTip(
@@ -343,45 +426,32 @@ class TuningPage(QWidget):
         self.random_seed_check.toggled.connect(
             lambda on: self.seed_spin.setEnabled(not on)
         )
-        form.addWidget(self.random_seed_check)
+        sample_form.add_full(self.random_seed_check)
+        sampling.add_widget(sample_form)
+        strategy.body.addWidget(sampling)
 
-        # 随机探索轮次（CMA-ES / TPE 建模前的纯随机轮数）
-        self.startup_spin = QSpinBox()
-        self.startup_spin.setRange(0, 100)
-        self.startup_spin.setValue(5)
-        self.startup_spin.setToolTip(
-            "开始建模前先纯随机探索的轮数；仅 CMA-ES、TPE 生效，"
-            "Random/QMC/Grid/GP 不受影响。"
-        )
-        form.addWidget(QLabel("随机探索轮次（仅 CMA-ES / TPE）", objectName="mutedText"))
-        form.addWidget(self.startup_spin)
+        # ---- 卡 3：安全保护与收尾 ----
+        guard = FoldSection("安全保护与收尾")
+        self.setting_sections["guard"] = guard
+        guard_form = CompactForm()
 
-        self.patience_spin = QSpinBox()
-        self.patience_spin.setRange(0, 50)
-        self.patience_spin.setValue(5)
-        self.patience_spin.setToolTip(
-            "收敛早停：连续这么多轮没有产生新的历史最优就正常结束（0 = 不启用）。"
-            "省掉后半段原地踏步的轮次，适合现场时间紧张时使用。"
-        )
-        form.addWidget(QLabel("收敛早停（连续无改进轮数，0=不启用）", objectName="mutedText"))
-        form.addWidget(self.patience_spin)
-
-        # ---- 束流丢失保护（改造报告 §5.2）----
-        # 总开关：SIM/演示或确认不需要时可整个关掉
         self.loss_protection_check = QCheckBox("启用束流丢失保护")
         self.loss_protection_check.setChecked(True)
         self.loss_protection_check.setToolTip(
             "关掉后执行服务完全不做束流异常判定，也不会自动回退；"
             "SIM 演示或确认不需要该保护时使用。"
         )
-        form.addWidget(self.loss_protection_check)
-        # 阈值必须现场可调：FC 量级、束流工况各不相同，写死在代码里等于没有保护。
+        guard_form.add_full(self.loss_protection_check)
+
         loss_row = QHBoxLayout()
-        self.loss_absolute_check = QCheckBox("目标低于")
+        loss_row.setContentsMargins(0, 0, 0, 0)
+        loss_row.setSpacing(6)
+        self.loss_absolute_check = QCheckBox("绝对归零阈值：目标低于")
         self.loss_absolute_spin = QDoubleSpinBox()
         self.loss_absolute_spin.setDecimals(3)
         self.loss_absolute_spin.setRange(0.0, 1e6)
         self.loss_absolute_spin.setValue(0.0)
+        mark_compact(self.loss_absolute_spin)
         self.loss_absolute_spin.setMaximumWidth(110)
         self.loss_absolute_check.setChecked(False)
         self.loss_absolute_spin.setEnabled(False)
@@ -389,81 +459,44 @@ class TuningPage(QWidget):
         loss_row.addWidget(self.loss_absolute_check)
         loss_row.addWidget(self.loss_absolute_spin)
         loss_row.addStretch()
-        form.addWidget(QLabel("绝对归零阈值（束流接近零）", objectName="mutedText"))
-        form.addLayout(loss_row)
+        loss_host = QWidget()
+        loss_host.setLayout(loss_row)
+        guard_form.add_full(loss_host)
 
         self.loss_relative_spin = QDoubleSpinBox()
         self.loss_relative_spin.setRange(0.0, 95.0)
         self.loss_relative_spin.setSingleStep(5.0)
         self.loss_relative_spin.setValue(50.0)
         self.loss_relative_spin.setSuffix(" %")
-        form.addWidget(QLabel("相对损失阈值（低于启动前基线多少算丢失）", objectName="mutedText"))
-        form.addWidget(self.loss_relative_spin)
+        self.loss_relative_spin.setToolTip("目标低于启动前基线的这个比例即判为束流丢失")
+        guard_form.add(
+            "相对损失阈值", mark_compact(self.loss_relative_spin), key="loss_relative"
+        )
 
         self.loss_strikes_spin = QSpinBox()
         self.loss_strikes_spin.setRange(1, 20)
         self.loss_strikes_spin.setValue(2)
-        form.addWidget(QLabel("连续异常次数才触发保护", objectName="mutedText"))
-        form.addWidget(self.loss_strikes_spin)
+        self.loss_strikes_spin.setToolTip("连续几次异常才触发保护，单点毛刺不该把参数全退回去")
+        guard_form.add(
+            "连续异常次数", mark_compact(self.loss_strikes_spin), key="loss_strikes"
+        )
 
-        self.auto_recover_check = QCheckBox("自动退回启动前参数")
+        self.auto_recover_check = QCheckBox("触发保护时自动退回启动前参数")
         self.auto_recover_check.setChecked(True)
         self.auto_recover_check.setToolTip(
             "触发保护时由执行服务按启动前快照逐路退回（走执行层斜坡）；"
             "不勾选则只标记异常并停下，等人工处理"
         )
-        form.addWidget(self.auto_recover_check)
+        guard_form.add_full(self.auto_recover_check)
 
-        # 总开关联动子控件
-        self._loss_protection_widgets = [
-            self.loss_absolute_check, self.loss_absolute_spin,
-            self.loss_relative_spin, self.loss_strikes_spin,
-            self.auto_recover_check,
-        ]
-        def _toggle_loss_protection(on: bool) -> None:
-            for w in self._loss_protection_widgets:
-                w.setEnabled(on)
-            if on:
-                # 恢复绝对阈值子联动
-                self.loss_absolute_spin.setEnabled(self.loss_absolute_check.isChecked())
-        self.loss_protection_check.toggled.connect(_toggle_loss_protection)
-
-        # 开始前复位：每次从安全起始点（各参数下限）开始，不继承上一次结果
         self.reset_before_start_check = QCheckBox("开始前复位到起始值（不继承上一次结果）")
         self.reset_before_start_check.setChecked(False)
         self.reset_before_start_check.setToolTip(
             "勾选后，开始调束会先把参与变量经执行层写到“起始值”列（默认为范围中值）再寻优，"
             "保证每次起点一致；不勾选则从设备当前值（可能是上次最优）开始。"
         )
-        form.addWidget(self.reset_before_start_check)
+        guard_form.add_full(self.reset_before_start_check)
 
-        # ---- 停滞阈值（过程建议「近 10 轮提升不足 X%」的 X）----
-        self.stall_fraction_form_spin = QDoubleSpinBox()
-        self.stall_fraction_form_spin.setRange(0.1, 50.0)
-        self.stall_fraction_form_spin.setSingleStep(0.5)
-        self.stall_fraction_form_spin.setValue(5.0)
-        self.stall_fraction_form_spin.setSuffix(" %")
-        self.stall_fraction_form_spin.setDecimals(1)
-        self.stall_fraction_form_spin.setMaximumWidth(170)
-        self.stall_fraction_form_spin.setToolTip(
-            "过程建议里「近 10 轮目标提升不足 X%」的 X。"
-            "噪声大时调大（避免误报），要更早报警时调小。"
-        )
-        self.stall_fraction_form_spin.valueChanged.connect(lambda _v: self._refresh_advice())
-        form.addWidget(QLabel("停滞阈值（近 10 轮提升不足多少算停滞）", objectName="mutedText"))
-        form.addWidget(self.stall_fraction_form_spin)
-
-        for widget in (
-            self.iterations_spin, self.settle_spin, self.samples_spin,
-            self.loss_relative_spin, self.loss_strikes_spin,
-            self.seed_spin,
-        ):
-            widget.setMaximumWidth(170)
-
-        # ---- 完成后处置偏好（改造报告 §5.2「完成后设备状态」/ §8.9 P2.3）----
-        # 只做**预选建议**，绝不在任务结束时自动写设备：多写一次设备就多一次
-        # 无人确认的动作，与"建议 → 人工确认"的第一版边界冲突。
-        form.addWidget(QLabel("完成后处置建议（仅提示，执行仍需二次确认）", objectName="mutedText"))
         self.finalize_pref = QComboBox()
         self.finalize_pref.addItem("不预设", "")
         for action, label in FINALIZE_LABELS.items():
@@ -471,104 +504,99 @@ class TuningPage(QWidget):
         self.finalize_pref.setToolTip(
             "保存进调束配置：任务结束时在结果页提示「要处置先考虑哪一种」"
         )
-        form.addWidget(self.finalize_pref)
+        guard_form.add("完成后处置建议", self.finalize_pref, key="finalize")
 
-        # ---- 配置保存与恢复（原 demo 的 bayes_config.json）----
-        config_row = QHBoxLayout()
-        self.save_config_button = QPushButton("保存调束配置")
+        # 总开关联动子控件
+        self._loss_protection_widgets = [
+            self.loss_absolute_check, self.loss_absolute_spin,
+            self.loss_relative_spin, self.loss_strikes_spin,
+            self.auto_recover_check,
+        ]
+
+        def _toggle_loss_protection(on: bool) -> None:
+            for widget in self._loss_protection_widgets:
+                widget.setEnabled(on)
+            if on:
+                # 恢复绝对阈值子联动
+                self.loss_absolute_spin.setEnabled(self.loss_absolute_check.isChecked())
+
+        self.loss_protection_check.toggled.connect(_toggle_loss_protection)
+        guard.add_widget(guard_form)
+        guard.toggled.connect(lambda _on: self._refresh_guard_summary())
+        strategy.body.addWidget(guard)
+        strategy.body.addStretch()
+
+        # ---------------- 页脚状态带：常驻不滚动 ----------------
+        self.status_strip = StatusStrip()
+        self.run_plan_label = QLabel("正在生成运行计划…", objectName="mutedText")
+        self.run_plan_label.setWordWrap(True)
+        self.preflight_label = QLabel("启动检查：请选择目标和优化变量", objectName="mutedText")
+        self.preflight_label.setWordWrap(True)
+        self.config_note = QLabel("", objectName="mutedText")
+        self.config_note.setWordWrap(True)
+        # 全局只读部署：按钮压住的同时必须说明原因，否则操作员会反复怀疑参数
+        self.read_only_note = QLabel("", objectName="mutedText")
+        self.read_only_note.setWordWrap(True)
+        self.read_only_note.setVisible(False)
+        for widget in (
+            self.run_plan_label, self.preflight_label, self.config_note, self.read_only_note,
+        ):
+            self.status_strip.add_note(widget)
+
+        self.advanced_button = QPushButton("高级参数")
+        self.advanced_button.setCheckable(True)
+        self.advanced_button.setToolTip("随机种子、早停、异常计数与配置保存等低频项")
+        self.advanced_button.toggled.connect(self._toggle_advanced_options)
+        self.status_strip.add_action(self.advanced_button)
+
+        self.save_config_button = QPushButton("保存配置")
         self.save_config_button.setToolTip(
             "把目标、勾选变量与范围、策略、轮次、稳定超时、采样次数、束流丢失保护"
             "和完成后处置存到本机，下次打开自动载回"
         )
         self.save_config_button.clicked.connect(self.save_tuning_config)
-        config_row.addWidget(self.save_config_button)
-        self.load_config_button = QPushButton("载入上次配置")
+        self.status_strip.add_action(self.save_config_button)
+        self.load_config_button = QPushButton("载入配置")
         self.load_config_button.setToolTip("从本机配置重新载入（覆盖当前界面上的设置）")
         self.load_config_button.clicked.connect(self.load_tuning_config)
-        config_row.addWidget(self.load_config_button)
-        config_row.addStretch()
-        form.addLayout(config_row)
-        self.config_note = QLabel("", objectName="mutedText")
-        self.config_note.setWordWrap(True)
-        form.addWidget(self.config_note)
+        self.status_strip.add_action(self.load_config_button)
 
-        # 默认只保留启动任务必需的参数；低频策略与保护项按需展开，
-        # 让 1320×820 下的开始按钮始终留在当前页内。
-        advanced_label_texts = {
-            "随机种子",
-            "随机探索轮次（仅 CMA-ES / TPE）",
-            "收敛早停（连续无改进轮数，0=不启用）",
-            "绝对归零阈值（束流接近零）",
-            "相对损失阈值（低于启动前基线多少算丢失）",
-            "连续异常次数才触发保护",
-            "完成后处置建议（仅提示，执行仍需二次确认）",
-        }
-        # 逐参数策略专属：只有选「逐参数 → 联合」时才可能显示
+        self.start_button = primary_button("开始自动调束")
+        self.start_button.setToolTip(
+            "范围必须落在设备允许区间内，且参数需配置最大单步；否则启动时会被拒绝——"
+            "让优化器提出一个必然写不进去的值没有意义。"
+        )
+        self.start_button.clicked.connect(self.start_tuning)
+        self.status_strip.add_action(self.start_button)
+        splitter.addWidget(strategy)
+
+        # 高级项：默认收起（低频，且展开后仍在同一网格里，不额外拉长页面）
         self._sequential_only_widgets = [
             self.calls_spin, self.calls_label,
             self.joint_frac_spin, self.joint_frac_label,
         ]
         self._advanced_widgets = [
-            self.seed_spin,
-            self.random_seed_check, self.startup_spin,
-            self.patience_spin,
-            self.loss_absolute_check, self.loss_absolute_spin,
-            self.loss_relative_spin, self.loss_strikes_spin,
-            self.auto_recover_check, self.finalize_pref,
+            self.seed_spin, self.random_seed_check, self.startup_spin,
+            self.patience_spin, self.loss_strikes_spin, self.finalize_pref,
             self.save_config_button, self.load_config_button, self.config_note,
         ]
-        self._advanced_widgets.extend(
-            label
-            for label in strategy.findChildren(QLabel)
-            if label.text() in advanced_label_texts
-        )
+        for form, keys in (
+            (sample_form, ("startup", "seed")),
+            (guard_form, ("loss_strikes", "finalize")),
+        ):
+            for key in keys:
+                self._advanced_widgets.append(form.fields[key])
+                self._advanced_widgets.append(form.labels[key])
         self._advanced_visible = False
         self.strategy.currentIndexChanged.connect(self._toggle_strategy_options)
-        self.advanced_button = QPushButton("展开高级参数")
-        self.advanced_button.setCheckable(True)
-        self.advanced_button.toggled.connect(self._toggle_advanced_options)
         self._toggle_advanced_options(False)
 
-        form.addStretch()
-        # 表单整体放进滚动区：展开高级参数后内容超高时滚动，而不是把控件压扁挤在一起。
-        # 1320×820 下开始按钮始终留在页内，靠下方固定区保证（与表单本身解耦）。
-        form_scroll = QScrollArea(objectName="groupScroll")
-        form_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        form_scroll.setWidgetResizable(True)
-        form_scroll.viewport().setAutoFillBackground(False)
-        form_scroll.setWidget(form_host)
-        strategy.body.addWidget(form_scroll, 1)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([640, 476])
+        outer.addWidget(splitter, 1)
+        outer.addWidget(self.status_strip)
 
-        # 固定区：展开/收起开关、提示、开始按钮始终可见，不随表单滚动
-        strategy.body.addWidget(self.advanced_button)
-
-        self.run_plan_label = QLabel("正在生成运行计划…", objectName="mutedText")
-        self.run_plan_label.setWordWrap(True)
-        strategy.body.addWidget(self.run_plan_label)
-        self.preflight_label = QLabel("启动检查：请选择目标和优化变量", objectName="mutedText")
-        self.preflight_label.setWordWrap(True)
-        strategy.body.addWidget(self.preflight_label)
-
-        hint = QLabel(
-            "范围必须落在设备允许区间内，且参数需配置最大单步；否则启动时会被拒绝——"
-            "让优化器提出一个必然写不进去的值没有意义。",
-            objectName="mutedText",
-        )
-        hint.setWordWrap(True)
-        strategy.body.addWidget(hint)
-        # 全局只读部署：按钮压住的同时必须说明原因，否则操作员会反复怀疑参数
-        self.read_only_note = QLabel("", objectName="mutedText")
-        self.read_only_note.setWordWrap(True)
-        self.read_only_note.setVisible(False)
-        strategy.body.addWidget(self.read_only_note)
-        self.start_button = primary_button("开始自动调束")
-        self.start_button.clicked.connect(self.start_tuning)
-        strategy.body.addWidget(self.start_button)
-        splitter.addWidget(strategy)
-        splitter.setStretchFactor(0, 4)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([980, 300])
-        outer.addWidget(splitter)
         for widget in (
             self.strategy, self.mode_combo, self.engine_combo,
             self.calls_spin, self.iterations_spin, self.settle_spin,
@@ -579,6 +607,30 @@ class TuningPage(QWidget):
             else:
                 widget.valueChanged.connect(self._update_run_plan)
         self.loss_absolute_check.toggled.connect(self._update_run_plan)
+        self.loss_absolute_spin.valueChanged.connect(self._update_run_plan)
+        # 长文案下拉框不该把面板最小宽度撑大：按"最小可见字符数"算尺寸，
+        # 否则「CMA-ES（推荐：连续联合调参）」这类条目会把左栏挤窄。
+        for combo in (
+            self.target, self.engine_combo, self.mode_combo, self.strategy,
+            self.finalize_pref,
+        ):
+            combo.setSizeAdjustPolicy(
+                QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+            )
+            combo.setMinimumContentsLength(11)
+        # 保护卡收起时靠摘要说明当前配置，所以每个相关控件都要刷新摘要
+        for widget in (
+            self.loss_protection_check, self.auto_recover_check,
+        ):
+            widget.toggled.connect(lambda _on: self._refresh_guard_summary())
+        for widget in (
+            self.loss_absolute_spin, self.loss_relative_spin, self.loss_strikes_spin,
+        ):
+            widget.valueChanged.connect(lambda _value: self._refresh_guard_summary())
+        self.loss_absolute_check.toggled.connect(
+            lambda _on: self._refresh_guard_summary()
+        )
+        self._refresh_guard_summary()
         self._update_run_plan()
         return tab
 
@@ -593,8 +645,12 @@ class TuningPage(QWidget):
         return self.strategy.currentData() == "sequential_then_joint"
 
     def _toggle_strategy_options(self, *_args) -> None:
-        """逐参数专属配置：高级已展开且策略选了逐参数时才显示。"""
-        show = self._advanced_visible and self._strategy_is_sequential()
+        """逐参数专属配置：选了"逐参数 → 联合微调"就必须可见。
+
+        这两个旋钮是策略本身的参数（每变量几轮、微调范围），不是"高级选项"：
+        选了逐参数却看不到它们，等于让人签一份看不见的合同。
+        """
+        show = self._strategy_is_sequential()
         for widget in self._sequential_only_widgets:
             widget.setVisible(show)
 
@@ -694,14 +750,21 @@ class TuningPage(QWidget):
     # 页签 2：运行监控
     # ------------------------------------------------------------------
     def _monitor_tab(self) -> QWidget:
+        """运行监控页：状态条 + 指标带 + 曲线 + 实时过程日志（+ 候选确认条）。
+
+        布局目标：曲线拿到页签内的主要高度（原来被 4 张 92px 指标卡、最近轮次表
+        和候选区压到最小 280px），过程日志与轮次表并排放进右栏页签，不再各占一行。
+        """
         tab = QWidget()
         outer = QVBoxLayout(tab)
         outer.setContentsMargins(0, 8, 0, 0)
-        outer.setSpacing(10)
+        outer.setSpacing(8)
 
+        # ---------------- 状态条：一行说完"现在在做什么" ----------------
         bar = QFrame(objectName="panel")
         row = QHBoxLayout(bar)
-        row.setContentsMargins(14, 10, 14, 10)
+        row.setContentsMargins(14, 8, 14, 8)
+        row.setSpacing(10)
         self.tuning_state = QLabel("尚未开始")
         self.iteration_label = QLabel("已完成 0 轮", objectName="mutedText")
         self.acknowledge_button = QPushButton("确认设备状态")
@@ -727,6 +790,136 @@ class TuningPage(QWidget):
         row.addWidget(self.tuning_stop_button)
         outer.addWidget(bar)
 
+        # ---------------- 指标带：压扁的 4 张卡（对象名/属性保持不变）----------------
+        metrics = QHBoxLayout()
+        metrics.setSpacing(8)
+        self.current_card = MetricCard("本轮测量", "--")
+        self.best_card = MetricCard("历史最优", "--", "", success=True)
+        self.gain_card = MetricCard("提升量", "--")
+        self.eta_card = MetricCard("预计剩余", "--")
+        for card in (self.current_card, self.best_card, self.gain_card, self.eta_card):
+            card.setMaximumHeight(58)
+            card.setMinimumHeight(52)
+            card.setStyleSheet(
+                "QLabel#cardCaption { font-size: 11px; }"
+                "QLabel#metricValue, QLabel#successValue { font-size: 17px; }"
+            )
+            layout = card.layout()
+            if layout is not None:
+                layout.setContentsMargins(12, 6, 12, 6)
+                layout.setSpacing(2)
+            metrics.addWidget(card, 1)
+        outer.addLayout(metrics)
+
+        # ---------------- 主体：左曲线 / 右过程日志与轮次 ----------------
+        body = QSplitter(Qt.Orientation.Horizontal)
+        body.setChildrenCollapsible(False)
+
+        plot_panel = Panel(
+            "目标量与响应曲线",
+            "可切换：目标量收敛（x = 轮次）/ 单变量响应（x = 实际回读）",
+        )
+        plot_tool_row = QHBoxLayout()
+        plot_tool_row.setContentsMargins(0, 0, 0, 0)
+        plot_tool_row.setSpacing(4)
+        plot_tool_row.addWidget(QLabel("视图", objectName="mutedText"))
+        self.plot_button_row = QHBoxLayout()
+        self.plot_button_row.setSpacing(4)
+        plot_tool_row.addLayout(self.plot_button_row, 1)
+        self.btn_export_plot = QPushButton("导出图", objectName="plotToolButton")
+        self.btn_export_plot.setToolTip("导出当前曲线（PNG / SVG / PDF）")
+        self.btn_export_plot.clicked.connect(lambda: self._export_plot(self.tuning_plot, "收敛曲线"))
+        plot_tool_row.addWidget(self.btn_export_plot)
+        plot_panel.body.addLayout(plot_tool_row)
+        # 兼容旧引用：_render_plot 读 currentData()，用一个隐藏的 QComboBox 存当前选择
+        from PySide6.QtWidgets import QComboBox as _QCB
+        self.plot_choice = _QCB()
+        self.plot_choice.hide()
+        # 索引变化就重画：按钮组只负责改索引，避免"按钮选了、图没换"的两套状态
+        self.plot_choice.currentIndexChanged.connect(lambda _index: self._render_plot())
+        self.tuning_plot = SpectrumPlot("轮次", "目标量")
+        self.tuning_plot.setMinimumHeight(260)
+        self.tuning_plot.use_science_style(x_label="轮次", y_label="目标量", legend=True)
+        plot_panel.body.addWidget(self.tuning_plot, 1)
+        self.response_note = QLabel("", objectName="mutedText")
+        self.response_note.setWordWrap(True)
+        plot_panel.body.addWidget(self.response_note)
+        body.addWidget(plot_panel)
+
+        side = QTabWidget()
+        log_panel = QWidget()
+        log_layout = QVBoxLayout(log_panel)
+        log_layout.setContentsMargins(0, 6, 0, 0)
+        log_layout.setSpacing(4)
+        log_tool = QHBoxLayout()
+        log_tool.setContentsMargins(0, 0, 0, 0)
+        log_tool.setSpacing(4)
+        self.log_follow_check = QCheckBox("跟随最新")
+        self.log_follow_check.setChecked(True)
+        log_tool.addWidget(self.log_follow_check)
+        log_tool.addStretch()
+        self.log_export_button = QPushButton("导出日志", objectName="plotToolButton")
+        self.log_export_button.clicked.connect(self.export_tuning_log)
+        log_tool.addWidget(self.log_export_button)
+        log_layout.addLayout(log_tool)
+        self.event_log_view = QPlainTextEdit()
+        self.event_log_view.setReadOnly(True)
+        self.event_log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.event_log_view.setPlaceholderText(
+            "过程日志：一行一个事件（毫秒时间戳 · 级别 · 阶段 · 轮次 · 内容）"
+        )
+        log_layout.addWidget(self.event_log_view, 1)
+        side.addTab(log_panel, "过程日志")
+
+        recent_panel = QWidget()
+        recent_layout = QVBoxLayout(recent_panel)
+        recent_layout.setContentsMargins(0, 6, 0, 0)
+        recent_layout.setSpacing(4)
+        # 只显示最近几轮：精确读数看这张表，趋势看左边的曲线
+        self.recent_table = QTableWidget(0, 5)
+        self.recent_table.setHorizontalHeaderLabels(["轮次", "阶段", "目标值", "质量", "结果"])
+        self.recent_table.verticalHeader().setVisible(False)
+        self.recent_table.verticalHeader().setDefaultSectionSize(26)
+        self.recent_table.horizontalHeader().setFixedHeight(26)
+        self.recent_table.setAlternatingRowColors(True)
+        recent_layout.addWidget(self.recent_table, 1)
+        side.addTab(recent_panel, "最近轮次")
+
+        proposal_panel = QWidget()
+        proposal_layout = QVBoxLayout(proposal_panel)
+        proposal_layout.setContentsMargins(0, 6, 0, 0)
+        proposal_layout.setSpacing(4)
+        self.proposal_table = QTableWidget(0, 4)
+        self.proposal_table.setHorizontalHeaderLabels(["参数", "当前回读", "建议值", "变化"])
+        self.proposal_table.verticalHeader().setVisible(False)
+        self.proposal_table.verticalHeader().setDefaultSectionSize(26)
+        self.proposal_table.horizontalHeader().setFixedHeight(26)
+        self.proposal_table.setAlternatingRowColors(True)
+        proposal_layout.addWidget(self.proposal_table, 1)
+        side.addTab(proposal_panel, "候选明细")
+        self.monitor_side_tabs = side
+        body.addWidget(side)
+        body.setStretchFactor(0, 3)
+        body.setStretchFactor(1, 2)
+        body.setSizes([640, 470])
+        outer.addWidget(body, 1)
+
+        # ---------------- 候选确认条（auto 模式下整条隐藏）----------------
+        confirm = QFrame(objectName="noticePanel")
+        self.proposal_panel = confirm
+        confirm_layout = QHBoxLayout(confirm)
+        confirm_layout.setContentsMargins(14, 8, 14, 8)
+        confirm_layout.setSpacing(10)
+        self.proposal_label = QLabel("等待候选…", objectName="mutedText")
+        self.proposal_label.setWordWrap(True)
+        self.approve_button = primary_button("确认并执行本轮")
+        self.approve_button.setEnabled(False)
+        self.approve_button.clicked.connect(self._approve)
+        confirm_layout.addWidget(self.proposal_label, 1)
+        confirm_layout.addWidget(self.approve_button)
+        outer.addWidget(confirm)
+
+        # ---------------- 只在需要时出现的提示行 ----------------
         # 束流丢失保护的执行结果：只在真的触发过时出现，逐路列实际回读
         self.recovery_label = QLabel("", objectName="mutedText")
         self.recovery_label.setWordWrap(True)
@@ -744,108 +937,35 @@ class TuningPage(QWidget):
         self.snapshot_label.setWordWrap(True)
         self.snapshot_label.setVisible(False)
         outer.addWidget(self.snapshot_label)
-
-        # 指标横排成一条紧凑信息带，避免占用曲线右侧整列空间。
-        metrics = QHBoxLayout()
-        metrics.setSpacing(10)
-        self.current_card = MetricCard("本轮测量", "--")
-        self.best_card = MetricCard("历史最优", "--", "", success=True)
-        self.gain_card = MetricCard("提升量", "--")
-        self.eta_card = MetricCard("预计剩余", "--")
-        for card in (self.current_card, self.best_card, self.gain_card, self.eta_card):
-            card.setMaximumHeight(92)
-            metrics.addWidget(card, 1)
-        outer.addLayout(metrics)
-
-        plot_panel = Panel(
-            "目标量与响应曲线",
-            "可切换：目标量收敛（x = 轮次）/ 单变量响应（x = 实际回读）",
-        )
-        # 原 demo 用同一个画布 + 一个下拉切换"收敛 / 某个变量的响应曲线"：
-        # 响应曲线是分析用的，不该另开一屏把实时监控挤掉。
-        plot_choice_row = QHBoxLayout()
-        plot_choice_row.addWidget(QLabel("视图", objectName="mutedText"))
-        self.plot_button_row = QHBoxLayout()
-        self.plot_button_row.setSpacing(6)
-        plot_choice_row.addLayout(self.plot_button_row, 1)
-        plot_panel.body.addLayout(plot_choice_row)
-        # 兼容旧引用：_render_plot 读 currentData()，用一个隐藏的 QComboBox 存当前选择
-        from PySide6.QtWidgets import QComboBox as _QCB
-        self.plot_choice = _QCB()
-        self.plot_choice.hide()
-        self.tuning_plot = SpectrumPlot("轮次", "目标量")
-        plot_panel.body.addWidget(self.tuning_plot, 1)
-        self.response_note = QLabel("", objectName="mutedText")
-        self.response_note.setWordWrap(True)
-        plot_panel.body.addWidget(self.response_note)
-        outer.addWidget(plot_panel, 1)
-
-        recent = Panel("最近轮次", "建议值与设备实际结果分开记录")
-        self.recent_table = QTableWidget(0, 5)
-        self.recent_table.setHorizontalHeaderLabels(
-            ["轮次", "阶段", "目标值", "质量", "结果"]
-        )
-        self.recent_table.verticalHeader().setVisible(False)
-        self.recent_table.setMaximumHeight(150)
-        recent.body.addWidget(self.recent_table)
-        outer.addWidget(recent)
-
-        confirm = QFrame(objectName="noticePanel")
-        self.proposal_panel = confirm
-        confirm_layout = QVBoxLayout(confirm)
-        confirm_layout.setContentsMargins(14, 10, 14, 10)
-        confirm_row = QHBoxLayout()
-        confirm_row.setContentsMargins(0, 0, 0, 0)
-        self.proposal_label = QLabel("等待候选…", objectName="mutedText")
-        self.proposal_label.setWordWrap(True)
-        self.approve_button = primary_button("确认并执行本轮")
-        self.approve_button.setEnabled(False)
-        self.approve_button.clicked.connect(self._approve)
-        confirm_row.addWidget(self.proposal_label, 1)
-        confirm_row.addWidget(self.approve_button)
-        confirm_layout.addLayout(confirm_row)
-
-        # 候选对比表：当前回读 vs 本轮建议值
-        self.proposal_table = QTableWidget(0, 4)
-        self.proposal_table.setHorizontalHeaderLabels(
-            ["参数", "当前回读", "建议值", "变化"]
-        )
-        self.proposal_table.verticalHeader().setVisible(False)
-        self.proposal_table.setMaximumHeight(140)
-        self.proposal_table.setVisible(False)
-        confirm_layout.addWidget(self.proposal_table)
-        outer.addWidget(confirm)
         return tab
 
     # ------------------------------------------------------------------
     # 页签 3：结果确认
     # ------------------------------------------------------------------
     def _result_tab(self) -> QWidget:
+        """结果与处置页：顶部摘要 + 左分析 / 右明细 + 固定处置栏。
+
+        布局目标：原来 7 个区块竖排（内容 1690px，视口 691px，要滚近 1000px），
+        现在把 参数变化 / Trial 明细 / 调束日志 收进右侧页签容器，
+        竖滚动条归零，分析图拿到属于自己的高度（科学图的读数与标注需要空间）。
+        """
         tab = QWidget()
         root = QVBoxLayout(tab)
         root.setContentsMargins(0, 8, 0, 0)
-        scroll = QScrollArea(objectName="groupScroll")
-        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        scroll.setWidgetResizable(True)
-        host = QWidget()
-        outer = QVBoxLayout(host)
-        outer.setContentsMargins(0, 8, 0, 0)
-        outer.setSpacing(10)
-        scroll.setWidget(host)
-        root.addWidget(scroll)
+        root.setSpacing(8)
 
         notice = QFrame(objectName="noticePanel")
         notice_row = QHBoxLayout(notice)
-        notice_row.setContentsMargins(14, 10, 14, 10)
+        notice_row.setContentsMargins(14, 8, 14, 8)
         self.result_notice = QLabel("尚未完成任何调束")
         self.result_detail = QLabel("", objectName="mutedText")
         notice_row.addWidget(self.result_notice)
         notice_row.addStretch()
         notice_row.addWidget(self.result_detail)
-        outer.addWidget(notice)
+        root.addWidget(notice)
 
         summary = QHBoxLayout()
-        summary.setSpacing(10)
+        summary.setSpacing(8)
         self.result_baseline_card = MetricCard("启动基线", "--")
         self.result_best_card = MetricCard("最佳目标", "--", "", success=True)
         self.result_gain_card = MetricCard("相对提升", "--")
@@ -854,13 +974,27 @@ class TuningPage(QWidget):
             self.result_baseline_card, self.result_best_card,
             self.result_gain_card, self.result_quality_card,
         ):
-            card.setMaximumHeight(92)
+            card.setMaximumHeight(58)
+            card.setMinimumHeight(52)
+            card.setStyleSheet(
+                "QLabel#cardCaption { font-size: 11px; }"
+                "QLabel#metricValue, QLabel#successValue { font-size: 17px; }"
+            )
+            layout = card.layout()
+            if layout is not None:
+                layout.setContentsMargins(12, 6, 12, 6)
+                layout.setSpacing(2)
             summary.addWidget(card, 1)
-        outer.addLayout(summary)
+        root.addLayout(summary)
 
-        analysis = Panel("结果分析", "优化历史、参数重要性、切片与 Trial 明细")
+        body = QSplitter(Qt.Orientation.Horizontal)
+        body.setChildrenCollapsible(False)
+
+        # ---------------- 左：结果分析 ----------------
+        analysis = Panel("结果分析", "优化历史、参数重要性、切片、轮廓与响应面矩阵")
         analysis_toolbar = QHBoxLayout()
-        analysis_toolbar.addWidget(QLabel("分析视图", objectName="mutedText"))
+        analysis_toolbar.setContentsMargins(0, 0, 0, 0)
+        analysis_toolbar.setSpacing(6)
         # 按钮组：直接点切换，不再塞下拉里
         self.analysis_button_group = QButtonGroup(self)
         self.analysis_button_group.setExclusive(True)
@@ -869,17 +1003,21 @@ class TuningPage(QWidget):
         # 变量很多时按钮会溢出：放进可横向滚动条，仍是一键直接切换
         buttons_host = QWidget()
         buttons_host.setLayout(self.analysis_buttons_row)
-        buttons_host.setFixedHeight(30)
+        buttons_host.setFixedHeight(26)
         self.analysis_scroll = QScrollArea()
         self.analysis_scroll.setWidget(buttons_host)
-        self.analysis_scroll.setWidgetResizable(False)
-        self.analysis_scroll.setFixedHeight(34)
-        self.analysis_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.analysis_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.analysis_scroll.setFrameShape(QFrame.NoFrame)
+        self.analysis_scroll.setWidgetResizable(True)
+        self.analysis_scroll.setFixedHeight(30)
+        self.analysis_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.analysis_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.analysis_scroll.setFrameShape(QFrame.Shape.NoFrame)
         analysis_toolbar.addWidget(self.analysis_scroll, 1)
+        self.btn_export_analysis = QPushButton("导出图", objectName="plotToolButton")
+        self.btn_export_analysis.setToolTip("导出当前分析图（PNG / SVG / PDF）")
+        self.btn_export_analysis.clicked.connect(self._export_current_analysis)
+        analysis_toolbar.addWidget(self.btn_export_analysis)
         self.open_dashboard_button = QPushButton("浏览器深度分析（英文）")
-        self.open_dashboard_button.setFlat(True)
+        self.open_dashboard_button.setObjectName("plotToolButton")
         self.open_dashboard_button.setToolTip(
             "常用分析（爬山图/参数重要性/多维切片/Trial 明细）已在左侧内嵌、"
             "中文展示；浏览器版为 optuna-dashboard，另提供等高线、平行坐标等"
@@ -891,43 +1029,70 @@ class TuningPage(QWidget):
         self.analysis_current_choice = "history"
         self._rebuild_analysis_buttons([("优化历史", "history")])
         self.analysis_plot = SpectrumPlot("轮次", "目标量")
-        analysis.body.addWidget(self.analysis_plot)
+        self.analysis_plot.setMinimumHeight(240)
+        self.analysis_plot.use_science_style(x_label="轮次", y_label="目标量")
+        analysis.body.addWidget(self.analysis_plot, 1)
+        # 响应面矩阵：n×n 配对图，用可滚动容器装，格子按视口自适应
+        self.surface_container = QScrollArea()
+        self.surface_container.setWidgetResizable(True)
+        self.surface_container_widget = QWidget()
+        self.surface_grid = QGridLayout(self.surface_container_widget)
+        self.surface_grid.setSpacing(4)
+        self.surface_container.setWidget(self.surface_container_widget)
+        self.surface_container.setVisible(False)
+        analysis.body.addWidget(self.surface_container, 1)
         self.analysis_note = QLabel(
             "任务结束后自动加载 Optuna 分析；优化历史始终可由本地轮次生成。",
             objectName="mutedText",
         )
         self.analysis_note.setWordWrap(True)
         analysis.body.addWidget(self.analysis_note)
-        self.analysis_trial_table = QTableWidget(0, 3)
-        self.analysis_trial_table.setHorizontalHeaderLabels(["Trial", "状态", "目标值"])
-        self.analysis_trial_table.verticalHeader().setVisible(False)
-        self.analysis_trial_table.setMaximumHeight(180)
-        analysis.body.addWidget(self.analysis_trial_table)
-        outer.addWidget(analysis)
+        body.addWidget(analysis)
 
-        # 必须是实例属性：旧版把它写成局部变量，真实结果根本回填不进去
+        # ---------------- 右：明细（参数变化 / Trial / 日志）----------------
+        detail = QTabWidget()
+        changes_page = QWidget()
+        changes_layout = QVBoxLayout(changes_page)
+        changes_layout.setContentsMargins(0, 6, 0, 0)
+        changes_layout.setSpacing(4)
         self.changes_table = QTableWidget(0, 5)
         self.changes_table.setHorizontalHeaderLabels(
             ["参数", "启动前", "最优轮", "最后一轮", "当前"]
         )
         self.changes_table.verticalHeader().setVisible(False)
-        changes = Panel("参数变化", "来自每轮的实际回读，不用建议值")
-        changes.body.addWidget(self.changes_table, 1)
+        self.changes_table.verticalHeader().setDefaultSectionSize(26)
+        self.changes_table.horizontalHeader().setFixedHeight(26)
+        self.changes_table.setAlternatingRowColors(True)
+        changes_layout.addWidget(self.changes_table, 1)
         self.change_note = QLabel("", objectName="mutedText")
         self.change_note.setWordWrap(True)
-        changes.body.addWidget(self.change_note)
-        outer.addWidget(changes, 1)
+        changes_layout.addWidget(self.change_note)
+        detail.addTab(changes_page, "参数变化")
 
-        # 调束日志（原 demo 的日志区）：建议 → 下发 → 回读 → 目标，一行一轮。
-        # 查看与导出用同一份文本，导出的 JSONL 另加 meta/advice/end 三类行。
-        log_panel = Panel("调束日志", "一行一轮：阶段 · 建议 → 下发 → 回读 → 目标")
+        trials_page = QWidget()
+        trials_layout = QVBoxLayout(trials_page)
+        trials_layout.setContentsMargins(0, 6, 0, 0)
+        self.analysis_trial_table = QTableWidget(0, 3)
+        self.analysis_trial_table.setHorizontalHeaderLabels(["Trial", "状态", "目标值"])
+        self.analysis_trial_table.verticalHeader().setVisible(False)
+        self.analysis_trial_table.verticalHeader().setDefaultSectionSize(26)
+        self.analysis_trial_table.horizontalHeader().setFixedHeight(26)
+        self.analysis_trial_table.setAlternatingRowColors(True)
+        trials_layout.addWidget(self.analysis_trial_table, 1)
+        detail.addTab(trials_page, "Trial 明细")
+
+        log_page = QWidget()
+        log_layout = QVBoxLayout(log_page)
+        log_layout.setContentsMargins(0, 6, 0, 0)
+        log_layout.setSpacing(4)
+        # 调束日志：建议 → 下发 → 回读 → 目标，一轮一行（带时间戳）
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setMaximumHeight(150)
         self.log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        log_panel.body.addWidget(self.log_view)
+        log_layout.addWidget(self.log_view, 1)
         log_row = QHBoxLayout()
-        self.export_log_button = QPushButton("导出日志（JSONL）")
+        log_row.setContentsMargins(0, 0, 0, 0)
+        self.export_log_button = QPushButton("导出日志（JSONL）", objectName="plotToolButton")
         self.export_log_button.setToolTip(
             "一轮一行导出，含本次任务的目标量、算法版本、种子、基线与过程建议，"
             "便于事后用脚本复盘"
@@ -937,13 +1102,22 @@ class TuningPage(QWidget):
         self.log_note = QLabel("", objectName="mutedText")
         self.log_note.setWordWrap(True)
         log_row.addWidget(self.log_note, 1)
-        log_panel.body.addLayout(log_row)
-        outer.addWidget(log_panel)
+        log_layout.addLayout(log_row)
+        detail.addTab(log_page, "调束日志")
+        self.result_detail_tabs = detail
+        body.addWidget(detail)
+        body.setStretchFactor(0, 3)
+        body.setStretchFactor(1, 2)
+        body.setSizes([640, 470])
+        root.addWidget(body, 1)
 
-        # 结束后的设备处置（改造报告 §5.2）：任务结束时设备停在**最后一轮**参数上，
-        # 而那不一定是最优轮，所以三种收尾方式要由操作员明确选，且都要二次确认。
-        disposal = Panel("结束后设备处置", "三种动作都会写设备，执行前需二次确认")
+        # ---------------- 底部：结束后设备处置（固定，不随分析滚动）----------------
+        # 任务结束时设备停在**最后一轮**参数上，而那不一定是最优轮，所以四种收尾
+        # 方式要由操作员明确选，且都要二次确认。
+        disposal = Panel("结束后设备处置", "四种动作都会写设备，执行前需二次确认")
         disposal_row = QHBoxLayout()
+        disposal_row.setContentsMargins(0, 0, 0, 0)
+        disposal_row.setSpacing(6)
         self.finalize_buttons: dict[str, QPushButton] = {}
         for action, label in FINALIZE_LABELS.items():
             button = QPushButton(label)
@@ -953,20 +1127,19 @@ class TuningPage(QWidget):
             )
             disposal_row.addWidget(button)
             self.finalize_buttons[action] = button
-        disposal_row.addStretch()
+        self.finalize_label = QLabel("", objectName="mutedText")
+        self.finalize_label.setWordWrap(True)
+        disposal_row.addWidget(self.finalize_label, 1)
         disposal.body.addLayout(disposal_row)
         note = QLabel(
             "「应用最优参数」按最优轮下发；「恢复启动前参数」用启动前快照；"
-            "「回到起始值」写到“起始值”列；「回安全值」退到配置下限。"
+            "「回到起始值」写到“起始值”列；「回安全值」退到安全值或配置下限。"
             "四种都走执行层（含单步与速率约束），并逐路等回读到位后才报成功。",
             objectName="mutedText",
         )
         note.setWordWrap(True)
         disposal.body.addWidget(note)
-        self.finalize_label = QLabel("", objectName="mutedText")
-        self.finalize_label.setWordWrap(True)
-        disposal.body.addWidget(self.finalize_label)
-        outer.addWidget(disposal)
+        root.addWidget(disposal)
         return tab
 
     # ------------------------------------------------------------------
@@ -1071,6 +1244,13 @@ class TuningPage(QWidget):
         ]
         self.parameter_table.setRowCount(len(candidates))
         self._rows = []
+        # 范围概况每次重建：映射刷新时变量集合可能变，旧标尺必须清掉
+        while self.range_rows.count():
+            item = self.range_rows.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.range_empty_label.setVisible(not candidates)
         for row, entry in enumerate(candidates):
             check = QTableWidgetItem()
             check.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
@@ -1089,6 +1269,7 @@ class TuningPage(QWidget):
             high_spin = QDoubleSpinBox()
             for spin in (low_spin, high_spin):
                 spin.setDecimals(2)
+                mark_compact(spin)  # 32px → 22px：表格行高随之降到 28px
                 spin.setRange(
                     float(low) if low is not None else -1e9,
                     float(high) if high is not None else 1e9,
@@ -1107,6 +1288,7 @@ class TuningPage(QWidget):
                 if low is not None and high is not None else 0.0
             )
             start_spin.setValue(midpoint)
+            mark_compact(start_spin)
             low_spin.valueChanged.connect(self._update_run_plan)
             high_spin.valueChanged.connect(self._update_run_plan)
             self.parameter_table.setCellWidget(row, 2, low_spin)
@@ -1115,6 +1297,18 @@ class TuningPage(QWidget):
             readback = QLabel("--")
             readback.setObjectName("mutedText")
             self.parameter_table.setCellWidget(row, 5, readback)
+
+            # 左栏下方的范围标尺：同一份数据换一种画法——"设备边界 / 设定区间 /
+            # 起始值 / 当前回读"叠在一条线上，贴边与越界一眼可见（调束最常见的误配）。
+            range_label = QLabel(
+                str(entry.get("label", entry.get("signal"))), objectName="mutedText"
+            )
+            range_bar = RangeBar()
+            range_text = QLabel("", objectName="mutedText")
+            range_text.setMinimumWidth(186)
+            self.range_rows.addWidget(range_label, row, 0)
+            self.range_rows.addWidget(range_bar, row, 1)
+            self.range_rows.addWidget(range_text, row, 2)
             self._rows.append(
                 {
                     "entry": entry,
@@ -1123,9 +1317,15 @@ class TuningPage(QWidget):
                     "high": high_spin,
                     "start": start_spin,
                     "readback": readback,
+                    "range_bar": range_bar,
+                    "range_text": range_text,
                 }
             )
-        self.parameter_table.resizeColumnsToContents()
+            for spin in (low_spin, high_spin, start_spin):
+                spin.valueChanged.connect(
+                    lambda _value, index=row: self._refresh_range_row(index)
+                )
+        self._refresh_range_rows()
         self._update_variable_hint()
         self._update_run_plan()
 
@@ -1210,6 +1410,10 @@ class TuningPage(QWidget):
         self.variable_hint.setText(" ".join(parts))
         self.variable_hint.style().unpolish(self.variable_hint)
         self.variable_hint.style().polish(self.variable_hint)
+        if hasattr(self, "variable_count_label"):
+            self.variable_count_label.setText(
+                f"{len(self._rows)} 个可调参数 · {usable} 个可调束 · 已勾选 {checked}"
+            )
 
     def _refresh_readbacks(self) -> None:
         if self._read_in_flight or not self._rows:
@@ -1235,8 +1439,76 @@ class TuningPage(QWidget):
                 row["readback"].setText(
                     f"{float(reading['value']):.3f} {row['entry'].get('unit', '')}"
                 )
+                row["_readback_value"] = float(reading["value"])
             else:
                 row["readback"].setText("未连接")
+                row["_readback_value"] = None
+        self._refresh_range_rows()
+
+    # ------------------------------------------------------------------
+    # 范围标尺与配置摘要
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _readback_value(row: dict) -> float | None:
+        """该变量当前的数值回读（回读列文本是主要来源，取不到就用缓存值）。"""
+        cached = row.get("_readback_value")
+        if isinstance(cached, float):
+            return cached
+        text = row["readback"].text()
+        try:
+            return float(text.split()[0])
+        except (ValueError, IndexError):
+            return None
+
+    def _refresh_range_row(self, index: int) -> None:
+        if not (0 <= index < len(self._rows)):
+            return
+        row = self._rows[index]
+        entry = row["entry"]
+        unit = str(entry.get("unit", ""))
+        readback = self._readback_value(row)
+        row["range_bar"].set_values(
+            low=float(row["low"].value()),
+            high=float(row["high"].value()),
+            start=float(row["start"].value()),
+            readback=readback,
+            device_low=entry.get("min_value"),
+            device_high=entry.get("max_value"),
+            unit=unit,
+        )
+        low = float(row["low"].value())
+        high = float(row["high"].value())
+        text = f"{low:g} – {high:g} {unit}".strip()
+        if readback is not None:
+            marker = "✓" if low <= readback <= high else "⚠"
+            text += f" · 当前 {readback:g} {marker}"
+        row["range_text"].setText(text)
+        row["range_text"].setProperty(
+            "state", "" if readback is None or low <= readback <= high else "warn"
+        )
+        row["range_text"].style().unpolish(row["range_text"])
+        row["range_text"].style().polish(row["range_text"])
+
+    def _refresh_range_rows(self) -> None:
+        for index in range(len(self._rows)):
+            self._refresh_range_row(index)
+
+    def _refresh_guard_summary(self) -> None:
+        """折叠状态下也要写清"当前保护是什么配置"，否则收起等于把信息藏了。"""
+        section = getattr(self, "setting_sections", {}).get("guard")
+        if section is None:
+            return
+        if not self.loss_protection_check.isChecked():
+            section.set_summary("保护已关闭（不做束流异常判定）")
+            return
+        parts: list[str] = []
+        if self.loss_absolute_check.isChecked():
+            parts.append(f"绝对阈值 {self.loss_absolute_spin.value():g}")
+        if self.loss_relative_spin.value() > 0:
+            parts.append(f"相对损失 {self.loss_relative_spin.value():g}%")
+        parts.append(f"连续 {self.loss_strikes_spin.value()} 次触发")
+        parts.append("自动回退" if self.auto_recover_check.isChecked() else "仅告警")
+        section.set_summary(" · ".join(parts))
 
     # ------------------------------------------------------------------
     # 配置保存与恢复（改造报告 §8.9 P2.3）
@@ -1403,6 +1675,8 @@ class TuningPage(QWidget):
             self.finalize_pref.setCurrentIndex(index)
 
         self._update_variable_hint()
+        self._refresh_guard_summary()
+        self._refresh_range_rows()
         return tuning_config.missing_signals(config, set(by_signal))
 
     def _set_config_note(self, text: str, state: str) -> None:
@@ -1481,6 +1755,9 @@ class TuningPage(QWidget):
         self._iterations = []
         self._last_completed = 0
         self._iterations_in_flight = False
+        self._log_lines_written = 0
+        if hasattr(self, "event_log_view"):
+            self.event_log_view.clear()
         self._algorithm = ""
         self._seed = None
         self._analysis = None  # 结束后从 /analysis 拉的 Optuna 分析结果
@@ -1984,6 +2261,7 @@ class TuningPage(QWidget):
         self._fill_log()
         self._fill_recent_iterations()
         self._update_result_summary()
+        self._fill_process_log()
         self._refresh_result_analysis_choices()
         self._render_result_analysis()
         self._fill_analysis_trials()
@@ -2066,8 +2344,12 @@ class TuningPage(QWidget):
         self.plot_choice.blockSignals(False)
 
     def _select_view(self, data: str) -> None:
-        self.plot_choice.setCurrentIndex(self.plot_choice.findData(data))
-        self._render_plot()
+        """切换过程页视图；索引变化即重画（下拉是按钮组背后的唯一事实来源）。"""
+        index = self.plot_choice.findData(data)
+        if index == self.plot_choice.currentIndex():
+            self._render_plot()
+        else:
+            self.plot_choice.setCurrentIndex(index)
 
     def _row_label(self, signal: str) -> str:
         for row in self._rows:
@@ -2096,28 +2378,45 @@ class TuningPage(QWidget):
         self._render_plot(best)
 
     def _render_plot(self, best: float | None = None) -> None:
-        """按下拉选择画收敛曲线或某个变量的响应曲线。"""
+        """画收敛（爬山）曲线或某个变量的响应曲线。
+
+        收敛视图走 :meth:`SpectrumPlot.plot_trials`：实测散点 + 误差棒 +
+        best-so-far 阶梯线 + 基线参考线，轴"只扩不缩"——新轮次出现时曲线是
+        "长出来"的，而不是整屏重新缩放（原来那种跳动感主要来自这里）。
+        """
         best = best if best is not None else self._best_objective()
         signal = self.plot_choice.currentData() or ""
+        usable = [it for it in self._iterations if it.get("objective") is not None]
+
         if not signal:
-            usable = [it for it in self._iterations if it.get("objective") is not None]
             if not usable:
-                self.tuning_plot.set_data([], [])
+                self.tuning_plot.clear_trials()
                 self._set_response_note("")
                 return
             xs = [float(it["iteration"]) + 1 for it in usable]
             ys = [float(it["objective"]) for it in usable]
-            self.tuning_plot.view.setLabel("bottom", "轮次")
-            self.tuning_plot.view.setLabel("left", "目标量")
-            self.tuning_plot.set_data(xs, ys)
-            if best is not None:
-                self._show_best_line(best)
+            running: list[float] = []
+            current_best: float | None = None
+            for value in ys:
+                current_best = value if current_best is None else max(current_best, value)
+                running.append(current_best)
+            errors = [self._objective_error(it) for it in usable]
+            self.tuning_plot.plot_trials(
+                xs,
+                ys,
+                best=running,
+                errors=errors if any(error > 0 for error in errors) else None,
+                baseline=self._baseline,
+                best_text=self._best_point_text(xs, ys),
+                x_label="轮次",
+                y_label=self._objective_axis_label(),
+                source=self._plot_source_note(),
+            )
             self._set_response_note("")
             return
 
         xs, ys = tuning_analysis.response_curve(self._iterations, signal)
-        self.tuning_plot.view.setLabel("bottom", self._row_label(signal))
-        self.tuning_plot.view.setLabel("left", "目标量")
+        self.tuning_plot.set_axis_labels(self._row_label(signal), self._objective_axis_label())
         self.tuning_plot.set_data(xs, ys)
         self._hide_best_line()
         peak = tuning_analysis.best_point(xs, ys)
@@ -2136,6 +2435,168 @@ class TuningPage(QWidget):
             )
             + "。曲线只反映已采过的点，不表示范围外的情况。"
         )
+
+    # ------------------------------------------------------------------
+    # 图的标注 / 导出 / 过程日志
+    # ------------------------------------------------------------------
+    def _objective_axis_label(self) -> str:
+        """纵轴标签：带单位的目标量名称（科学图必须写清量纲）。"""
+        signal = str(self.target.currentData() or "")
+        if not signal:
+            return "目标量"
+        for entry in self._mapping:
+            if entry.get("signal") == signal:
+                unit = str(entry.get("unit") or "")
+                label = str(entry.get("label") or signal)
+                return f"{label} ({unit})" if unit else label
+        return signal
+
+    @staticmethod
+    def _objective_error(record: dict) -> float:
+        """本轮目标测量的离散度（服务端给出采样离散度时才有值）。
+
+        只有中位数而没有离散度是"看着精确"的假象：现场要判断一个改进是真提升
+        还是噪声，必须看到误差棒。字段缺失时返回 0（不画误差棒，也不编一个数）。
+        """
+        for key in ("sample_spread", "objective_std"):
+            value = record.get(key)
+            if isinstance(value, (int, float)) and float(value) > 0:
+                return float(value)
+        samples = record.get("samples")
+        if isinstance(samples, (list, tuple)) and len(samples) >= 2:
+            try:
+                import statistics
+
+                return float(statistics.pstdev([float(item) for item in samples]))
+            except (TypeError, ValueError):
+                return 0.0
+        return 0.0
+
+    def _best_point_text(self, xs: list[float], ys: list[float]) -> str:
+        if not ys:
+            return ""
+        index = max(range(len(ys)), key=ys.__getitem__)
+        return f"最优 {ys[index]:.3f} @ 第 {xs[index]:g} 轮"
+
+    def _plot_source_note(self) -> str:
+        """图注：这张图是哪一次、什么算法、多少有效点画的。"""
+        usable = sum(1 for it in self._iterations if it.get("objective") is not None)
+        parts = []
+        if self._algorithm:
+            parts.append(str(self._algorithm))
+        if self._seed is not None:
+            parts.append(f"种子 {self._seed}")
+        parts.append(f"有效 {usable}/{len(self._iterations)} 轮")
+        if self._run_id:
+            parts.append(f"run {str(self._run_id)[:8]}")
+        return " · ".join(parts)
+
+    def _export_plot(self, plot: SpectrumPlot, title: str) -> None:
+        """导出当前图（PNG 高清 / SVG / PDF 矢量）。"""
+        suggested = f"{title}-{str(self._run_id or 'run')[:8]}.png"
+        chosen, _filter = QFileDialog.getSaveFileName(
+            self,
+            f"导出{title}",
+            suggested,
+            "PNG 图片 (*.png);;SVG 矢量 (*.svg);;PDF 文档 (*.pdf)",
+        )
+        if not chosen:
+            return
+        try:
+            path = plot_style.export_plot(plot.view, chosen, scale=3)
+        except Exception as exc:  # noqa: BLE001 —— 导出失败要说清楚，不能静默
+            QMessageBox.critical(self, "导出失败", f"{exc}")
+            return
+        self._set_response_note(f"已导出：{path}")
+
+    def _export_current_analysis(self) -> None:
+        """导出当前分析视图：响应面矩阵是控件（多图容器），其余是单张曲线。"""
+        if getattr(self, "analysis_current_choice", "") == "surface":
+            self._export_widget(self.surface_container_widget, "响应面矩阵")
+        else:
+            self._export_plot(self.analysis_plot, "结果分析")
+
+    def _export_widget(self, widget, title: str) -> None:
+        chosen, _filter = QFileDialog.getSaveFileName(
+            self,
+            f"导出{title}",
+            f"{title}-{str(self._run_id or 'run')[:8]}.png",
+            "PNG 图片 (*.png);;SVG 矢量 (*.svg);;PDF 文档 (*.pdf)",
+        )
+        if not chosen:
+            return
+        try:
+            path = plot_style.export_plot(widget, chosen, scale=2)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "导出失败", f"{exc}")
+            return
+        self._set_response_note(f"已导出：{path}")
+
+    def _format_event_time(self, raw: object) -> str:
+        """把 ISO(UTC) 时间戳转成本地 ``HH:MM:SS.mmm``；无效值原样返回。"""
+        text = str(raw or "")
+        if not text:
+            return "--:--:--.---"
+        try:
+            from datetime import datetime
+
+            moment = datetime.fromisoformat(text)
+            if moment.tzinfo is not None:
+                moment = moment.astimezone()
+            return moment.strftime("%H:%M:%S.") + f"{moment.microsecond // 1000:03d}"
+        except (TypeError, ValueError):
+            return text[:12]
+
+    def _process_log_lines(self) -> list[str]:
+        """过程日志行：一轮一行，带毫秒时间戳与级别。
+
+        （第二批会把服务端事件流接进来，这里先用轮次记录给出同样的四段链路：
+        建议 → 下发 → 回读 → 目标，并带上轮末时间戳。）
+        """
+        lines: list[str] = []
+        for record in self._iterations:
+            stage = tuning_analysis.stage_of(record)
+            quality = str(record.get("quality") or "ok")
+            level = "INFO" if quality == "ok" else "WARN"
+            objective = record.get("objective")
+            detail = str(record.get("detail") or "")
+            lines.append(
+                f"[{self._format_event_time(record.get('at'))}] {level:4s} "
+                f"第 {int(record.get('iteration', 0)) + 1} 轮 · {stage} · "
+                f"建议 {tuning_analysis._pairs(record.get('proposed') or {})} → "
+                f"下发 {tuning_analysis._pairs(record.get('applied') or {})} → "
+                f"回读 {tuning_analysis._pairs(record.get('readback') or {})} → "
+                f"目标 " + ("--" if objective is None else f"{float(objective):.4f}")
+                + (f"（{quality}：{detail}）" if detail else ("" if quality == "ok" else f"（{quality}）"))
+            )
+        for text in self._current_advice():
+            lines.append(f"[{self._format_event_time(None)}] WARN 建议 · {text}")
+        return lines
+
+    def _fill_process_log(self) -> None:
+        """把过程日志写进监控页的日志面板（增量追加，不整屏重排）。"""
+        view = getattr(self, "event_log_view", None)
+        if view is None:
+            return
+        lines = self._process_log_lines()
+        if not lines:
+            if not view.toPlainText():
+                view.setPlainText("（还没有轮次记录）")
+            return
+        if len(lines) == getattr(self, "_log_lines_written", 0):
+            return
+        if len(lines) < getattr(self, "_log_lines_written", 0):
+            # 轮次减少（换任务/复位）：整屏重画
+            view.setPlainText("\n".join(lines))
+        else:
+            new_lines = lines[getattr(self, "_log_lines_written", 0):]
+            if view.toPlainText().startswith("（还没有"):
+                view.clear()
+            view.appendPlainText("\n".join(new_lines))
+        self._log_lines_written = len(lines)
+        if getattr(self, "log_follow_check", None) is not None and self.log_follow_check.isChecked():
+            scrollbar = view.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
 
     def _load_analysis(self) -> None:
         """结束后从服务端拉 Optuna 分析数据（importance / slice / history）。"""
@@ -2168,23 +2629,261 @@ class TuningPage(QWidget):
             self.analysis_buttons_row.removeWidget(button)
             button.deleteLater()
         self._analysis_buttons = []
-        current = getattr(self, "analysis_current_choice", "history")
-        picked = False
+        current = getattr(self, "analysis_current_choice", "history") or "history"
+        available = [data for _label, data in choices]
+        if current not in available and available:
+            # 上一轮的选择可能在新任务里已不存在（变量变了或数据不足）：
+            # 回退到第一个可用的 **data**。写成按钮文本会让渲染分支永远对不上，
+            # 于是"看起来切了视图，其实还是旧图"。
+            current = available[0]
+            self.analysis_current_choice = current
         for label, data in choices:
-            btn = QPushButton(label)
+            btn = QPushButton(label, objectName="plotToolButton")
             btn.setCheckable(True)
             btn.setAutoExclusive(True)
             btn.setMaximumHeight(26)
+            btn.setMinimumWidth(76)
+            btn.setToolTip(label)
             btn.clicked.connect(lambda _checked=False, d=data: self._set_analysis_choice(d))
             self.analysis_button_group.addButton(btn)
             self.analysis_buttons_row.addWidget(btn)
             self._analysis_buttons.append(btn)
             if data == current:
                 btn.setChecked(True)
-                picked = True
-        if not picked and self._analysis_buttons:
-            self._analysis_buttons[0].setChecked(True)
-            self.analysis_current_choice = self._analysis_buttons[0].text()
+
+    # ------------------------------------------------------------------
+    # 响应面矩阵
+    # ------------------------------------------------------------------
+    def _surface_cell_size(self, n: int) -> int:
+        """格子边长随视口自适应：变量多时缩小而不是溢出（原来固定 220×170 必然溢出）。"""
+        viewport = self.surface_container.viewport()
+        width = max(viewport.width(), 520)
+        height = max(viewport.height(), 300)
+        # 额外留一列给色条、一行给标签
+        usable_w = width - 70 - 6 * (n + 1)
+        usable_h = height - 26 - 6 * (n + 1)
+        size = min(usable_w / max(1, n), usable_h / max(1, n))
+        return int(max(104, min(200, size)))
+
+    def _colorbar_strip(self, cmap, vmin: float, vmax: float, title: str, height: int) -> QWidget:
+        """手绘色条：与矩阵使用同一张查找表，量程写在两端。
+
+        没有色条的响应面只能看"形状"，看不出"差多少"——而且两个三角各有一套
+        量程（预测值 / 不确定性），必须各自标出来，否则颜色会被误读成同一个尺度。
+        """
+        import numpy as np
+        import pyqtgraph as pg
+
+        host = QWidget()
+        layout = QVBoxLayout(host)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addWidget(QLabel(title, objectName="mutedText"))
+        upper = QLabel(f"{vmax:.4g}", objectName="mutedText")
+        layout.addWidget(upper)
+        strip = pg.PlotWidget()
+        strip.setFixedSize(46, max(60, height - 56))
+        image = pg.ImageItem(np.linspace(0.0, 1.0, 256).reshape(256, 1))
+        image.setLookupTable(cmap.getLookupTable(256))
+        image.setRect(QRectF(0.0, 0.0, 1.0, 1.0))
+        strip.addItem(image)
+        strip.hideAxis("bottom")
+        strip.hideAxis("left")
+        strip.setXRange(0.0, 1.0, padding=0.0)
+        strip.setYRange(0.0, 1.0, padding=0.0)
+        layout.addWidget(strip)
+        layout.addWidget(QLabel(f"{vmin:.4g}", objectName="mutedText"))
+        layout.addStretch()
+        return host
+
+    def _render_surface(self) -> None:
+        """响应面矩阵：左下=GP 预测均值（含等高线），右上=不确定性。
+
+        与旧版的区别：格子按视口自适应、两个三角各配一条色条、叠加等高线与最优
+        参数十字、双击可放大单格。旧版每格固定 220×170 且各画各的量程——
+        变量一多就溢出，而且颜色无法横向比较。
+        """
+        import numpy as np
+        import pyqtgraph as pg
+
+        data = (self._analysis or {}).get("surface") or {}
+        params = data.get("params") or []
+        bounds = data.get("bounds") or []
+        pairs = data.get("pairs") or {}
+        points = data.get("points") or []
+        best_params = data.get("best") or []
+        grid = int(data.get("grid") or 0)
+        n = len(params)
+        while self.surface_grid.count():
+            item = self.surface_grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        if n < 2:
+            self.analysis_note.setText((data.get("reason") or "暂无可画的响应面数据"))
+            return
+
+        labels = [self._row_label(name) for name in params]
+        cmap_mean = pg.colormap.get("viridis")
+        cmap_std = pg.colormap.get("plasma")
+        lut_mean = cmap_mean.getLookupTable(256)
+        lut_std = cmap_std.getLookupTable(256)
+        cell = self._surface_cell_size(n)
+
+        # 统一量程：同一三角内所有格子共用一个色标（否则颜色不可比）
+        means = [np.asarray(pair["mean"], dtype=float) for pair in pairs.values()]
+        stds = [np.asarray(pair["std"], dtype=float) for pair in pairs.values()]
+        mean_range = (
+            (float(min(arr.min() for arr in means)), float(max(arr.max() for arr in means)))
+            if means else (0.0, 1.0)
+        )
+        std_range = (
+            (float(min(arr.min() for arr in stds)), float(max(arr.max() for arr in stds)))
+            if stds else (0.0, 1.0)
+        )
+
+        for row in range(n):
+            for column in range(n):
+                if row == column:
+                    lab = QLabel(labels[row], alignment=Qt.AlignmentFlag.AlignCenter)
+                    lab.setFixedSize(cell, cell)
+                    lab.setWordWrap(True)
+                    self.surface_grid.addWidget(lab, row, column)
+                    continue
+                i, j = min(row, column), max(row, column)
+                lo_x, hi_x = bounds[column]
+                lo_y, hi_y = bounds[row]
+                is_mean = row > column
+                pair = pairs.get(f"{i}_{j}")
+                pw = pg.PlotWidget()
+                pw.setFixedSize(cell, cell)
+                pw.setXRange(lo_x, hi_x, padding=0.0)
+                pw.setYRange(lo_y, hi_y, padding=0.0)
+                pw.showGrid(x=False, y=False)
+                pw.getAxis("bottom").setStyle(showValues=(row == n - 1), tickLength=-4)
+                pw.getAxis("left").setStyle(showValues=(column == 0), tickLength=-4)
+                pw.setMouseEnabled(x=False, y=False)
+                if pair:
+                    arr = np.asarray(pair["mean" if is_mean else "std"], dtype=float)
+                    low, high = mean_range if is_mean else std_range
+                    if high <= low:
+                        high = low + 1e-12
+                    image = pg.ImageItem((arr - low) / (high - low))
+                    image.setRect(QRectF(lo_x, lo_y, hi_x - lo_x, hi_y - lo_y))
+                    image.setOpts(origin="lower", axisOrder="row-major")
+                    image.setLookupTable(lut_mean if is_mean else lut_std)
+                    image.setLevels((0.0, 1.0))
+                    pw.addItem(image)
+                    if is_mean and grid >= 3:
+                        # 等高线：把"坡"画出来，比纯色块更容易读出峰值位置
+                        try:
+                            levels = np.linspace(arr.min(), arr.max(), 7)[1:-1]
+                            for level in levels:
+                                curve = pg.IsocurveItem(level=float(level), pen=pg.mkPen((255, 255, 255, 90), width=1))
+                                curve.setData(arr)
+                                from PySide6.QtGui import QTransform
+
+                                curve.setTransform(
+                                    QTransform()
+                                    .translate(lo_x, lo_y)
+                                    .scale(
+                                        (hi_x - lo_x) / max(1, arr.shape[1] - 1),
+                                        (hi_y - lo_y) / max(1, arr.shape[0] - 1),
+                                    )
+                                )
+                                pw.addItem(curve)
+                        except Exception:
+                            pass  # 等高线是增强项：画不出来也要留下面板
+                sx = [point[j] for point in points]
+                sy = [point[i] for point in points]
+                pw.addItem(pg.ScatterPlotItem(
+                    x=sx, y=sy, size=4, symbol="o",
+                    brush=pg.mkBrush(255, 255, 255, 170), pen=None,
+                ))
+                if len(best_params) > max(i, j):
+                    pw.addItem(pg.InfiniteLine(
+                        pos=float(best_params[j]), angle=90,
+                        pen=pg.mkPen((255, 255, 255, 150), width=1, style=Qt.PenStyle.DashLine),
+                    ))
+                    pw.addItem(pg.InfiniteLine(
+                        pos=float(best_params[i]), angle=0,
+                        pen=pg.mkPen((255, 255, 255, 150), width=1, style=Qt.PenStyle.DashLine),
+                    ))
+                if pair:
+                    pw.setToolTip(
+                        f"{labels[column]} × {labels[row]}\n"
+                        f"{'GP 预测均值' if is_mean else '预测不确定性（std）'}\n"
+                        f"范围 [{arr.min():.4g}, {arr.max():.4g}]\n"
+                        "双击放大（其余维度固定在最优值）"
+                    )
+                    pw.scene().sigMouseClicked.connect(
+                        lambda _event, a=i, b=j, mean=is_mean: self._open_surface_pair(a, b, mean)
+                    )
+                self.surface_grid.addWidget(pw, row, column)
+
+        # 两条色条：均值（左下三角）与不确定性（右上三角）
+        self.surface_grid.addWidget(
+            self._colorbar_strip(cmap_mean, mean_range[0], mean_range[1], "预测均值", cell),
+            n - 1, n,
+        )
+        self.surface_grid.addWidget(
+            self._colorbar_strip(cmap_std, std_range[0], std_range[1], "不确定性", cell),
+            0, n,
+        )
+        self.analysis_note.setText(
+            "左下三角 = GP 预测均值（含等高线，色条在右侧），右上三角 = 不确定性"
+            "（暖色=未探索），白点 = 实际采样点，虚线十字 = 当前最优点；"
+            "双击任一格放大。多个采样阶段混在一个 study 里时，矩阵只应作为趋势参考。"
+            + (data.get("note") or "")
+        )
+
+    def _open_surface_pair(self, i: int, j: int, is_mean: bool) -> None:
+        """单格放大：小矩阵里读不出细节，放大后能看清峰位与陡峭程度。"""
+        import numpy as np
+        import pyqtgraph as pg
+
+        data = (self._analysis or {}).get("surface") or {}
+        pair = (data.get("pairs") or {}).get(f"{i}_{j}")
+        params = data.get("params") or []
+        bounds = data.get("bounds") or []
+        if not pair or len(bounds) <= max(i, j):
+            return
+        arr = np.asarray(pair["mean" if is_mean else "std"], dtype=float)
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(
+            f"响应面 · {self._row_label(params[j])} × {self._row_label(params[i])}"
+        )
+        layout = QVBoxLayout(dialog)
+        plot = pg.PlotWidget()
+        plot.setMinimumSize(560, 420)
+        plot_style.apply_science_style(
+            plot,
+            x_label=self._row_label(params[j]),
+            y_label=self._row_label(params[i]),
+            mirrored_axes=False,
+        )
+        image = pg.ImageItem(arr)
+        lo_x, hi_x = bounds[j]
+        lo_y, hi_y = bounds[i]
+        image.setRect(QRectF(lo_x, lo_y, hi_x - lo_x, hi_y - lo_y))
+        image.setOpts(origin="lower", axisOrder="row-major")
+        cmap = pg.colormap.get("viridis" if is_mean else "plasma")
+        image.setLookupTable(cmap.getLookupTable(256))
+        plot.addItem(image)
+        bar = pg.ColorBarItem(
+            values=(float(arr.min()), float(arr.max())),
+            colorMap=cmap,
+            label="GP 预测均值" if is_mean else "预测不确定性 (std)",
+        )
+        bar.setImageItem(image, insert_in=plot.getPlotItem())
+        layout.addWidget(plot)
+        close = QPushButton("关闭")
+        close.clicked.connect(dialog.accept)
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(close)
+        layout.addLayout(row)
+        dialog.exec()
 
     def _set_analysis_choice(self, data: str) -> None:
         self.analysis_current_choice = data
@@ -2198,6 +2897,9 @@ class TuningPage(QWidget):
             choices.append(("参数重要性", "importance"))
         for name in (self._analysis or {}).get("slice", {}):
             choices.append((f"切片 · {self._row_label(name)}", f"slice:{name}"))
+        surface = (self._analysis or {}).get("surface") or {}
+        if surface.get("available"):
+            choices.append(("响应面矩阵", "surface"))
         self._rebuild_analysis_buttons(choices)
 
     def _clear_result_analysis_items(self) -> None:
@@ -2205,46 +2907,130 @@ class TuningPage(QWidget):
             self.analysis_plot.view.removeItem(item)
         self._analysis_items.clear()
         self.analysis_plot.set_series([])
-        self.analysis_plot.view.getAxis("bottom").setTicks(None)
+        self.analysis_plot.clear_trials()
+        for axis in ("bottom", "left"):
+            self.analysis_plot.view.getAxis(axis).setTicks(None)
+        self.analysis_plot.view.getAxis("bottom").setLabel("轮次")
+        self.analysis_plot.view.getAxis("left").setLabel(self._objective_axis_label())
 
     def _render_result_analysis(self, *_args) -> None:
-        """在结果页渲染历史、重要性或单参数切片。"""
+        """渲染历史 / 重要性 / 切片（论文式样式：轴标签带单位、标注最优、图注写来源）。"""
+        import numpy as np
         import pyqtgraph as pg
 
         self._clear_result_analysis_items()
         choice = getattr(self, "analysis_current_choice", "history") or "history"
+        is_surface = choice == "surface"
+        self.analysis_plot.setVisible(not is_surface)
+        self.surface_container.setVisible(is_surface)
+        if is_surface:
+            self._render_surface()
+            return
+
         if choice == "importance":
             values = ((self._analysis or {}).get("importance") or {}).get("values") or {}
             names = list(values)
             scores = [float(values[name]) for name in names]
-            xs = list(range(len(names)))
-            if scores:
-                item = pg.BarGraphItem(x=xs, height=scores, width=0.65, brush="#8BC8EA")
-                self.analysis_plot.view.addItem(item)
-                self._analysis_items.append(item)
-            self.analysis_plot.view.setLabel("bottom", "参数")
-            self.analysis_plot.view.setLabel("left", "重要性（FANOVA）")
-            self.analysis_plot.view.getAxis("bottom").setTicks(
-                [[(i, self._row_label(name)) for i, name in enumerate(names)]]
+            if not scores:
+                # 数据不足时不要画一张空图配一段"已计算 0 个参数"的话：
+                # 直接说清为什么没有，比留白更省操作员的时间。
+                reason = ((self._analysis or {}).get("importance") or {}).get("reason")
+                self.analysis_note.setText(
+                    reason or "还没有重要性数据：有效 Trial 不足或分析尚未加载。"
+                )
+                return
+            order = np.argsort(scores)
+            ranked = [names[index] for index in order]
+            ranked_scores = [scores[index] for index in order]
+            # 横向条形图：参数名写在纵轴刻度上，长的中文名不会被斜着挤
+            bars = pg.BarGraphItem(
+                x0=[0.0] * len(ranked),
+                y=[float(index) for index in range(len(ranked))],
+                width=ranked_scores,
+                height=0.62,
+                brush=plot_style.series_style()["model"]["pen"].color(),
+                pen=pg.mkPen(current_palette()["surfacePanel"], width=1),
             )
+            self.analysis_plot.view.addItem(bars)
+            self._analysis_items.append(bars)
+            for index, (name, score) in enumerate(zip(ranked, ranked_scores)):
+                label = pg.TextItem(f"{score:.3f}", color=current_palette()["textBase"],
+                                    anchor=(0.0, 0.5))
+                label.setPos(score, float(index))
+                self.analysis_plot.view.addItem(label)
+                self._analysis_items.append(label)
+            self.analysis_plot.view.getAxis("left").setTicks(
+                [[(index, self._row_label(name)) for index, name in enumerate(ranked)]]
+            )
+            self.analysis_plot.view.setXRange(0.0, max(ranked_scores) * 1.18, padding=0.0)
+            self.analysis_plot.view.setYRange(-0.6, len(ranked) - 0.4, padding=0.0)
+            self.analysis_plot.view.setLabel("bottom", "重要性（FANOVA）")
+            self.analysis_plot.view.setLabel("left", "参数")
+            count = ((self._analysis or {}).get("n_complete") or 0)
+            method = ((self._analysis or {}).get("importance") or {}).get("method", "")
+            trusted = count >= max(10, 3 * max(1, len(names)))
             self.analysis_note.setText(
-                f"已基于有效 Trial 计算 {len(names)} 个参数的重要性。"
+                f"基于 {count} 个有效 Trial 计算 {len(names)} 个参数的重要性"
+                f"（{method or '未记录方法'}）。"
+                + ("" if trusted else "有效 Trial 数偏少，排名只能作为方向参考，不要当作定论。")
             )
             return
+
         if choice.startswith("slice:"):
             name = choice.split(":", 1)[1]
             points = ((self._analysis or {}).get("slice") or {}).get(name) or []
-            xs = [float(point[0]) for point in points]
-            ys = [float(point[1]) for point in points]
-            if xs:
-                item = pg.ScatterPlotItem(
-                    x=xs, y=ys, size=9, symbol="o", brush="#3b82f6", pen=None
+            xs = np.asarray([float(point[0]) for point in points], dtype=float)
+            ys = np.asarray([float(point[1]) for point in points], dtype=float)
+            if xs.size:
+                style = plot_style.series_style()
+                scatter = pg.ScatterPlotItem(
+                    x=xs, y=ys, size=7, symbol="o",
+                    brush=style["current"]["brush"],
+                    pen=pg.mkPen(current_palette()["surfacePanel"], width=0.8),
                 )
-                self.analysis_plot.view.addItem(item)
-                self._analysis_items.append(item)
+                self.analysis_plot.view.addItem(scatter)
+                self._analysis_items.append(scatter)
+                # 局部均值 + 离散带：单看散点很难判断"是趋势还是噪声"
+                window = max(2, min(5, xs.size // 4 or 2))
+                if xs.size >= 3:
+                    smooth_x, smooth_y, band = self._rolling_summary(xs, ys, window)
+                    mean_curve = self.analysis_plot.view.plot(
+                        smooth_x, smooth_y, pen=style["model"]["pen"]
+                    )
+                    self._analysis_items.append(mean_curve)
+                    upper = self.analysis_plot.view.plot(smooth_x, smooth_y + band,
+                                                         pen=pg.mkPen(None))
+                    band_color = style["model"]["pen"].color().lighter(160)
+                    band_color.setAlpha(50)
+                    lower = self.analysis_plot.view.plot(
+                        smooth_x, smooth_y - band,
+                        pen=pg.mkPen(None), fillLevel=0.0,
+                        brush=pg.mkBrush(band_color),
+                    )
+                    self._analysis_items.extend([upper, lower])
+                best_index = int(np.argmax(ys))
+                marker, label = plot_style.best_point_marker(
+                    float(xs[best_index]), float(ys[best_index]),
+                    f"最优 {ys[best_index]:.3f} @ {xs[best_index]:g}",
+                )
+                self.analysis_plot.view.addItem(marker)
+                self._analysis_items.append(marker)
+                if label is not None:
+                    self.analysis_plot.view.addItem(label)
+                    self._analysis_items.append(label)
+                self.analysis_plot.view.addItem(
+                    pg.InfiniteLine(
+                        pos=float(xs[best_index]), angle=90,
+                        pen=pg.mkPen(current_palette()["plotBest"], width=1,
+                                     style=Qt.PenStyle.DashLine),
+                    )
+                )
             self.analysis_plot.view.setLabel("bottom", self._row_label(name))
-            self.analysis_plot.view.setLabel("left", "目标量")
-            self.analysis_note.setText(f"共 {len(points)} 个切片样本点。")
+            self.analysis_plot.view.setLabel("left", self._objective_axis_label())
+            self.analysis_note.setText(
+                f"共 {len(points)} 个切片样本点；橙线为局部均值（窗口 {max(2, min(5, len(points) // 4 or 2))} 点），"
+                "淡带为局部离散度。切片用的是算法建议值，不是设备回读。"
+            )
             return
 
         points = ((self._analysis or {}).get("history") or {}).get("points") or []
@@ -2261,11 +3047,63 @@ class TuningPage(QWidget):
             for value in ys:
                 running = value if running is None else max(running, value)
                 best.append(running)
-        self.analysis_plot.view.setLabel("bottom", "Trial / 轮次")
-        self.analysis_plot.view.setLabel("left", "目标量")
-        self.analysis_plot.set_series([(xs, ys)], best=best)
+        if not ys:
+            self.analysis_note.setText("还没有可用轮次：任务跑起来后这里会显示爬山图。")
+            return
+        errors = [self._objective_error(it) for it in (self._iterations or [])]
+        usable_count = len(ys)
+        # 误差棒只在"逐轮记录与图上的点一一对应"时才画：分析数据来自 Optuna trial
+        # 投影时长度可能不等于本地轮次，硬拼会把误差棒挂到错误的点上。
+        error_bars = errors if len(errors) == usable_count and any(errors) else None
+        self.analysis_plot.plot_trials(
+            xs,
+            ys,
+            best=best,
+            errors=error_bars,
+            baseline=self._baseline,
+            best_text=self._best_point_text(xs, ys),
+            x_label="Trial / 轮次",
+            y_label=self._objective_axis_label(),
+            source=self._plot_source_note(),
+        )
         self.analysis_note.setText(
-            f"共 {len(ys)} 个有效点；实线为本轮测量，虚线为历史最优。"
+            f"共 {usable_count} 个有效点：散点为单轮测量"
+            + ("（带误差棒）" if error_bars else "（服务端未提供采样离散度，暂不画误差棒）")
+            + "，阶梯线为历史最优；横线为启动前基线（如果读到）。"
+            + f"  {self._plot_source_note()}"
+        )
+
+    @staticmethod
+    def _rolling_summary(
+        xs, ys, window: int
+    ) -> tuple["np.ndarray", "np.ndarray", "np.ndarray"]:
+        """按 x 排序后的局部均值与离散度（切片图的趋势线）。
+
+        不用 GP 拟合：客户端不该为了画一张趋势线引入重量级依赖；局部均值能诚实
+        表达"附近这几点的平均水平"，窗口大小写进图注，不冒充模型预测。
+
+        返回 numpy 数组而不是 list：调用方要算 ``mean ± band``，
+        list 的 ``+`` 是拼接，会把两个长度 3 的序列拼成长度 6 再把图画崩。
+        """
+        import numpy as np
+
+        order = np.argsort(xs)
+        sorted_x = np.asarray(xs, dtype=float)[order]
+        sorted_y = np.asarray(ys, dtype=float)[order]
+        mean_x: list[float] = []
+        mean_y: list[float] = []
+        band: list[float] = []
+        for index in range(sorted_x.size):
+            lo = max(0, index - window // 2)
+            hi = min(sorted_x.size, lo + window)
+            window_y = sorted_y[lo:hi]
+            mean_x.append(float(sorted_x[index]))
+            mean_y.append(float(window_y.mean()))
+            band.append(float(window_y.std()) if window_y.size > 1 else 0.0)
+        return (
+            np.asarray(mean_x, dtype=float),
+            np.asarray(mean_y, dtype=float),
+            np.asarray(band, dtype=float),
         )
 
     def _fill_analysis_trials(self) -> None:

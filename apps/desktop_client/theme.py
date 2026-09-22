@@ -92,6 +92,19 @@ QFrame#manualFrame, QWidget#manualCanvas { background: transparent; border: none
 QFrame#noticePanel { background: $noticeBg; border: 1px solid $panelBorder;
                      border-radius: ${radiusCard}px; }
 QFrame#sepLine { color: $separator; }
+/* 调束页的紧凑分区卡与页脚状态带（仅这些 objectName 使用，不影响其它页面）：
+   折叠卡把"目标与算法 / 采样与稳定 / 安全保护"分成三块，每块收起时只留一行标题与摘要；
+   状态带常驻页脚，保证"开始"按钮不随表单滚动跑出屏幕。 */
+QFrame#foldSection { background: transparent; border: 1px solid $panelBorder;
+                     border-radius: ${radiusControl}px; }
+QPushButton#foldHeader { min-height: 24px; max-height: 24px; padding: 0 4px;
+                         background: transparent; border: none; color: $headText;
+                         font-weight: 600; text-align: left; }
+QPushButton#foldHeader:hover { color: $accent; background: transparent; }
+QPushButton#foldHeader:focus { border: none; }
+QLabel#foldSummary { color: $muted; font-size: ${fontCaption}px; }
+QFrame#statusStrip { background: $surfacePanel; border: 1px solid $panelBorder;
+                     border-radius: ${radiusControl}px; }
 
 /* L2 玻璃面（由 GlassCard 自绘，QSS 不画背景避免双重绘制） */
 QFrame#glassCard, QFrame#serviceCard, QFrame#heroCard, QFrame#contextCard,
@@ -202,10 +215,15 @@ QComboBox QAbstractItemView { background: $surfacePanel; color: $textBase;
                               padding: 4px; selection-background-color: $accentSoft;
                               selection-color: $textBase; outline: none; }
 
-/* 手动控制的密集表格行：行内输入框单独压扁 */
-QDoubleSpinBox#rowInput, QComboBox#rowInput { min-height: 22px; max-height: 22px;
-                                              padding: 0 4px; border-radius: 6px; }
-QDoubleSpinBox#rowInput:disabled, QComboBox#rowInput:disabled {
+/* 手动控制的密集表格行：行内输入框单独压扁。
+   调束页的紧凑表单网格复用同一套样式：同一行里放两组"标签 + 字段"，
+   行高因此从 32px 压到 22px——这是三个页签能在一屏内显示完的前提。
+   （仅对显式标注 #rowInput 的控件生效，不影响其它页面。） */
+QDoubleSpinBox#rowInput, QComboBox#rowInput, QSpinBox#rowInput, QLineEdit#rowInput {
+    min-height: 22px; max-height: 22px;
+    padding: 0 4px; border-radius: 6px; }
+QDoubleSpinBox#rowInput:disabled, QComboBox#rowInput:disabled,
+QSpinBox#rowInput:disabled, QLineEdit#rowInput:disabled {
     background: $disabledBg; color: $disabledText; }
 /* 三列版式里设定框只有 72px：上下箭头让给数字，滚轮与方向键照样能调 */
 QDoubleSpinBox#rowInput::up-button, QDoubleSpinBox#rowInput::down-button {
