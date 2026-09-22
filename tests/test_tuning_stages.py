@@ -72,7 +72,7 @@ def two_variable_request(**overrides: object) -> TuningRunRequest:
 
 class StageStrategyTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._directory = tempfile.TemporaryDirectory()
+        self._directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.store = TuningStore(Path(self._directory.name))
         self.locks = DeviceLockManager()
         self.config = two_variable_config()
@@ -305,7 +305,7 @@ class IterationStageStoreTests(unittest.TestCase):
     """阶段的落盘与老库迁移：历史轮次没有这一列时读出来是"未记录"，不猜。"""
 
     def setUp(self) -> None:
-        self._directory = tempfile.TemporaryDirectory()
+        self._directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self._directory.cleanup)
         self.path = Path(self._directory.name)
 

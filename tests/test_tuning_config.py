@@ -127,7 +127,7 @@ class TuningConfigFileTests(unittest.TestCase):
     """文件层：存得住、读得回，坏内容只丢坏的那一项。"""
 
     def setUp(self) -> None:
-        self._directory = tempfile.TemporaryDirectory()
+        self._directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.path = Path(self._directory.name) / "tuning_config.json"
 
     def tearDown(self) -> None:
@@ -269,7 +269,7 @@ class TuningPageConfigTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
-        self._directory = tempfile.TemporaryDirectory()
+        self._directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.path = Path(self._directory.name) / "tuning_config.json"
         self._env = mock.patch.dict(
             os.environ, {tuning_config.CONFIG_ENV_VAR: str(self.path)}

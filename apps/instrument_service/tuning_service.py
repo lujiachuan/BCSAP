@@ -678,13 +678,26 @@ class TuningService:
         为什么改成循环：旧实现在 ``_propose_next`` 与 ``_execute_pending`` 之间互相调用，
         每轮往调用栈上压两层帧。200 轮的 auto 任务要压 400+ 帧，再叠加 Python 默认
         1000 帧上限，属于"跑得越久越接近崩"的隐患；循环写法与轮次多少无关。
+
+        **同时只允许一个驱动线程**：两个驱动各跑各的循环时，日志会出现
+        "第 6 轮候选 → 第 5 轮开始执行"这种错位（各自 propose/execute 相互穿插），
+        而且同一轮可能被写两次。这里显式拦住（重复的 /resume 也会走到这里）。
         """
+        existing = run.driver
+        if existing is not None and existing.is_alive():
+            self._emit(
+                run,
+                f"已有驱动线程在运行（{existing.name}），忽略重复的驱动请求",
+                level=LEVEL_WARN,
+            )
+            return
         thread = threading.Thread(
             target=self._auto_driver_loop, args=(run,), daemon=True
         )
         with self._lock:
             run.driver = thread
         thread.start()
+        self._emit(run, f"自动调束驱动已启动（{thread.name}）", phase=PHASE_IDLE)
 
     def _auto_driver_loop(self, run: _Run) -> None:
         """全自动主循环：提候选 → 执行一轮 → 再提候选，直到终态 / 暂停 / 出错。"""
@@ -710,7 +723,6 @@ class TuningService:
                     return
         except Exception as exc:  # noqa: BLE001 —— 驱动线程兜底
             self._finish_failed(run, f"自动调束驱动异常：{exc}")
-
     def _read_with_retry(self, read: Callable[[], float | None]) -> float | None:
         """读一次现场值，失败就退避重试几次再认输。
 
@@ -1323,6 +1335,12 @@ class TuningService:
             + (f"，刷新历史最优（{best_objective:.4f}）" if improved else "")
             + (
                 f"，耗时 {iteration.duration_ms / 1000:.2f}s"
+                + (
+                    f"（写入 {iteration.write_s:.2f}s · 稳定 {iteration.settle_s:.2f}s"
+                    f" · 测量 {iteration.measure_s:.2f}s）"
+                    if iteration.write_s is not None
+                    else ""
+                )
                 if iteration.duration_ms
                 else ""
             )
@@ -1334,6 +1352,9 @@ class TuningService:
             quality=iteration.quality,
             is_best=bool(improved),
             duration_ms=iteration.duration_ms,
+            write_s=iteration.write_s,
+            settle_s=iteration.settle_s,
+            measure_s=iteration.measure_s,
             sample_count=iteration.sample_count,
             sample_spread=iteration.sample_spread,
             failure_step=iteration.failure_step,
@@ -1806,6 +1827,12 @@ class TuningService:
         unsettled: list[str] = []
         proposed_at = proposal.at
         started = time.monotonic()
+        # 分段计时：写入（含斜坡步进）/ 等稳定 / 测量各花多少时间。
+        # 现场问"这一轮为什么慢"时，只有总耗时是答不出来的——本轮实测表明
+        # 大头通常是**逐路缓变写入的斜坡限速**，而不是采样或保持时间。
+        write_s = 0.0
+        settle_s = 0.0
+        measure_s = 0.0
 
         for variable in request.enabled_variables():
             entry = self._entry(variable.signal)
@@ -1824,9 +1851,13 @@ class TuningService:
                     )
                 continue
             target_value = proposal.values[variable.signal]
+            write_started = time.monotonic()
             result = self._signals.write(
                 SignalWriteRequest(signal=variable.signal, value=target_value, ramp=True)
             )
+            write_elapsed = time.monotonic() - write_started
+            write_s += write_elapsed
+            steps = len(result.ramp_steps or [])
             if not result.accepted:
                 self._emit(
                     run,
@@ -1854,6 +1885,9 @@ class TuningService:
                         applied_at=None,
                         failure_step="write_rejected",
                         duration_ms=int((time.monotonic() - started) * 1000),
+                        write_s=round(write_s, 3),
+                        settle_s=round(settle_s, 3),
+                        measure_s=round(measure_s, 3),
                     ),
                     result.device_state_unknown,
                 )
@@ -1863,6 +1897,11 @@ class TuningService:
             self._emit(
                 run,
                 f"写入 {entry.label} = {applied[variable.signal]:g} {entry.unit}"
+                + (
+                    f"（斜坡 {steps} 步，耗时 {write_elapsed:.2f}s）"
+                    if steps > 1
+                    else f"（单步写入，耗时 {write_elapsed:.2f}s）"
+                )
                 + (
                     f"（执行层实际下发 {float(result.applied):g}）"
                     if result.applied is not None
@@ -1883,7 +1922,8 @@ class TuningService:
                 timeout=request.settle_timeout_s,
                 readback_signal=entry.readback_signal or None,
             )
-            settle_s = time.monotonic() - settle_started
+            settle_elapsed = time.monotonic() - settle_started
+            settle_s += settle_elapsed
             if actual is not None:
                 readback[variable.signal] = float(actual)
             self._emit(
@@ -1896,14 +1936,15 @@ class TuningService:
                         f"（当前 {float(actual):g}）" if actual is not None
                         else f"{entry.label} 回读读不到"
                     )
-                ),
+                )
+                + f"（等待 {settle_elapsed:.2f}s）",
                 level=LEVEL_INFO if settled else LEVEL_WARN,
                 phase=PHASE_SETTLING,
                 iteration=proposal.iteration,
                 signal=variable.signal,
                 settled=bool(settled),
                 readback=None if actual is None else float(actual),
-                seconds=round(settle_s, 3),
+                seconds=round(settle_elapsed, 3),
             )
             if not settled:
                 # 未稳定仍如实记录：实际回读才是设备真实位置。但质量要标出来，
@@ -1912,6 +1953,7 @@ class TuningService:
 
         applied_at = _now()
         samples: list[float] = []
+        measure_started = time.monotonic()
         # 「保持时间」：稳定判据过了之后再等一会儿——有些量（气路、真空）到位后
         # 仍然在缓慢变化，不等就是把过渡态当成稳态测进目标里。
         if request.hold_s:
@@ -1940,6 +1982,7 @@ class TuningService:
                 sample_index=index,
                 value=None if value is None else float(value),
             )
+        measure_s = time.monotonic() - measure_started
         measured_at = _now()
 
         if not samples:
@@ -1961,6 +2004,9 @@ class TuningService:
                     measured_at=measured_at,
                     failure_step="read_failed",
                     duration_ms=int((time.monotonic() - started) * 1000),
+                    write_s=round(write_s, 3),
+                    settle_s=round(settle_s, 3),
+                    measure_s=round(measure_s, 3),
                 ),
                 False,
             )
@@ -1992,6 +2038,9 @@ class TuningService:
                 sample_spread=spread,
                 samples=samples,
                 failure_step="unsettled" if unsettled else None,
+                write_s=round(write_s, 3),
+                settle_s=round(settle_s, 3),
+                measure_s=round(measure_s, 3),
             ),
             False,
         )

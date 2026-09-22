@@ -38,7 +38,7 @@ def _timestamp(value: str) -> datetime:
 
 class TuningEventTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._directory = tempfile.TemporaryDirectory()
+        self._directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.directory = Path(self._directory.name)
         self.store = TuningStore(self.directory)
         self.config = build_config()
@@ -245,7 +245,7 @@ class TuningEventApiTests(unittest.TestCase):
     """路由契约：直接调 endpoint（不起 HTTP 服务，也不碰现场设备）。"""
 
     def setUp(self) -> None:
-        self._directory = tempfile.TemporaryDirectory()
+        self._directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
 
     def tearDown(self) -> None:
         self._directory.cleanup()

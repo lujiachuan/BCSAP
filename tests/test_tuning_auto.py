@@ -85,7 +85,7 @@ def request(**overrides: object) -> TuningRunRequest:
 
 class TuningAutoTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._directory = tempfile.TemporaryDirectory()
+        self._directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.store = TuningStore(Path(self._directory.name))
         self.locks = DeviceLockManager()
 

@@ -63,7 +63,7 @@ class TuningClientFixTests(unittest.TestCase):
         for patcher in self._network_patches:
             patcher.start()
             self.addCleanup(patcher.stop)
-        self._directory = tempfile.TemporaryDirectory()
+        self._directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self._directory.cleanup)
 
     def make_page(self, *, run_id: str | None = None) -> TuningPage:

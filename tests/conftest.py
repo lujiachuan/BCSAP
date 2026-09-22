@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import importlib
 import urllib.request
 from urllib.parse import urlparse
 
@@ -91,3 +92,59 @@ def forbid_live_dev_service_writes(monkeypatch: pytest.MonkeyPatch):
         "以下写请求打到了真实开发服务（会改动现场配置或设备）："
         + "；".join(_violations)
     )
+
+
+@pytest.fixture(autouse=True)
+def block_tuning_read_requests(monkeypatch: pytest.MonkeyPatch):
+    """调束页**构造时**会真的去拉映射/目录/能力：单测里一律换成"永不完成"的假线程。
+
+    为什么必须拦：本机常常正跑着一个执行服务（现场联调时就是如此）。真发请求会让
+    `_on_mapping` 在**用例中途**回调，把测试自己塞进去的 4 路映射覆盖成现场的 29 路，
+    于是"范围标尺应有 4 行"这类断言时好时坏——2026-09-22 实测踩到过
+    （87 != 12）。测试的结果不该取决于现场此刻有没有服务在跑。
+    """
+    from apps.desktop_client import instrument_api
+
+    class _NeverFinishes:
+        """假请求线程：connect 之后永远不回调，页面停在"已发出、还没回来"。"""
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.completed = _SignalStub()
+            self.finished = _SignalStub()
+
+        def start(self) -> None:
+            return None
+
+        def isRunning(self) -> bool:  # noqa: N802
+            return False
+
+        def deleteLater(self) -> None:  # noqa: N802
+            return None
+
+    class _SignalStub:
+        def connect(self, *_args, **_kwargs) -> None:
+            return None
+
+    def fake(*_args, **_kwargs) -> _NeverFinishes:
+        return _NeverFinishes()
+
+    for name in (
+        "request_tuning_catalog",
+        "request_tuning_capabilities",
+        "request_tuning_runs",
+        "request_tuning_status",
+        "request_tuning_iterations",
+        "request_tuning_progress",
+        "request_tuning_events",
+    ):
+        if hasattr(instrument_api, name):
+            monkeypatch.setattr(instrument_api, name, fake, raising=False)
+    for module_name in ("tuning", "manual", "settings"):
+        try:
+            module = importlib.import_module(
+                f"apps.desktop_client.pages.{module_name}"
+            )
+        except ImportError:  # pragma: no cover - 模块缺失时不该让所有用例挂掉
+            continue
+        if hasattr(module, "PvMappingRequestThread"):
+            monkeypatch.setattr(module, "PvMappingRequestThread", fake, raising=False)

@@ -98,6 +98,10 @@ MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("tuning_iterations", "sample_spread", "REAL"),
     ("tuning_iterations", "samples_json", "TEXT"),
     ("tuning_iterations", "failure_step", "TEXT"),
+    # 分段耗时（写入 / 等稳定 / 测量）
+    ("tuning_iterations", "write_s", "REAL"),
+    ("tuning_iterations", "settle_s", "REAL"),
+    ("tuning_iterations", "measure_s", "REAL"),
 )
 
 
@@ -225,8 +229,10 @@ class TuningStore:
                 " (run_id, iteration, proposed_json, applied_json, readback_json,"
                 "  target, objective, quality, detail, at, stage,"
                 "  proposed_at, applied_at, settled_at, measured_at, duration_ms,"
-                "  sample_count, sample_spread, samples_json, failure_step)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "  sample_count, sample_spread, samples_json, failure_step,"
+                "  write_s, settle_s, measure_s)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+                " ?, ?, ?)",
                 (
                     run_id,
                     iteration.iteration,
@@ -250,6 +256,9 @@ class TuningStore:
                     if iteration.samples
                     else None,
                     iteration.failure_step,
+                    iteration.write_s,
+                    iteration.settle_s,
+                    iteration.measure_s,
                 ),
             )
 
@@ -292,6 +301,9 @@ class TuningStore:
             sample_spread=value("sample_spread"),
             samples=json.loads(samples_json) if samples_json else [],
             failure_step=value("failure_step"),
+            write_s=value("write_s"),
+            settle_s=value("settle_s"),
+            measure_s=value("measure_s"),
         )
 
     # ------------------------------------------------------------------

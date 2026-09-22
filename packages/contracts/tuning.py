@@ -372,6 +372,12 @@ class TuningIteration(BaseModel):
     measured_at: str | None = None
     # 本轮从"提出候选"到"测完目标"的墙钟耗时（毫秒）
     duration_ms: int | None = None
+    # 总耗时的分段构成（秒）：写入（含斜坡步进）/ 等回读稳定 / 测量目标。
+    # 现场问"这一轮为什么慢"时，只有总耗时是答不出来的——实测大头通常是
+    # 逐路缓变写入的斜坡限速，而不是采样次数或保持时间。
+    write_s: float | None = None
+    settle_s: float | None = None
+    measure_s: float | None = None
     # 目标重复采样：次数、标准差与原始样本。
     # 只给中位数不给离散度，无法判断一次"提升"是真提升还是噪声。
     sample_count: int = 0

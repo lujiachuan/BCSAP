@@ -16,7 +16,7 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QScrollArea, QTabWidget
+from PySide6.QtWidgets import QApplication, QComboBox, QScrollArea, QTabWidget
 
 from apps.desktop_client import instrument_api
 from apps.desktop_client.pages.tuning import TuningPage
@@ -285,9 +285,8 @@ class TuningLayoutTests(unittest.TestCase):
         }
 
         page._refresh_result_analysis_choices()
-        choices = [
-            button.text() for button in page._analysis_buttons
-        ]
+        combo = page.analysis_choice_combo
+        choices = [combo.itemText(index) for index in range(combo.count())]
         self.assertIn("参数重要性", choices)
         self.assertIn(f"切片 · {page._row_label(MAGNET)}", choices)
 
@@ -296,13 +295,37 @@ class TuningLayoutTests(unittest.TestCase):
         page._set_analysis_choice(f"slice:{MAGNET}")
         self.assertIn("切片", page.analysis_note.text())
 
+    def test_view_selectors_are_dropdowns_not_button_rows(self) -> None:
+        """视图选择必须是下拉：按钮排在变量多时会被挤爆、被滚动条压住看不见。"""
+        page = self.make_page(records=24)
+
+        self.assertIsInstance(page.plot_choice, QComboBox)
+        self.assertFalse(page.plot_choice.isHidden())
+        self.assertIsInstance(page.analysis_choice_combo, QComboBox)
+        self.assertFalse(page.analysis_choice_combo.isHidden())
+        # 下拉宽度只占一个控件，不再需要横向滚动区
+        self.assertEqual(page.findChildren(QComboBox) and True, True)
+        self.assertFalse(hasattr(page, "analysis_scroll"))
+
+    def test_process_view_dropdown_lists_every_variable(self) -> None:
+        page = self.make_page(records=8)
+
+        data = [
+            page.plot_choice.itemData(index)
+            for index in range(page.plot_choice.count())
+        ]
+
+        self.assertEqual(data[0], "")
+        self.assertIn(MAGNET, data)
+        self.assertIn(FOCUS, data)
+
     def test_analysis_choice_falls_back_to_data_not_button_text(self) -> None:
         """回归：回退时曾把按钮**文本**写进 analysis_current_choice，导致视图对不上。"""
         page = self.make_page(records=3)
 
         page._analysis_current_choice = "slice:不存在的参数"
         page.analysis_current_choice = "slice:不存在的参数"
-        page._rebuild_analysis_buttons([("优化历史", "history")])
+        page._rebuild_analysis_choices([("优化历史", "history")])
 
         self.assertEqual(page.analysis_current_choice, "history")
 

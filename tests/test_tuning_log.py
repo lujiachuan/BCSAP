@@ -62,7 +62,7 @@ class TuningProcessLogTests(unittest.TestCase):
         for patcher in self._patches:
             patcher.start()
             self.addCleanup(patcher.stop)
-        self._directory = tempfile.TemporaryDirectory()
+        self._directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self._directory.cleanup)
 
     def make_page(self, run_id: str | None = "run-1") -> TuningPage:
@@ -294,11 +294,18 @@ class LogLineTests(unittest.TestCase):
         record["duration_ms"] = 3740
         record["sample_spread"] = 0.08
         record["sample_count"] = 3
+        record["write_s"] = 3.1
+        record["settle_s"] = 0.5
+        record["measure_s"] = 0.04
 
         lines = tuning_analysis.log_lines([record], target_signal="FC1", timestamps=True)
 
         self.assertRegex(lines[0], r"^\[\d{2}:\d{2}:\d{2}\.\d{3}\] \[第 4 轮")
         self.assertIn("耗时 3.74s", lines[0])
+        # 分段耗时：现场要一眼看出时间花在写入、等稳定还是测量上
+        self.assertIn("写入 3.10s", lines[0])
+        self.assertIn("稳定 0.50s", lines[0])
+        self.assertIn("测量 0.04s", lines[0])
         self.assertIn("σ 0.080", lines[0])
         self.assertIn("3 次采样", lines[0])
 

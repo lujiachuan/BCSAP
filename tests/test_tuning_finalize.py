@@ -26,7 +26,7 @@ SAFE_MAGNET = 0.0  # 测试映射里磁铁的下限
 
 class TuningFinalizeTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._directory = tempfile.TemporaryDirectory()
+        self._directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.store = TuningStore(Path(self._directory.name))
         self.locks = DeviceLockManager()
         self.config = build_config()

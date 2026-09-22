@@ -276,7 +276,7 @@ class TuningAnalysisPageTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
-        self._directory = tempfile.TemporaryDirectory()
+        self._directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self._directory.cleanup)
         self.config_path = Path(self._directory.name) / "tuning_config.json"
         self._env = mock.patch.dict(

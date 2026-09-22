@@ -887,22 +887,26 @@ class TuningPage(QWidget):
         )
         plot_tool_row = QHBoxLayout()
         plot_tool_row.setContentsMargins(0, 0, 0, 0)
-        plot_tool_row.setSpacing(4)
+        plot_tool_row.setSpacing(6)
         plot_tool_row.addWidget(QLabel("视图", objectName="mutedText"))
-        self.plot_button_row = QHBoxLayout()
-        self.plot_button_row.setSpacing(4)
-        plot_tool_row.addLayout(self.plot_button_row, 1)
+        # 视图选择用**下拉**：变量多的时候按钮会铺满一整行、放不下也点不准。
+        # 下拉只有一个控件宽度，长标签走 elide + tooltip，条目再多也不影响布局。
+        self.plot_choice = QComboBox()
+        mark_compact(self.plot_choice)
+        self.plot_choice.setMinimumWidth(240)
+        self.plot_choice.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.plot_choice.setMinimumContentsLength(18)
+        self.plot_choice.setToolTip("切换过程视图：收敛曲线 / 单个变量的响应曲线")
+        # 索引变化就重画：不再维护"按钮选中态"与"真实视图"两套状态
+        self.plot_choice.currentIndexChanged.connect(lambda _index: self._render_plot())
+        plot_tool_row.addWidget(self.plot_choice, 1)
         self.btn_export_plot = QPushButton("导出图", objectName="plotToolButton")
         self.btn_export_plot.setToolTip("导出当前曲线（PNG / SVG / PDF）")
         self.btn_export_plot.clicked.connect(lambda: self._export_plot(self.tuning_plot, "收敛曲线"))
         plot_tool_row.addWidget(self.btn_export_plot)
         plot_panel.body.addLayout(plot_tool_row)
-        # 兼容旧引用：_render_plot 读 currentData()，用一个隐藏的 QComboBox 存当前选择
-        from PySide6.QtWidgets import QComboBox as _QCB
-        self.plot_choice = _QCB()
-        self.plot_choice.hide()
-        # 索引变化就重画：按钮组只负责改索引，避免"按钮选了、图没换"的两套状态
-        self.plot_choice.currentIndexChanged.connect(lambda _index: self._render_plot())
         self.tuning_plot = SpectrumPlot("轮次", "目标量")
         self.tuning_plot.setMinimumHeight(260)
         self.tuning_plot.use_science_style(x_label="轮次", y_label="目标量", legend=True)
@@ -1074,23 +1078,24 @@ class TuningPage(QWidget):
         analysis_toolbar = QHBoxLayout()
         analysis_toolbar.setContentsMargins(0, 0, 0, 0)
         analysis_toolbar.setSpacing(6)
-        # 按钮组：直接点切换，不再塞下拉里
-        self.analysis_button_group = QButtonGroup(self)
-        self.analysis_button_group.setExclusive(True)
-        self.analysis_buttons_row = QHBoxLayout()
-        self.analysis_buttons_row.setSpacing(4)
-        # 变量很多时按钮会溢出：放进可横向滚动条，仍是一键直接切换
-        buttons_host = QWidget()
-        buttons_host.setLayout(self.analysis_buttons_row)
-        buttons_host.setFixedHeight(26)
-        self.analysis_scroll = QScrollArea()
-        self.analysis_scroll.setWidget(buttons_host)
-        self.analysis_scroll.setWidgetResizable(True)
-        self.analysis_scroll.setFixedHeight(30)
-        self.analysis_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.analysis_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.analysis_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        analysis_toolbar.addWidget(self.analysis_scroll, 1)
+        # 分析视图也用**下拉**：原来把每个"切片 · 参数名"做成按钮塞进一条 30px 高的
+        # 横向滚动区，条目一多就被滚动条压住看不见（变量十几个时尤其明显）。
+        # 下拉只有一个控件宽度，条目再多也不影响布局。
+        analysis_toolbar.addWidget(QLabel("分析视图", objectName="mutedText"))
+        self.analysis_choice_combo = QComboBox()
+        mark_compact(self.analysis_choice_combo)
+        self.analysis_choice_combo.setMinimumWidth(240)
+        self.analysis_choice_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.analysis_choice_combo.setMinimumContentsLength(18)
+        self.analysis_choice_combo.setToolTip(
+            "优化历史 / 参数重要性 / 各参数切片 / 响应面矩阵；变量多时用它切换"
+        )
+        self.analysis_choice_combo.currentIndexChanged.connect(
+            lambda _index: self._on_analysis_choice_changed()
+        )
+        analysis_toolbar.addWidget(self.analysis_choice_combo, 1)
         self.btn_export_analysis = QPushButton("导出图", objectName="plotToolButton")
         self.btn_export_analysis.setToolTip("导出当前分析图（PNG / SVG / PDF）")
         self.btn_export_analysis.clicked.connect(self._export_current_analysis)
@@ -1106,7 +1111,7 @@ class TuningPage(QWidget):
         analysis_toolbar.addWidget(self.open_dashboard_button)
         analysis.body.addLayout(analysis_toolbar)
         self.analysis_current_choice = "history"
-        self._rebuild_analysis_buttons([("优化历史", "history")])
+        self._rebuild_analysis_choices([("优化历史", "history")])
         self.analysis_plot = SpectrumPlot("轮次", "目标量")
         self.analysis_plot.setMinimumHeight(240)
         self.analysis_plot.use_science_style(x_label="轮次", y_label="目标量")
@@ -2635,33 +2640,27 @@ class TuningPage(QWidget):
     # 过程视图：收敛曲线 / 单变量响应曲线 / 过程建议 / 日志
     # ------------------------------------------------------------------
     def _refresh_plot_choices(self) -> None:
-        """过程页只保留收敛与变量响应，事后分析统一放在结果页。"""
+        """过程页视图列表：收敛 + 每个出现过的变量（下拉，变量多也不挤）。
+
+        变量多时条目会很长，所以每项的 tooltip 写全名，显示交给下拉自己 elide。
+        """
         variables = tuning_analysis.curve_variables(self._iterations)
         current = self.plot_choice.currentData() or ""
-        # 清空旧按钮
-        while self.plot_button_row.count():
-            item = self.plot_button_row.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
         self.plot_choice.blockSignals(True)
         self.plot_choice.clear()
-        from PySide6.QtWidgets import QPushButton
-        def _add_btn(label: str, data: str) -> None:
-            self.plot_choice.addItem(label, data)
-            btn = QPushButton(label, checkable=True, objectName="plotToolButton")
-            btn.setChecked(data == current)
-            btn.clicked.connect(lambda _checked=False, d=data: self._select_view(d))
-            self.plot_button_row.addWidget(btn)
-        _add_btn("收敛", "")
+        self.plot_choice.addItem("收敛（目标量 vs 轮次）", "")
         for signal in variables:
-            _add_btn(self._row_label(signal), signal)
+            label = self._row_label(signal)
+            self.plot_choice.addItem(label, signal)
+            self.plot_choice.setItemData(
+                self.plot_choice.count() - 1, label, Qt.ItemDataRole.ToolTipRole
+            )
         index = self.plot_choice.findData(current)
         self.plot_choice.setCurrentIndex(max(index, 0))
         self.plot_choice.blockSignals(False)
 
     def _select_view(self, data: str) -> None:
-        """切换过程页视图；索引变化即重画（下拉是按钮组背后的唯一事实来源）。"""
+        """切换过程页视图；索引变化即重画（下拉是唯一事实来源）。"""
         index = self.plot_choice.findData(data)
         if index == self.plot_choice.currentIndex():
             self._render_plot()
@@ -2938,35 +2937,33 @@ class TuningPage(QWidget):
         self._render_result_analysis()
         self._fill_analysis_trials()
 
-    def _rebuild_analysis_buttons(self, choices: list[tuple[str, str]]) -> None:
-        """把分析视图选项做成一排可点按钮（不再用下拉）。"""
-        # 清掉旧按钮
-        for button in getattr(self, "_analysis_buttons", []):
-            self.analysis_button_group.removeButton(button)
-            self.analysis_buttons_row.removeWidget(button)
-            button.deleteLater()
-        self._analysis_buttons = []
+    def _rebuild_analysis_choices(self, choices: list[tuple[str, str]]) -> None:
+        """把分析视图选项灌进下拉（变量多时不再被一排按钮挤爆）。"""
+        combo = getattr(self, "analysis_choice_combo", None)
+        if combo is None:
+            return
         current = getattr(self, "analysis_current_choice", "history") or "history"
         available = [data for _label, data in choices]
         if current not in available and available:
             # 上一轮的选择可能在新任务里已不存在（变量变了或数据不足）：
-            # 回退到第一个可用的 **data**。写成按钮文本会让渲染分支永远对不上，
+            # 回退到第一个可用的 **data**，而不是按钮文本——文本会让渲染分支永远对不上，
             # 于是"看起来切了视图，其实还是旧图"。
             current = available[0]
             self.analysis_current_choice = current
+        combo.blockSignals(True)
+        combo.clear()
         for label, data in choices:
-            btn = QPushButton(label, objectName="plotToolButton")
-            btn.setCheckable(True)
-            btn.setAutoExclusive(True)
-            btn.setMaximumHeight(26)
-            btn.setMinimumWidth(76)
-            btn.setToolTip(label)
-            btn.clicked.connect(lambda _checked=False, d=data: self._set_analysis_choice(d))
-            self.analysis_button_group.addButton(btn)
-            self.analysis_buttons_row.addWidget(btn)
-            self._analysis_buttons.append(btn)
-            if data == current:
-                btn.setChecked(True)
+            combo.addItem(label, data)
+            combo.setItemData(combo.count() - 1, label, Qt.ItemDataRole.ToolTipRole)
+        index = combo.findData(current)
+        combo.setCurrentIndex(max(index, 0))
+        combo.blockSignals(False)
+
+    def _on_analysis_choice_changed(self) -> None:
+        combo = getattr(self, "analysis_choice_combo", None)
+        if combo is None:
+            return
+        self._set_analysis_choice(str(combo.currentData() or "history"))
 
     # ------------------------------------------------------------------
     # 响应面矩阵
@@ -3217,7 +3214,7 @@ class TuningPage(QWidget):
         surface = (self._analysis or {}).get("surface") or {}
         if surface.get("available"):
             choices.append(("响应面矩阵", "surface"))
-        self._rebuild_analysis_buttons(choices)
+        self._rebuild_analysis_choices(choices)
 
     def _clear_result_analysis_items(self) -> None:
         for item in self._analysis_items:

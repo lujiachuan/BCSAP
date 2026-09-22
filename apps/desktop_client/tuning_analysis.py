@@ -247,11 +247,24 @@ def format_local_time(raw: object) -> str:
 
 
 def _timing_note(record: Mapping) -> str:
-    """本轮耗时与采样离散度（拿不到就什么都不写，不假装有数据）。"""
+    """本轮耗时与采样离散度（拿不到就什么都不写，不假装有数据）。
+
+    有分段耗时（写入 / 等稳定 / 测量）时一并写出来：现场最常问的"这一轮为什么慢"
+    只有总耗时是答不出来的——实测大头通常是逐路缓变写入的斜坡限速。
+    """
     parts: list[str] = []
     duration = record.get("duration_ms")
     if isinstance(duration, (int, float)) and duration > 0:
         parts.append(f"耗时 {float(duration) / 1000:.2f}s")
+        write_s = record.get("write_s")
+        settle_s = record.get("settle_s")
+        measure_s = record.get("measure_s")
+        if isinstance(write_s, (int, float)):
+            parts.append(
+                f"写入 {float(write_s):.2f}s"
+                + (f" · 稳定 {float(settle_s):.2f}s" if isinstance(settle_s, (int, float)) else "")
+                + (f" · 测量 {float(measure_s):.2f}s" if isinstance(measure_s, (int, float)) else "")
+            )
     spread = record.get("sample_spread")
     count = record.get("sample_count")
     if isinstance(spread, (int, float)) and spread > 0:

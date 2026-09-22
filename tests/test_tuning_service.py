@@ -74,7 +74,7 @@ def request(**overrides: object) -> TuningRunRequest:
 
 class TuningServiceTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._directory = tempfile.TemporaryDirectory()
+        self._directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.store = TuningStore(Path(self._directory.name))
         self.locks = DeviceLockManager()
 
@@ -183,8 +183,14 @@ class TuningServiceTests(unittest.TestCase):
         service = self.build()
 
         status = service.start(request(mode="auto"))
+        # 启动即返回：驱动线程可能已经把第一轮推到"写入设备"（applying），
+        # 也可能还在 running / 已经跑完（轮次很少时）。这些都属于"auto 被接受"。
         self.assertIn(
-            status.state, ("running", "awaiting_confirmation", "completed", "failed")
+            status.state,
+            (
+                "running", "applying", "awaiting_confirmation",
+                "completed", "failed",
+            ),
         )
         service.join(status.run_id, timeout=5.0)
         self.assertTrue(service.wait_idle(timeout=5.0))

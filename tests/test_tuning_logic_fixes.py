@@ -73,7 +73,7 @@ class _ServiceHarness(unittest.TestCase):
     """可控制目标读数的 TuningService（SIM 的 fc1 是算出来的，写 `_values` 不生效）。"""
 
     def setUp(self) -> None:
-        self._directory = tempfile.TemporaryDirectory()
+        self._directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.directory = Path(self._directory.name)
         self.locks = DeviceLockManager()
 
