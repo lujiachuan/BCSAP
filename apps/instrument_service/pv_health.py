@@ -42,6 +42,9 @@ def create_simulated_gateway(config: PvMappingConfig | None = None) -> Simulated
 
     同时按映射里的 ``readback_signal`` 建立「设定 → 回读」耦合，让模拟设备
     表现得像一个真的会跟随的电源，而不是一张扁平键值表。
+
+    无硬件联调时，把 4 个 DW 调优参数的 SIM 起点拉到离最优工作点（195/2500/2500/5100）
+    稍偏但仍有可观束流的位置，这样寻优一开始就能看到 fc1 上升曲线。
     """
     target = config or pv_mapping.default_config()
     coupling = {
@@ -49,9 +52,22 @@ def create_simulated_gateway(config: PvMappingConfig | None = None) -> Simulated
         for entry in target.entries
         if entry.readback_signal
     }
-    return SimulatedEpicsGateway(
-        pv_mapping.simulated_seed_values(target), coupling=coupling
-    )
+    seeds = pv_mapping.simulated_seed_values(target)
+    # SIM 起点：略偏离最优，便于观察寻优收敛
+    _sim_start = {
+        "hv_array.dw01.voltage_setpoint": 80.0,
+        "hv_array.dw02.voltage_setpoint": 1200.0,
+        "hv_array.dw03.voltage_setpoint": 1300.0,
+        "hv_array.dw04.voltage_setpoint": 2400.0,
+    }
+    for sig, val in _sim_start.items():
+        if sig in seeds:
+            unit = seeds[sig][1]
+            seeds[sig] = (val, unit)
+            rb = coupling.get(sig)
+            if rb and rb in seeds:
+                seeds[rb] = (val, seeds[rb][1])
+    return SimulatedEpicsGateway(seeds, coupling=coupling)
 
 
 def check_pv_health(

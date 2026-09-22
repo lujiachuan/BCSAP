@@ -1142,8 +1142,8 @@ class PageTests(unittest.TestCase):
         )
 
         values = [label.text() for _entry, label in self.page.topbar.readouts]
-        # 顶栏读数固定两位小数，位数不再随数值变化（否则整条顶栏每秒抖）
-        self.assertEqual(values, ["12.50 nA", "8.00 nA"])
+        # 顶栏读数固定六位小数，位数不再随数值变化（否则整条顶栏每秒抖）
+        self.assertEqual(values, ["12.500000 nA", "8.000000 nA"])
 
     def test_topbar_falls_back_to_a_panel_when_there_are_too_many_readouts(self) -> None:
         many = [
@@ -1569,7 +1569,7 @@ class CardVisibilityTests(unittest.TestCase):
             }
         )
 
-        trend_frame = next(f for f in self.page._frames if f._key == "__trend__")
+        trend_frame = next(f for f in self.page._frames if f._key == manual.TREND_CARD_ID)
 
         self.assertFalse(trend_frame.isHidden())
 
@@ -1787,7 +1787,7 @@ class LayoutPersistenceTests(unittest.TestCase):
             }
         )
 
-        trend = next(f for f in self.page._frames if f._key == "__trend__")
+        trend = next(f for f in self.page._frames if f._key == manual.TREND_CARD_ID)
 
         self.assertEqual(trend.property("layoutColumn"), 1)
 
@@ -1799,10 +1799,10 @@ class LayoutPersistenceTests(unittest.TestCase):
             ("溅射电源", 120, 0),
             ("腔体真空", 120, 0),
             ("聚焦/漂移管", 164, 0),
-            ("__trend__", manual._TrendPanel.HEIGHT, 1),
+            (manual.TREND_CARD_ID, manual._TrendPanel.HEIGHT, 1),
             ("高压阵列 DW", 416, 1),
             ("新高压电源 BD", 216, 2),
-            ("磁铁电源", 260, 2),
+            ("磁铁电源", 260 + manual.MAGNET_GROUP_CONTROLS_HEIGHT, 2),
         )
         columns = [manual.CANVAS_MARGIN] * manual.COLUMN_COUNT
         for _name, height, column in expected:
@@ -1850,9 +1850,9 @@ class TrendCardTests(unittest.TestCase):
                     "payload": {
                         "readings": [
                             {"signal": "detector.fc1.beam_current", "connected": True,
-                             "value": 10.0 + index, "received_time": iso(index)},
+                             "value": 10.0 + index, "received_time": iso(samples - index)},
                             {"signal": "detector.fc2.beam_current", "connected": True,
-                             "value": 5.0 + index, "received_time": iso(index)},
+                             "value": 5.0 + index, "received_time": iso(samples - index)},
                         ]
                     },
                 }
@@ -1884,14 +1884,27 @@ class TrendCardTests(unittest.TestCase):
 
         self.assertEqual(panel.window_s, 30.0)
 
-    def test_clear_empties_the_buffer(self) -> None:
+    def test_clear_only_empties_the_active_channel(self) -> None:
         panel = self.load()
         self.feed(panel)
         self.assertTrue(self.page.trend.signals())
 
         panel.clear_button.click()
 
-        self.assertEqual(self.page.trend.signals(), [])
+        self.assertEqual(self.page.trend.signals(), ["detector.fc2.beam_current"])
+
+    def test_fc_channels_switch_instead_of_overlaying(self) -> None:
+        panel = self.load()
+        self.feed(panel)
+
+        _xs, ys = panel.plot.raw_data()
+        self.assertEqual(list(ys), [10.0, 11.0, 12.0, 13.0, 14.0])
+
+        panel.signal_buttons[1].click()
+
+        _xs, ys = panel.plot.raw_data()
+        self.assertEqual(list(ys), [5.0, 6.0, 7.0, 8.0, 9.0])
+        self.assertIn("FC2", panel.stats_label.text())
 
     def test_best_toggle_is_off_by_default(self) -> None:
         panel = self.load()
@@ -2008,7 +2021,7 @@ class TrendRecordingTests(unittest.TestCase):
         _entry, label = self.page.topbar.readouts[0]
         trend = self.page.topbar.readout_trends[0]
 
-        self.assertEqual(label.text(), "12.50 nA")
+        self.assertEqual(label.text(), "12.500000 nA")
         self.assertIn("▲", trend.text())
         self.assertIn("+2.5", trend.text())
 
@@ -2229,6 +2242,8 @@ class MagnetGroupPanelTests(unittest.TestCase):
         panel = page.magnet_group_panel
         self.assertIsNotNone(panel)
         self.assertEqual(panel.group_combo.count(), len(manual._magnet_group_choices()))
+        self.assertNotIn("__magnet_group__", [frame._key for frame in page._frames])
+        self.assertTrue(any(frame.child.isAncestorOf(panel) for frame in page._frames))
 
     def test_panel_is_skipped_without_magnet_signals(self) -> None:
         page = self.make_page(

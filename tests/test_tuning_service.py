@@ -79,7 +79,17 @@ class TuningServiceTests(unittest.TestCase):
         self.locks = DeviceLockManager()
 
     def tearDown(self) -> None:
-        self._directory.cleanup()
+        import shutil
+        service = getattr(self, "service", None)
+        if service is not None:
+            for run in service._runs.values():
+                study = getattr(run.optimizer, "_study", None)
+                if study is not None:
+                    try:
+                        study._storage.close()
+                    except Exception:
+                        pass
+        shutil.rmtree(self._directory.name, ignore_errors=True)
 
     def build(self, config: PvMappingConfig | None = None) -> TuningService:
         self.config = config or build_config()
@@ -168,15 +178,31 @@ class TuningServiceTests(unittest.TestCase):
         self.assertEqual(run_row["algorithm"], "gp-ei")
 
     # ---------------- 模式 ----------------
-    def test_only_confirm_mode_is_accepted(self) -> None:
-        """连续自动写入需另行通过安全评审，第一版必须显式拒绝。"""
+    def test_auto_mode_accepted_unknown_modes_rejected(self) -> None:
+        """auto（启用束流保护）允许启动；continuous / whatever 仍显式拒绝。"""
         service = self.build()
 
-        for mode in ("auto", "continuous", "whatever"):
+        status = service.start(request(mode="auto"))
+        self.assertIn(
+            status.state, ("running", "awaiting_confirmation", "completed", "failed")
+        )
+        service.join(status.run_id, timeout=5.0)
+        self.assertTrue(service.wait_idle(timeout=5.0))
+
+        for mode in ("continuous", "whatever"):
             with self.subTest(mode=mode):
                 with self.assertRaises(TuningError) as caught:
                     service.start(request(mode=mode))
-                self.assertIn("6.6", str(caught.exception))
+                self.assertIn("暂不支持调束模式", str(caught.exception))
+
+    def test_auto_mode_requires_beam_protection(self) -> None:
+        """全自动写入必须启用束流丢失保护（绝对阈值或相对阈值>0）。"""
+        service = self.build()
+
+        req = request(mode="auto", loss_absolute=None, loss_relative=0.0)
+        with self.assertRaises(TuningError) as caught:
+            service.start(req)
+        self.assertIn("束流丢失保护", str(caught.exception))
 
     # ---------------- 执行层校验 ----------------
     def test_variable_range_above_device_limit_is_rejected(self) -> None:

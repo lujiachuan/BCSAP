@@ -45,6 +45,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import time
 from collections.abc import Callable, Sequence
@@ -58,6 +59,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -70,6 +72,8 @@ from PySide6.QtWidgets import (
 )
 
 from apps.desktop_client import instrument_api
+from apps.desktop_client.manual_dashboard_api import ManualDashboardRequestThread
+from apps.desktop_client.manual_library import DeviceLibraryDialog
 from apps.desktop_client.pages.common import page_layout
 from apps.desktop_client.pages.registry import PageSpec
 from apps.desktop_client.pv_mapping_api import PvMappingRequestThread
@@ -134,7 +138,7 @@ MIN_HOLDER_WIDTH = COLUMN_COUNT * COLUMN_MIN_WIDTH + (COLUMN_COUNT - 1) * COLUMN
 # 顶栏大字读数最多显示几路；超出就退回组面板，避免有数看不见
 TOPBAR_SLOTS = 3
 # 顶栏读数：定宽数字 + 变化量文字的预留宽度（防止每秒抖动 / 布局跳动）
-READOUT_MIN_WIDTH = 92
+READOUT_MIN_WIDTH = 132
 TREND_TEXT_WIDTH = 58
 # 变化量比较的时间基准（秒）
 DELTA_WINDOW_S = 30.0
@@ -148,8 +152,8 @@ STEP_LEVELS = (1, 10, 100)
 # 量程端点**——顶到端点后增量被夹住，×100 与 ×10 的差别就消失了。实测旧的分母
 # 50（×100 = 200% 量程）在 DW 通道 5000 V 处三档增量全是 +100 V，与 ×1 完全一样。
 SPAN_PER_BASE_STEP = 500.0
-# 成组设定卡片的高度（表头 + 一行控件 + 结果行）
-MAGNET_GROUP_PANEL_HEIGHT = 132
+# 磁铁卡片内嵌成组控制增加的高度
+MAGNET_GROUP_CONTROLS_HEIGHT = 82
 # 单行最多几个设定槽（现场映射最多 2 个：磁铁电流+速率、主高压电压+电流）
 MAX_SETPOINT_SLOTS = 3
 # 回读列一行最多平铺几个读数，超出用 «· +n» 提示，明细进 tooltip
@@ -165,6 +169,7 @@ _COLUMN_OF_NAMESPACE = {
 _DEFAULT_COLUMN = 0
 # 顶栏大字读数取自这些命名空间（demo 顶栏就是 FC1/FC2 电流）
 _TOPBAR_NAMESPACES = ("detector",)
+TREND_CARD_ID = "system.beam-trend"
 
 # 可写角色；其余（含空角色）一律按只读呈现，不给语义不明的可写控件。
 _WRITABLE_ROLES = ("setpoint", "toggle", "pulse")
@@ -220,6 +225,54 @@ def _device_of(signal: str) -> str:
     """信号所属设备：去掉最后一段（``hv_array.dw04.voltage_setpoint`` → ``hv_array.dw04``）。"""
     head, _, _tail = signal.rpartition(".")
     return head or signal
+
+
+def _entry_device_id(entry: dict) -> str:
+    return str(entry.get("device_id") or "").strip() or _device_of(
+        str(entry.get("signal") or "")
+    )
+
+
+def _default_dashboard(entries: Sequence[dict]) -> dict:
+    """旧映射首次使用时生成卡片库；稳定 ID 不再依赖可编辑标题。"""
+    grouped: dict[str, list[str]] = {}
+    order: dict[str, int] = {}
+    assigned: set[str] = set()
+    for entry in sorted(entries, key=lambda item: int(item.get("display_order") or 0)):
+        if not entry.get("visible", True) or str(entry.get("signal") or "").startswith(
+            "detector."
+        ):
+            continue
+        group = str(entry.get("group") or "未分组")
+        device_id = _entry_device_id(entry)
+        if device_id in assigned:
+            continue
+        assigned.add(device_id)
+        grouped.setdefault(group, []).append(device_id)
+        order.setdefault(group, int(entry.get("display_order") or 0))
+    cards = [
+        {
+            "card_id": TREND_CARD_ID,
+            "title": "束流电流趋势",
+            "device_ids": [],
+            "visible": True,
+            "display_order": -1,
+            "system": True,
+        }
+    ]
+    for group, device_ids in grouped.items():
+        digest = hashlib.sha1(group.encode("utf-8")).hexdigest()[:12]
+        cards.append(
+            {
+                "card_id": f"device.{digest}",
+                "title": group,
+                "device_ids": device_ids,
+                "visible": True,
+                "display_order": order[group],
+                "system": False,
+            }
+        )
+    return {"version": 1, "cards": cards}
 
 
 def _namespace_of(device: str) -> str:
@@ -519,6 +572,12 @@ class _TopBar(QFrame):
         self.lock_button.toggled.connect(page.toggle_layout_lock)
         layout.addWidget(self.lock_button)
 
+        self.library_button = QPushButton("设备库")
+        self.library_button.setToolTip("选择主面板卡片，并进行新增、编辑、删除和排序")
+        self.library_button.setEnabled(False)
+        self.library_button.clicked.connect(page.open_device_library)
+        layout.addWidget(self.library_button)
+
         self.reload_button = QPushButton("重新载入映射")
         self.reload_button.clicked.connect(page.reload_mapping)
         layout.addWidget(self.reload_button)
@@ -543,7 +602,7 @@ class _TopBar(QFrame):
         """顶栏大字读数（demo 顶栏就是 FC1/FC2 电流）。
 
         每格是「标签 + 定宽数字 + 变化量 / 滞后」三段：
-        * 数字用 `_fmt_fixed` 固定两位小数——`_fmt` 会去尾零，位数一变整条
+        * 数字用 `_fmt_fixed` 固定六位小数——`_fmt` 会去尾零，位数一变整条
           顶栏就跟着抖（既有 UI 方案 §5.1「读数固定宽度」）；
         * 变化量相对 ``DELTA_WINDOW_S`` 前的值，带箭头与正负号，颜色只作辅助；
         * 滞后（服务时间戳算出来的）单独显示，和"未连接"区分开。
@@ -595,11 +654,11 @@ class _TopBar(QFrame):
                 continue
             unit = str(entry.get("unit") or "")
             value = reading.get("value")
-            _set_state(label, _fmt_fixed(value, unit), "good")
+            _set_state(label, _fmt_fixed(value, unit, 6), "good")
             lag = _lag_seconds(reading, now)
             if lag is not None and lag > 2 * POLL_INTERVAL_MS / 1000.0:
                 # 读数还在来，但已经旧了——和"未连接"不是一回事
-                _set_state(label, _fmt_fixed(value, unit), "warn")
+                _set_state(label, _fmt_fixed(value, unit, 6), "warn")
                 label.setToolTip(f"{signal}\n数据滞后 {lag:.0f}s（服务端时间戳）")
                 if trend is not None:
                     _set_state(trend, f"滞后{lag:.0f}s", "warn")
@@ -961,8 +1020,8 @@ def _magnet_group_choices() -> list[tuple[str, list[str]]]:
     return choices
 
 
-class _MagnetGroupPanel(_GroupPanel):
-    """磁铁成组设定：把一组磁铁一起下发同一个电流（可选先下发速率）。
+class _MagnetGroupPanel(QWidget):
+    """磁铁电源卡片内的成组设定区（可选先下发速率）。
 
     下发交给执行服务的**成组接口**，不在界面里循环调单点写：后者在中途失败时
     会留下"前两台已经动了、后两台还在原位"的中间状态，而磁场不均匀比整体不动
@@ -975,11 +1034,16 @@ class _MagnetGroupPanel(_GroupPanel):
         choices: list[tuple[str, list[str]]],
         entries: Sequence[dict],
     ) -> None:
-        super().__init__("磁铁成组", "整批校验后一起下发", with_steps=False)
+        super().__init__()
         self.page = page
         self.choices = choices
         self._by_signal = {str(entry.get("signal") or ""): entry for entry in entries}
         self._in_flight = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 2, 0, 4)
+        layout.setSpacing(3)
+        layout.addWidget(QLabel("成组控制 · 整批校验后一起下发", objectName="columnHeader"))
 
         row = QWidget()
         row_layout = QHBoxLayout(row)
@@ -1018,12 +1082,12 @@ class _MagnetGroupPanel(_GroupPanel):
         self.send_button.clicked.connect(self._submit)
         row_layout.addWidget(self.send_button)
         row_layout.addStretch()
-        self.body.addWidget(row)
+        layout.addWidget(row)
 
         self.result_label = QLabel("尚未下发。整批校验不通过时一次都不会写设备。")
         self.result_label.setObjectName("mutedText")
         self.result_label.setWordWrap(True)
-        self.body.addWidget(self.result_label)
+        layout.addWidget(self.result_label)
 
     def _on_rate_toggled(self, checked: bool) -> None:
         self.rate_spin.setEnabled(checked)
@@ -1495,7 +1559,7 @@ class _Sparkline(QWidget):
 
 
 class _TrendPanel(_GroupPanel):
-    """束流电流趋势卡片：窗口档位 + 多条曲线 + 统计行。
+    """束流电流趋势卡片：FC通道切换 + 窗口档位 + 统计行。
 
     与设备卡片同一套外壳（可折叠、可拖拽、可缩放、位置持久化），只是 body 里
     放的是曲线而不是设备行。数据来自 ``page.trend``（客户端滚动缓冲），
@@ -1512,12 +1576,17 @@ class _TrendPanel(_GroupPanel):
         self.page = page
         self.window_s = self.DEFAULT_WINDOW_S
         self.signals: list[dict] = []
+        self.active_signal_index = 0
         self.show_best = False
 
         bar = QWidget()
         bar_layout = QHBoxLayout(bar)
+        self.bar_layout = bar_layout
         bar_layout.setContentsMargins(0, 0, 0, 0)
         bar_layout.setSpacing(3)
+        self.signal_buttons: list[QPushButton] = []
+        self.signal_group = QButtonGroup(self)
+        self.signal_group.setExclusive(True)
         self.window_buttons: list[QPushButton] = []
         group = QButtonGroup(self)
         group.setExclusive(True)
@@ -1541,9 +1610,9 @@ class _TrendPanel(_GroupPanel):
         self.best_button.toggled.connect(self._on_best_toggled)
         bar_layout.addWidget(self.best_button)
 
-        self.clear_button = QPushButton("清空", objectName="stepButton")
-        self.clear_button.setFixedWidth(36)
-        self.clear_button.setToolTip("清掉已缓冲的采样，重新开始记")
+        self.clear_button = QPushButton("清空当前", objectName="stepButton")
+        self.clear_button.setFixedWidth(58)
+        self.clear_button.setToolTip("只清空当前选中通道，另一通道历史不受影响")
         self.clear_button.clicked.connect(self._on_clear)
         bar_layout.addWidget(self.clear_button)
         bar_layout.addStretch()
@@ -1560,9 +1629,41 @@ class _TrendPanel(_GroupPanel):
 
     # ------------------------------------------------------------------
     def set_readouts(self, entries: Sequence[dict]) -> None:
-        """绑定要画的信号（顶栏那几路）。"""
+        """绑定要画的信号；所有通道持续缓存，图中只呈现当前一路。"""
         self.signals = list(entries)
+        for button in self.signal_buttons:
+            self.bar_layout.removeWidget(button)
+            self.signal_group.removeButton(button)
+            button.deleteLater()
+        self.signal_buttons.clear()
+        for index, entry in enumerate(self.signals):
+            label = str(entry.get("label") or entry.get("signal") or f"通道{index + 1}")
+            caption = label.split()[0]
+            button = QPushButton(caption, objectName="stepButton")
+            button.setCheckable(True)
+            button.setToolTip(f"切换显示 {label}")
+            button.clicked.connect(lambda _c=False, i=index: self.set_active_signal(i))
+            self.signal_group.addButton(button)
+            self.bar_layout.insertWidget(index, button)
+            self.signal_buttons.append(button)
+        self.active_signal_index = min(self.active_signal_index, max(0, len(self.signals) - 1))
+        if self.signal_buttons:
+            self.signal_buttons[self.active_signal_index].setChecked(True)
+        for button in self.signal_buttons:
+            button.setVisible(len(self.signal_buttons) > 1)
         self.refresh()
+
+    def set_active_signal(self, index: int) -> None:
+        if not self.signals:
+            return
+        self.active_signal_index = max(0, min(len(self.signals) - 1, index))
+        self.signal_buttons[self.active_signal_index].setChecked(True)
+        self.refresh()
+
+    def active_entry(self) -> dict | None:
+        if not self.signals:
+            return None
+        return self.signals[self.active_signal_index]
 
     def set_window_index(self, index: int) -> None:
         index = max(0, min(len(self.WINDOWS) - 1, index))
@@ -1575,27 +1676,29 @@ class _TrendPanel(_GroupPanel):
         self.refresh()
 
     def _on_clear(self) -> None:
-        self.page.trend.clear()
+        entry = self.active_entry()
+        if entry is not None:
+            self.page.trend.clear([str(entry.get("signal") or "")])
         self.refresh()
 
     def _readout_text(self, x: float, y: float) -> str:
-        unit = str(self.signals[0].get("unit") or "") if self.signals else ""
+        entry = self.active_entry()
+        unit = str(entry.get("unit") or "") if entry else ""
         return f"{x:.0f} s   {y:.2f} {unit}".rstrip()
 
     def refresh(self) -> None:
-        if not self.signals:
+        entry = self.active_entry()
+        if entry is None:
             self.stats_label.setText("等待数据…")
             return
         now = time.time()
         max_gap = 3 * POLL_INTERVAL_MS / 1000.0
-        series: list[tuple[list[float], list[float]]] = []
-        for entry in self.signals:
-            signal = str(entry.get("signal") or "")
-            points = self.page.trend.window(signal, self.window_s, now)
-            xs, ys = series_with_gaps(points, max_gap)
-            # x 轴用"距今多少秒"（0 = 现在），负数往左
-            xs = [stamp - now for stamp in xs]
-            series.append((xs, ys))
+        signal = str(entry.get("signal") or "")
+        points = self.page.trend.window(signal, self.window_s, now)
+        xs, ys = series_with_gaps(points, max_gap)
+        # x 轴用"距今多少秒"（0 = 现在），负数往左
+        xs = [stamp - now for stamp in xs]
+        series = [(xs, ys)]
         best: list[float] | None = None
         if self.show_best and series:
             best = best_so_far(series[0][1])
@@ -1605,20 +1708,21 @@ class _TrendPanel(_GroupPanel):
         self._refresh_stats(now)
 
     def _refresh_stats(self, now: float) -> None:
-        parts: list[str] = []
-        for entry in self.signals:
-            signal = str(entry.get("signal") or "")
-            stats = self.page.trend.stats(signal, self.window_s, now)
-            name = str(entry.get("label") or signal)
-            if stats is None:
-                parts.append(f"{name}: 无数据")
-                continue
-            parts.append(
-                f"{name} 当前 {stats['latest']:.2f} · 均 {stats['mean']:.2f} · "
-                f"σ {stats['std']:.3f} · 峰峰 {stats['range']:.2f} · "
-                f"{stats['count']} 点/{stats['span_s']:.0f}s"
-            )
-        self.stats_label.setText("　|　".join(parts))
+        entry = self.active_entry()
+        if entry is None:
+            self.stats_label.setText("等待数据…")
+            return
+        signal = str(entry.get("signal") or "")
+        stats = self.page.trend.stats(signal, self.window_s, now)
+        name = str(entry.get("label") or signal)
+        if stats is None:
+            self.stats_label.setText(f"{name}: 无数据")
+            return
+        self.stats_label.setText(
+            f"{name} 当前 {stats['latest']:.2f} · 均 {stats['mean']:.2f} · "
+            f"σ {stats['std']:.3f} · 峰峰 {stats['range']:.2f} · "
+            f"{stats['count']} 点/{stats['span_s']:.0f}s"
+        )
 
 
 def layout_settings() -> QSettings:
@@ -1628,6 +1732,17 @@ def layout_settings() -> QSettings:
     `Status.AccessError` 而被静默丢弃，测试没法验证"存-取-清"这条链路。
     """
     return QSettings("SpectrumPlatform", "DesktopClient")
+
+
+def _migrate_layout_key(old_key: str, new_key: str) -> None:
+    """把旧标题布局迁到稳定 card_id；已有新布局时绝不覆盖。"""
+    if not old_key or old_key == new_key:
+        return
+    settings = layout_settings()
+    old_path = f"{LAYOUT_SETTINGS_PREFIX}{old_key}/rect"
+    new_path = f"{LAYOUT_SETTINGS_PREFIX}{new_key}/rect"
+    if settings.value(new_path) is None and settings.value(old_path) is not None:
+        settings.setValue(new_path, settings.value(old_path))
 
 
 def _parse_saved_rect(value: object) -> tuple[int, int, int, int] | None:
@@ -1747,6 +1862,9 @@ class ManualControlPage(QWidget):
         # 客户端滚动缓冲：服务端没有时序库，趋势只能自己留（见 trend_buffer 说明）
         self.trend = TrendBuffer()
         self.trend_panel: _TrendPanel | None = None
+        self.magnet_group_panel: _MagnetGroupPanel | None = None
+        self._dashboard_config: dict = {"version": 1, "cards": []}
+        self._dashboard_request: ManualDashboardRequestThread | None = None
         # 顶栏变化量要跨快照比较，记一下最近一次读数
         self._topbar_signals: list[dict] = []
         # 卡片布局是否已按真实画布尺寸恢复过（防止 hidden 构建时尺寸误判）
@@ -1805,6 +1923,7 @@ class ManualControlPage(QWidget):
         self._rows.clear()
         self._rows_by_signal.clear()
         self._editors.clear()
+        self.magnet_group_panel = None
         self._grid_x = 0
         self._grid_y = 0
         self._column_y = [CANVAS_MARGIN] * COLUMN_COUNT
@@ -1863,6 +1982,7 @@ class ManualControlPage(QWidget):
             return
 
         self._entries = list((payload.get("config") or {}).get("entries", []))
+        self._dashboard_config = _default_dashboard(self._entries)
         self._build_rows()
         self._mapping_loaded = True
         writable = sum(1 for e in self._entries if e.get("writable"))
@@ -1882,7 +2002,57 @@ class ManualControlPage(QWidget):
                 "good",
             )
             self.all_off_button.setEnabled(writable > 0)
+        self._load_dashboard()
         self._poll()
+
+    def _load_dashboard(self) -> None:
+        if self._dashboard_request is not None and self._dashboard_request.isRunning():
+            return
+        self._dashboard_request = ManualDashboardRequestThread(
+            instrument_api.instrument_base_url(), None
+        )
+        self.topbar.library_button.setEnabled(False)
+        self._dashboard_request.completed.connect(self._on_dashboard_loaded)
+        self._dashboard_request.start()
+
+    def _on_dashboard_loaded(self, payload: dict) -> None:
+        if not payload.get("ok"):
+            self.topbar.library_button.setToolTip(
+                f"设备库不可用：{payload.get('message', '主面板配置读取失败')}"
+            )
+            return
+        self.topbar.library_button.setEnabled(True)
+        self.topbar.library_button.setToolTip("选择主面板卡片，并进行新增、编辑、删除和排序")
+        self._dashboard_config = dict(payload.get("config") or {})
+        self._build_rows()
+
+    def open_device_library(self) -> None:
+        devices: list[dict] = []
+        seen: set[str] = set()
+        for spec in build_device_specs(self._entries):
+            if spec.device in seen or spec.namespace in _TOPBAR_NAMESPACES:
+                continue
+            seen.add(spec.device)
+            devices.append({"device_id": spec.device, "label": spec.label})
+        dialog = DeviceLibraryDialog(self._dashboard_config, devices, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.topbar.library_button.setEnabled(False)
+        self.topbar.set_message("正在保存主面板配置…", "warn")
+        self._dashboard_request = ManualDashboardRequestThread(
+            instrument_api.instrument_base_url(), dialog.config()
+        )
+        self._dashboard_request.completed.connect(self._on_dashboard_saved)
+        self._dashboard_request.start()
+
+    def _on_dashboard_saved(self, payload: dict) -> None:
+        self.topbar.library_button.setEnabled(True)
+        if not payload.get("ok"):
+            self.topbar.set_message(f"主面板配置保存失败：{payload.get('message', '')}", "error")
+            return
+        self._dashboard_config = dict(payload.get("config") or {})
+        self._build_rows()
+        self.topbar.set_message("主面板配置已保存。", "good")
 
     def _load_startup_recoveries(self) -> None:
         self._recovery_request = instrument_api.request_recovery_items()
@@ -1945,78 +2115,56 @@ class ManualControlPage(QWidget):
             + (self._layout_columns - 1) * COLUMN_SPACING
             + 2 * CANVAS_MARGIN
         )
-        groups: dict[str, list[dict]] = {}
-        for entry in sorted(
-            self._entries, key=lambda item: int(item.get("display_order") or 0)
-        ):
-            if not entry.get("visible", True):
-                continue
-            groups.setdefault(str(entry.get("group") or "未分组"), []).append(entry)
-
-        built = [(name, build_device_specs(entries)) for name, entries in groups.items()]
-        topbar_entries = self._pick_topbar_entries(built)
+        all_specs = build_device_specs(self._entries)
+        by_device = {spec.device: spec for spec in all_specs}
+        topbar_entries = self._pick_topbar_entries([("全部", all_specs)])
         consumed = {str(e.get("signal") or "") for e in topbar_entries}
         self._topbar_signals = list(topbar_entries)
         self.topbar.set_readouts(topbar_entries)
-        self._add_trend_card()
 
-        assignment = assign_columns(built)
+        cards = sorted(
+            self._dashboard_config.get("cards") or [],
+            key=lambda item: int(item.get("display_order") or 0),
+        )
+        trend_card = next(
+            (card for card in cards if card.get("card_id") == TREND_CARD_ID), None
+        )
+        if trend_card is not None and trend_card.get("visible", True):
+            self._add_trend_card()
+        else:
+            self.trend_panel = None
+
+        built: list[tuple[dict, list[DeviceSpec]]] = []
+        for card in cards:
+            if card.get("system") or not card.get("visible", True):
+                continue
+            specs = [by_device[item] for item in card.get("device_ids") or [] if item in by_device]
+            if specs:
+                built.append((card, specs))
+
+        layout_groups = [(str(card.get("card_id") or ""), specs) for card, specs in built]
+        assignment = assign_columns(layout_groups)
         if self._layout_columns == 2:
             heights = self._column_y[:2]
             assignment = {}
-            for name, specs in sorted(
+            for card, specs in sorted(
                 built,
                 key=lambda item: sum(spec.row_height() for spec in item[1]),
                 reverse=True,
             ):
                 column = 0 if heights[0] <= heights[1] else 1
-                assignment[name] = column
+                assignment[str(card.get("card_id") or "")] = column
                 heights[column] += 52 + sum(spec.row_height() for spec in specs) + CARD_GAP
-        for name, specs in built:
+        for card, specs in built:
             if all(signal in consumed for signal in (s for spec in specs for s in spec.signals())):
                 continue  # 整组都在顶栏大字里了，不再占画布
-            self._add_panel(name, specs, assignment.get(name, _DEFAULT_COLUMN))
-        self._add_magnet_group_panel(built, assignment)
-
-    def _add_magnet_group_panel(
-        self, built: Sequence[tuple[str, Sequence[DeviceSpec]]], assignment: dict[str, int]
-    ) -> None:
-        """成组设定卡片：只在映射里真的有这些磁铁设定信号时才建。
-
-        放在磁铁组所在的那一列，跟设备卡片一样可拖拽、可折叠。
-        """
-        available = {str(entry.get("signal") or "") for entry in self._entries}
-        choices = [
-            (label, signals)
-            for label, signals in _magnet_group_choices()
-            if all(signal in available for signal in signals)
-        ]
-        if not choices:
-            self.magnet_group_panel = None
-            return
-        panel = _MagnetGroupPanel(self, choices, self._entries)
-        self.magnet_group_panel = panel
-        self._place_panel(
-            panel,
-            key="__magnet_group__",
-            column=self._magnet_group_column(assignment),
-            height=MAGNET_GROUP_PANEL_HEIGHT,
-        )
-
-    def _magnet_group_column(self, assignment: dict[str, int]) -> int:
-        """成组卡片放在磁铁组那一列（找不到就放默认列）。"""
-        magnet_signals = {
-            signal
-            for _label, signals in _magnet_group_choices()
-            for signal in signals
-        }
-        for entry in self._entries:
-            if str(entry.get("signal") or "") not in magnet_signals:
-                continue
-            group = str(entry.get("group") or "")
-            if group in assignment:
-                return assignment[group]
-        return _DEFAULT_COLUMN
+            card_id = str(card.get("card_id") or "")
+            self._add_panel(
+                str(card.get("title") or "未命名"),
+                specs,
+                assignment.get(card_id, _DEFAULT_COLUMN),
+                card_id,
+            )
 
     def _add_trend_card(self, column: int = 1) -> None:
         """束流电流趋势卡片：放在**中列**最上面，可折叠/拖拽/缩放。
@@ -2031,8 +2179,9 @@ class ManualControlPage(QWidget):
         panel = _TrendPanel(self)
         panel.set_readouts(self._topbar_signals)
         self.trend_panel = panel
+        _migrate_layout_key("__trend__", TREND_CARD_ID)
         self._place_panel(
-            panel, key="__trend__", column=column, height=_TrendPanel.HEIGHT
+            panel, key=TREND_CARD_ID, column=column, height=_TrendPanel.HEIGHT
         )
 
     def reset_layout(self) -> None:
@@ -2059,7 +2208,9 @@ class ManualControlPage(QWidget):
                 picked.extend(spec.readbacks)
         return picked if 0 < len(picked) <= TOPBAR_SLOTS else []
 
-    def _add_panel(self, name: str, specs: Sequence[DeviceSpec], column: int) -> None:
+    def _add_panel(
+        self, name: str, specs: Sequence[DeviceSpec], column: int, card_id: str
+    ) -> None:
         writable = sum(
             1 for spec in specs for entry in spec.controls if entry.get("writable")
         )
@@ -2068,6 +2219,20 @@ class ManualControlPage(QWidget):
             for kw in _GroupPanel.HAZARD_KEYWORDS
         )
         panel = _GroupPanel(name, f"{len(specs)} 个设备 · 可写 {writable} 路", hazard=hazard)
+        _migrate_layout_key(name, card_id)
+        card_entries = [entry for spec in specs for entry in spec.entries]
+        available = {str(entry.get("signal") or "") for entry in card_entries}
+        choices = [
+            (label, signals)
+            for label, signals in _magnet_group_choices()
+            if all(signal in available for signal in signals)
+        ]
+        extra_height = 0
+        if choices and self.magnet_group_panel is None:
+            controls = _MagnetGroupPanel(self, choices, card_entries)
+            self.magnet_group_panel = controls
+            panel.body.addWidget(controls)
+            extra_height = MAGNET_GROUP_CONTROLS_HEIGHT
         panel.body.addWidget(_header_row(_slot_labels(specs)))
         for spec in specs:
             widget = _DeviceRow(spec, self)
@@ -2077,12 +2242,12 @@ class ManualControlPage(QWidget):
             for signal in spec.signals():
                 self._rows_by_signal[signal] = widget
         # 包进可拖拽/resize 容器。默认几何按三列当前可用宽度计算，
-        # 每列分别累计高度；用户移动后仍会保存到 layout-v2。
+        # 每列分别累计高度；用户移动后保存到稳定 card_id 对应的 layout-v3。
         self._place_panel(
             panel,
-            key=name,
+            key=card_id,
             column=column,
-            height=max(104, 52 + sum(spec.row_height() for spec in specs)),
+            height=max(104, 52 + sum(spec.row_height() for spec in specs) + extra_height),
         )
 
     def _place_panel(

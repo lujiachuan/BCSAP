@@ -198,8 +198,22 @@ def load_config_checked() -> PvMappingConfig:
         fallback = defaults.get(entry.signal)
         updates = {}
         if fallback is not None:
-            for field in ("scan_axis", "scan_detector", "safe_value"):
-                if field not in source:
+            for field in (
+                "device_id",
+                "device_label",
+                "scan_axis",
+                "scan_detector",
+                "safe_value",
+                # 调束用途标记：老现场文件没有这两个键时按设备档案规则补齐。
+                # 缺 beam_target 的直接后果是调束页"优化目标"下拉为空；
+                # 缺 tunable 则"优化变量"只剩少数几条（2026-09-20 现场）。
+                "tunable",
+                "beam_target",
+            ):
+                missing = field not in source
+                if field in {"device_id", "device_label"}:
+                    missing = not str(source.get(field) or "").strip()
+                if missing:
                     updates[field] = getattr(fallback, field)
         migrated.append(entry.model_copy(update=updates) if updates else entry)
     config = config.model_copy(update={"entries": migrated})

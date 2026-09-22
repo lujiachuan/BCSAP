@@ -37,8 +37,9 @@ _NUMERIC_FIELDS: dict[str, str] = {
     "hold_s": "每轮写完后额外保持",
     "loss_relative": "相对损失阈值",
     "loss_strikes": "连续异常次数",
-    "noise": "观测噪声",
     "seed": "随机种子",
+    "n_startup_trials": "随机探索轮次",
+    "patience": "收敛早停轮数",
 }
 
 
@@ -69,7 +70,8 @@ def _as_int(value: object) -> int | None:
 
 
 def sanitize(raw: object, *, strategies: tuple[str, ...] = (),
-             actions: tuple[str, ...] = ()) -> tuple[dict, list[str]]:
+             actions: tuple[str, ...] = (), engines: tuple[str, ...] = (),
+             modes: tuple[str, ...] = ()) -> tuple[dict, list[str]]:
     """把读到的（可能是手改坏的）配置逐项规范化。
 
     返回 ``(配置, 丢弃说明)``。丢弃说明是给界面看的：哪一项是什么值、为什么没用它。
@@ -98,7 +100,7 @@ def sanitize(raw: object, *, strategies: tuple[str, ...] = (),
         entry: dict = {"signal": signal.strip()}
         if "enabled" in item:
             entry["enabled"] = bool(item.get("enabled"))
-        for key in ("low", "high"):
+        for key in ("low", "high", "start"):
             if key not in item:
                 continue
             value = _as_float(item.get(key))
@@ -119,6 +121,24 @@ def sanitize(raw: object, *, strategies: tuple[str, ...] = (),
     elif strategy is not None:
         notes.append(f"优化策略不是字符串（{strategy!r}），已用页面默认值")
 
+    engine = raw.get("engine")
+    if isinstance(engine, str) and engine:
+        if engines and engine not in engines:
+            notes.append(f"优化引擎 {engine!r} 不认识，已用页面默认值")
+        else:
+            config["engine"] = engine
+    elif engine is not None:
+        notes.append(f"优化引擎不是字符串（{engine!r}），已用页面默认值")
+
+    mode = raw.get("mode")
+    if isinstance(mode, str) and mode:
+        if modes and mode not in modes:
+            notes.append(f"调束模式 {mode!r} 不认识，已用页面默认值")
+        else:
+            config["mode"] = mode
+    elif mode is not None:
+        notes.append(f"调束模式不是字符串（{mode!r}），已用页面默认值")
+
     for key, label in _NUMERIC_FIELDS.items():
         if key not in raw:
             continue
@@ -136,6 +156,12 @@ def sanitize(raw: object, *, strategies: tuple[str, ...] = (),
 
     if "auto_recover" in raw:
         config["auto_recover"] = bool(raw.get("auto_recover"))
+
+    if "reset_before_start" in raw:
+        config["reset_before_start"] = bool(raw.get("reset_before_start"))
+
+    if "random_seed" in raw:
+        config["random_seed"] = bool(raw.get("random_seed"))
 
     action = raw.get("finalize_action")
     if action in (None, ""):
@@ -156,7 +182,8 @@ def sanitize(raw: object, *, strategies: tuple[str, ...] = (),
 
 
 def load(path: Path | None = None, *, strategies: tuple[str, ...] = (),
-         actions: tuple[str, ...] = ()) -> tuple[dict | None, str]:
+         actions: tuple[str, ...] = (), engines: tuple[str, ...] = (),
+         modes: tuple[str, ...] = ()) -> tuple[dict | None, str]:
     """读配置文件。
 
     返回 ``(配置, 说明)``：**没有文件时返回 ``(None, "")``**——"从没用过"是正常状态，
@@ -169,7 +196,9 @@ def load(path: Path | None = None, *, strategies: tuple[str, ...] = (),
         raw = json.loads(target.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         return None, f"调束配置读不出来（{target}）：{exc}"
-    config, notes = sanitize(raw, strategies=strategies, actions=actions)
+    config, notes = sanitize(
+        raw, strategies=strategies, actions=actions, engines=engines, modes=modes
+    )
     if not config:
         return None, f"调束配置内容无效（{target}）：" + ("；".join(notes) or "空文件")
     detail = f"调束配置 {target} 里有 {len(notes)} 项被忽略：" + "；".join(notes)
@@ -208,6 +237,12 @@ def describe(config: dict) -> str:
         parts.append(f"目标 {config['target_signal']}")
     if config.get("strategy"):
         parts.append(f"策略 {config['strategy']}")
+    if config.get("engine"):
+        parts.append(f"引擎 {config['engine']}")
+    if config.get("mode"):
+        parts.append(f"模式 {config['mode']}")
     if config.get("max_iterations") is not None:
         parts.append(f"最大 {config['max_iterations']:g} 轮")
+    if config.get("patience") is not None:
+        parts.append(f"早停 {config['patience']:g} 轮")
     return "、".join(parts)

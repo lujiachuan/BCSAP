@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import json
 import statistics
 import threading
 import time
@@ -29,12 +30,15 @@ from packages.contracts import SignalWriteRequest
 from packages.contracts.tuning import (
     ACTION_APPLY_BEST,
     ACTION_RESTORE_INITIAL,
+    ACTION_START_VALUES,
+    ENGINE_GP,
     FINALIZE_ACTIONS,
-    MODE_CONFIRM,
+    MODE_AUTO,
     STAGE_JOINT,
     STAGE_LABELS,
     STAGE_SEQUENTIAL,
     STRATEGY_SEQUENTIAL,
+    SUPPORTED_ENGINES,
     SUPPORTED_MODES,
     SUPPORTED_STRATEGIES,
     TuningFinalizeResult,
@@ -49,8 +53,10 @@ from packages.contracts.tuning import (
 from packages.domain import beamline
 from packages.domain.tuning import TuningState, transition_tuning
 from packages.optimizer import Dimension, GpEiOptimizer
+from packages.optimizer.optuna_adapter import OPTUNA_ENGINES, OptunaAsker
 
 from .device_locks import DeviceBusy, DeviceLockManager
+from .interlocks import InterlockViolation, check_interlocks
 from .signal_io import SignalWriteService, WriteRejected
 from .tuning_catalog import NEVER_TUNABLE_SUFFIXES
 from .tuning_store import TuningStore
@@ -59,6 +65,7 @@ from .tuning_store import TuningStore
 FINALIZE_LABELS = {
     ACTION_APPLY_BEST: "应用最优参数",
     ACTION_RESTORE_INITIAL: "恢复启动前参数",
+    ACTION_START_VALUES: "回到起始值",
     "safe_values": "回安全值",
 }
 
@@ -70,6 +77,31 @@ TERMINAL_STATES = frozenset(
         TuningState.RECOVERY_REQUIRED,
     }
 )
+
+
+def build_optimizer(
+    dimensions: list[Dimension],
+    request: TuningRunRequest,
+    *,
+    storage: str | None = None,
+    study_name: str | None = None,
+    pruner: str | None = None,
+):
+    """按请求的引擎构造优化器：gp 走自研，其余走 Optuna ask/tell 适配。
+
+    接口统一为 propose/observe（GpEiOptimizer 与 OptunaAsker 同构），
+    状态机里"提候选 → 人工门/自动门 → 执行 → 回报观测"的循环代码不用改。
+
+    storage/study_name 给 Optuna 侧持久化（sqlite），事后可挂 dashboard、
+    算参数重要性；gp 侧不使用。
+    """
+    if request.engine == ENGINE_GP or request.engine not in OPTUNA_ENGINES:
+        return GpEiOptimizer(dimensions, noise=request.noise, seed=request.seed)
+    return OptunaAsker(
+        dimensions, noise=request.noise, seed=request.seed, engine=request.engine,
+        storage=storage, study_name=study_name, pruner=pruner,
+        n_startup_trials=request.n_startup_trials,
+    )
 
 # 每轮目标量重复采样之间的间隔（秒）。目标量本身是瞬时读数，间隔只为避开
 # 单次毛刺，不需要按设备稳定时间去等。
@@ -115,6 +147,10 @@ class _Run:
     # 连续异常计数与回退记录
     anomalies: int = 0
     recovery: TuningRecovery | None = None
+    # 连续"没有产生新的历史最优"的轮数（收敛早停的计数）
+    no_improvement: int = 0
+    # 全自动模式的后台驱动线程（测试用 join 等它彻底结束，避免写库竞态）
+    driver: threading.Thread | None = None
     # 结束后的处置（应用最优/恢复初始/回安全值）最近一次结果
     finalize: TuningFinalizeResult | None = None
     # ---- 两阶段策略的运行态 ----
@@ -128,6 +164,8 @@ class _Run:
     # 每个变量**自己**的最优点（信号 → (值, 当时的目标值)）：
     # 联合微调要围绕它收窄，而不是围绕"最后一轮停在哪"
     variable_best: dict[str, tuple[float, float]] = field(default_factory=dict)
+    # Optuna study 名（= run_id），供分析 API / dashboard 定位持久化 study
+    optuna_study_name: str = ""
 
 
 class TuningService:
@@ -151,10 +189,20 @@ class TuningService:
         self._sleep = sleep
         self._lock = threading.RLock()
         self._runs: dict[str, _Run] = {}
+        # Optuna study 持久化库（与 tuning_spool.sqlite3 同目录）。
+        # 传 None 给 gp 引擎；Optuna 引擎用它跨会话保留 trials，事后算重要性/挂 dashboard。
+        self._optuna_storage_url = (
+            f"sqlite:///{store.directory / 'tuning_studies.sqlite3'}"
+        )
 
     @property
     def _signals(self) -> SignalWriteService:
         return self._signals_provider()
+
+    @property
+    def optuna_storage_url(self) -> str:
+        """Optuna study 持久化库 URL（供分析 API / dashboard 定位）。"""
+        return self._optuna_storage_url
 
     # ------------------------------------------------------------------
     # 查询
@@ -165,13 +213,23 @@ class TuningService:
             return self._status_of(run)
 
     def iterations(self, run_id: str) -> TuningIterationsResponse:
-        run = self._require(run_id)
         with self._lock:
-            return TuningIterationsResponse(
-                run_id=run_id,
-                iterations=list(run.iterations),
-                max_iterations=run.request.max_iterations,
-            )
+            run = self._runs.get(run_id)
+            if run is not None:
+                return TuningIterationsResponse(
+                    run_id=run_id,
+                    iterations=list(run.iterations),
+                    max_iterations=run.request.max_iterations,
+                )
+        # 内存没有（服务重启后）：从暂存库读历史轮次
+        stored = self._store.load_iterations(run_id)
+        run_row = self._store.load_run(run_id)
+        max_iters = int(run_row["max_iterations"]) if run_row else 0
+        return TuningIterationsResponse(
+            run_id=run_id,
+            iterations=stored,
+            max_iterations=max_iters,
+        )
 
     def active_run_id(self) -> str | None:
         with self._lock:
@@ -193,12 +251,81 @@ class TuningService:
             time.sleep(0.02)
         return False
 
+    def join(self, run_id: str, timeout: float = 30.0) -> None:
+        """等待任务的驱动线程彻底结束（含收尾写库），测试与 CLI 场景用。"""
+        run = self._require(run_id)
+        thread = run.driver
+        if thread is not None and thread.is_alive():
+            thread.join(timeout)
+
     def _require(self, run_id: str) -> _Run:
         with self._lock:
             run = self._runs.get(run_id)
         if run is None:
+            run = self._recover_terminal_run(run_id)
+        if run is None:
             raise TuningError(f"没有这个调束任务：{run_id}")
         return run
+
+    def _recover_terminal_run(self, run_id: str) -> _Run | None:
+        """服务重启后，内存 _Run 已丢，但终态任务可能还要做设备处置。
+
+        从 spool 重建只含处置所需字段的 _Run；非终态不重建。
+        """
+        import traceback
+        try:
+            row = self._store.load_run(run_id)
+            if row is None:
+                return None
+            state = TuningState(row["state"])
+            if state not in TERMINAL_STATES:
+                return None
+            variables = [
+                TuningVariable(**v)
+                for v in json.loads(row["variables_json"] or "[]")
+            ]
+            request = TuningRunRequest(
+                target_signal=row["target_signal"],
+                variables=variables,
+                mode=row["mode"],
+                max_iterations=int(row["max_iterations"] or 1),
+            )
+            groups = {
+                self._entry(v.signal).group
+                for v in variables
+                if v.enabled
+            }
+            run = _Run(
+                run_id=run_id,
+                request=request,
+                dimensions=[],
+                optimizer=None,  # type: ignore[arg-type]
+                state=state,
+                message=row["message"] or "",
+                locked_groups=sorted(g for g in groups if g),
+            )
+            if row["best_values_json"]:
+                try:
+                    run.best_values = {
+                        k: float(v)
+                        for k, v in json.loads(row["best_values_json"]).items()
+                    }
+                except (ValueError, TypeError):
+                    pass
+            if row["snapshot_json"]:
+                try:
+                    run.snapshot = {
+                        k: float(v)
+                        for k, v in json.loads(row["snapshot_json"]).items()
+                    }
+                except (ValueError, TypeError):
+                    pass
+            with self._lock:
+                self._runs[run_id] = run
+            return run
+        except Exception:
+            traceback.print_exc()
+            return None
 
     def _status_of(self, run: _Run) -> TuningRunStatus:
         return TuningRunStatus(
@@ -215,6 +342,7 @@ class TuningService:
             algorithm=run.optimizer.ALGORITHM,
             algorithm_version=run.optimizer.VERSION,
             seed=run.optimizer.seed,
+            engine=run.request.engine,
             # 报「当前实际占着哪些组」，不是「曾经声明过哪些组」——
             # 终态后仍列出旧分组会让诊断端误以为设备还锁着
             locked_groups=self._held_by(run.run_id),
@@ -253,16 +381,20 @@ class TuningService:
             if active is not None:
                 raise TuningError(f"已有调束任务在进行中：{active}")
             dimensions, groups = self._validate(request)
+            run_id = str(uuid4())
             run = _Run(
-                run_id=str(uuid4()),
+                run_id=run_id,
                 request=request,
                 dimensions=dimensions,
-                optimizer=GpEiOptimizer(
-                    dimensions, noise=request.noise, seed=request.seed
+                optimizer=build_optimizer(
+                    dimensions, request,
+                    storage=self._optuna_storage_url,
+                    study_name=f"run_{run_id}",
                 ),
                 state=TuningState.VALIDATING,
                 message="参数校验通过，准备占用设备",
             )
+            run.optuna_study_name = f"run_{run_id}"
             self._runs[run.run_id] = run
 
         self._store.create_run(
@@ -284,17 +416,62 @@ class TuningService:
         with self._lock:
             run.started_at = _now()
             self._to(run, TuningState.PREPARING, "占用设备组")
+        # 开始前复位：把参与变量写到起始值（自定义 start，未填取范围中值），
+        # 保证每次同一起点、不继承上一次结果。
+        if request.reset_before_start:
+            reset_targets = {
+                variable.signal: variable.resolved_start()
+                for variable in request.enabled_variables()
+            }
+            _, reset_problems = self._write_and_settle(run, reset_targets)
+            if reset_problems:
+                self._finish_failed(run, "开始前复位未完成：" + "；".join(reset_problems))
+                return self.status(run.run_id)
         # 启动前快照：**必须先取到**再进入 RUNNING。取不到就等于退不回去，
         # 宁可不开（改造报告 §5.2 第一条）。
         problem = self._capture_snapshot(run)
         if problem is not None:
             self._finish_failed(run, problem)
             return self.status(run.run_id)
+        # auto 模式二次保护：基线读不到时相对判据无效，必须有绝对阈值兜底
+        if request.mode == MODE_AUTO and run.baseline_objective is None:
+            if request.loss_absolute is None:
+                self._finish_failed(
+                    run,
+                    "启动基线读取失败且未配置绝对束流保护阈值，自动模式拒绝启动。"
+                    "请确认设备可读，或设置 loss_absolute。",
+                )
+                return self.status(run.run_id)
         with self._lock:
             self._to(run, TuningState.RUNNING, "开始调束")
         self._persist_state(run)
-        self._propose_next(run)
+        if request.mode == MODE_AUTO:
+            # 全自动：后台线程驱动整条循环（每轮含写设备/采样，秒级），
+            # start 立即返回，客户端轮询状态与进度。
+            self._spawn_auto_driver(run)
+        else:
+            self._propose_next(run)
         return self.status(run.run_id)
+
+    def _spawn_auto_driver(self, run: _Run) -> None:
+        """启动全自动模式的后台驱动线程。
+
+        start 请求必须立即返回（客户端要轮询状态与进度），而每轮要写设备、
+        等稳定、采样，耗时秒级——放进请求里会让 HTTP 挂起整个任务时长。
+        线程与 stop() / pause() 通过 RLock 与 stopped 标志协作；任何异常
+        都收尾为 FAILED（驱动线程兜底，不让异常无声消失）。
+        """
+
+        def driver() -> None:
+            try:
+                self._propose_next(run)
+            except Exception as exc:  # noqa: BLE001 —— 驱动线程兜底
+                self._finish_failed(run, str(exc))
+
+        thread = threading.Thread(target=driver, daemon=True)
+        with self._lock:
+            run.driver = thread
+        thread.start()
 
     def _read_with_retry(self, read: Callable[[], float | None]) -> float | None:
         """读一次现场值，失败就退避重试几次再认输。
@@ -356,13 +533,28 @@ class TuningService:
         )
         return None
 
+    @staticmethod
+    def _auto_protection_ok(request: TuningRunRequest) -> bool:
+        """全自动模式的前置安全：至少一个束流丢失判据有效。"""
+        return request.loss_absolute is not None or (
+            request.loss_relative is not None and request.loss_relative > 0
+        )
+
     def _validate(self, request: TuningRunRequest) -> tuple[list[Dimension], set[str]]:
         """校验模式、信号与范围；返回维度列表与需要占用的设备组。"""
         if request.mode not in SUPPORTED_MODES:
             raise TuningError(
-                f"暂不支持调束模式 {request.mode!r}。按架构文档 6.6 的分阶段计划，"
-                f"第一版只开放「建议→人工确认」（{MODE_CONFIRM}）；"
-                "连续自动写入需另行通过安全评审。"
+                f"暂不支持调束模式 {request.mode!r}，支持：{'、'.join(SUPPORTED_MODES)}"
+            )
+        if request.engine not in SUPPORTED_ENGINES:
+            raise TuningError(
+                f"未知的优化引擎 {request.engine!r}，支持：{'、'.join(SUPPORTED_ENGINES)}"
+            )
+        if request.mode == MODE_AUTO and not self._auto_protection_ok(request):
+            raise TuningError(
+                "自动模式（全自动写入）必须启用束流丢失保护：绝对归零阈值或"
+                "相对损失阈值（loss_relative>0）至少一个有效，"
+                "否则无人确认的自动写入没有兜底。"
             )
         variables = request.enabled_variables()
         if not variables:
@@ -544,25 +736,38 @@ class TuningService:
         run.active_signals = active_signals
         dimensions = [self._dimension_for(run, variable) for variable in active]
         names = [dimension.name for dimension in dimensions]
-        optimizer = GpEiOptimizer(
-            dimensions, noise=run.request.noise, seed=run.request.seed
+        # 采样 Study 按阶段命名：逐变量阶段各一个，联合阶段一个；
+        # 避免 TPE 因 search space 动态变化出问题。
+        sample_study = f"run_{run.run_id}__sample__{stage}"
+        if stage == STAGE_SEQUENTIAL and active_signals:
+            sample_study += f"_{active_signals[0]}"
+        optimizer = build_optimizer(
+            dimensions, run.request,
+            storage=self._optuna_storage_url,
+            study_name=sample_study,
         )
-        for iteration in run.iterations:
-            if iteration.objective is None:
-                continue
-            try:
-                optimizer.observe(
-                    [iteration.proposed[name] for name in names], iteration.objective
-                )
-            except (KeyError, ValueError, TypeError):
-                # 老记录缺这一路（或维度不匹配）时跳过，不让它挡住后面的建议
-                continue
+        # 持久化 study 已含历史 trials（load_if_exists），不再重复 seed_history；
+        # 内存 study 或首次创建时，把已观测投影到新维度接续记忆。
+        if optimizer.n_observed == 0:
+            history: list[tuple[list[float], float]] = []
+            for iteration in run.iterations:
+                if iteration.objective is None:
+                    continue
+                try:
+                    history.append(
+                        ([iteration.proposed[name] for name in names], iteration.objective)
+                    )
+                except (KeyError, ValueError, TypeError):
+                    continue
+            if history:
+                optimizer.seed_history(history)
         run.optimizer = optimizer
 
     # ------------------------------------------------------------------
     # 建议
     # ------------------------------------------------------------------
     def _propose_next(self, run: _Run) -> None:
+        schedule_execute = False
         with self._lock:
             if run.state in TERMINAL_STATES:
                 return
@@ -601,27 +806,68 @@ class TuningService:
                 if run.stage == STAGE_SEQUENTIAL and active
                 else STAGE_LABELS.get(run.stage, run.stage)
             )
-            self._to(
-                run,
-                TuningState.AWAITING_CONFIRMATION,
-                f"第 {proposal.iteration + 1} 轮候选已生成（{stage_text}），等待人工确认",
-            )
+            if run.request.mode == MODE_AUTO:
+                # 全自动：不进"等待人工确认"。暂停中候选先挂着（不迁移状态，
+                # 等 resume 再执行），否则直接进执行层（内部再转 APPLYING）。
+                if run.state == TuningState.PAUSED:
+                    self._persist_state(run)
+                    return self.status(run.run_id)
+                self._persist_state(run)
+                # 只标记：写设备/等稳定/采目标耗时秒级，必须在锁外跑，
+                # 否则 start() 主线程在 return status() 时会被堵到整个任务结束。
+                schedule_execute = True
+            else:
+                self._to(
+                    run,
+                    TuningState.AWAITING_CONFIRMATION,
+                    f"第 {proposal.iteration + 1} 轮候选已生成（{stage_text}），等待人工确认",
+                )
         self._persist_state(run)
+        if schedule_execute:
+            self._execute_pending(run.run_id, require_awaiting=False)
+            return self.status(run.run_id)
 
     # ------------------------------------------------------------------
     # 确认并执行
     # ------------------------------------------------------------------
     def approve(self, run_id: str) -> TuningRunStatus:
         """人工确认当前候选：交给执行层校验并写入设备，然后测量目标。"""
+        return self._execute_pending(run_id, require_awaiting=True)
+
+    def _execute_pending(
+        self, run_id: str, *, require_awaiting: bool = True
+    ) -> TuningRunStatus:
+        """执行当前候选：联锁巡检 → 执行层写入 → 读回 → 采目标 → 记录 → 下一轮。
+
+        confirm 模式由 /approve 触发（require_awaiting=True）；
+        auto 模式由 _propose_next 直接触发（require_awaiting=False）。
+        """
         run = self._require(run_id)
         with self._lock:
-            if run.state != TuningState.AWAITING_CONFIRMATION or run.pending is None:
+            if run.pending is None:
+                raise TuningError("当前没有待确认的候选")
+            if require_awaiting and run.state != TuningState.AWAITING_CONFIRMATION:
                 raise TuningError(
                     f"当前没有待确认的候选（状态为 {run.state}）"
                 )
+            if not require_awaiting and run.state not in (
+                TuningState.RUNNING,
+                TuningState.AWAITING_CONFIRMATION,
+            ):
+                raise TuningError(f"当前状态不能执行候选（{run.state}）")
             proposal = run.pending
             self._to(run, TuningState.APPLYING, f"第 {proposal.iteration + 1} 轮写入设备")
         self._persist_state(run)
+
+        # 应用层联锁：写设备之前巡检，越界即终止本轮（设备保持现状，锁交人工）
+        try:
+            check_interlocks(
+                run.request.interlocks,
+                self._signals.read_value,
+            )
+        except InterlockViolation as exc:
+            self._finish_failed(run, str(exc))
+            return self.status(run_id)
 
         iteration, state_unknown = self._apply(run, proposal)
 
@@ -635,10 +881,20 @@ class TuningService:
         with self._lock:
             run.pending = None
             run.iterations.append(iteration)
-            if iteration.objective is not None:
+            quality = getattr(iteration, "quality", "ok")
+            if iteration.objective is not None and quality == "ok":
+                ob_kwargs = {}
+                if hasattr(run.optimizer, "study"):  # OptunaAsker 才有 user_attrs
+                    ob_kwargs["user_attrs"] = {
+                        "run_id": run.run_id,
+                        "iteration": getattr(iteration, "iteration", 0),
+                        "quality": quality,
+                        "readback": dict(iteration.readback or {}),
+                    }
                 run.optimizer.observe(
                     [proposal.values[d.name] for d in run.optimizer.dimensions],
                     iteration.objective,
+                    **ob_kwargs,
                 )
                 if (
                     run.best_objective is None
@@ -646,9 +902,17 @@ class TuningService:
                 ):
                     run.best_objective = iteration.objective
                     run.best_values = dict(iteration.readback)
+                    run.no_improvement = 0
                     self._store.set_best(
                         run.run_id, dict(iteration.readback), iteration.objective
                     )
+                else:
+                    run.no_improvement += 1
+            else:
+                # 失败/未稳定/写入拒绝：标 FAIL，不喂优化器，不计历史最优
+                fail = getattr(run.optimizer, "fail_trial", None)
+                if callable(fail):
+                    fail()
             # 非激活变量下一轮要继续"保持"的值 = 设备此刻的实际位置；
             # 阶段 1 逐变量推进时，后一个变量的起点就是前一个停下时的位置。
             for signal in run.active_signals:
@@ -684,6 +948,15 @@ class TuningService:
             self._recover(run, reason)
             return self.status(run_id)
 
+        # 收敛早停：连续 patience 轮没有新的历史最优即正常结束
+        if run.request.patience > 0 and run.no_improvement >= run.request.patience:
+            self._finish_completed(
+                run,
+                f"连续 {run.no_improvement} 轮无显著改进，收敛早停"
+                f"（共 {len(run.iterations)} 轮）",
+            )
+            return self.status(run_id)
+
         with self._lock:
             if run.stopped:
                 self._finish_aborted(run)
@@ -698,7 +971,10 @@ class TuningService:
 
         三条判据（改造报告 §5.2）：目标读不到 / 低于绝对阈值 / 相对启动前基线
         下降过多。相对判据在拿不到基线时不参与判断——**不拿猜测的数字当安全边界**。
+        总开关 ``loss_protection=False`` 时直接跳过（SIM/演示用）。
         """
+        if not run.request.loss_protection:
+            return None
         if iteration.objective is None:
             return f"本轮没有有效目标读数（{iteration.detail or '原因未记录'}）"
         absolute = run.request.loss_absolute
@@ -854,6 +1130,11 @@ class TuningService:
                     "这次任务没有启动前快照（可能是旧版本任务），无法恢复初始参数"
                 )
             return {signal: float(value) for signal, value in run.snapshot.items()}
+        if action == ACTION_START_VALUES:
+            return {
+                variable.signal: variable.resolved_start()
+                for variable in run.request.enabled_variables()
+            }
         # 安全值：每路退到映射里配置的下限；没有下限按 0（与"全部关断"同一口径）
         targets: dict[str, float] = {}
         for variable in run.request.enabled_variables():
@@ -973,25 +1254,63 @@ class TuningService:
     # ------------------------------------------------------------------
     # 终态
     # ------------------------------------------------------------------
+    def pause(self, run_id: str) -> TuningRunStatus:
+        """暂停任务：只在"不在写设备"的状态可暂停，参数保持现状。"""
+        run = self._require(run_id)
+        with self._lock:
+            if run.state not in (
+                TuningState.RUNNING,
+                TuningState.AWAITING_CONFIRMATION,
+            ):
+                raise TuningError(
+                    f"当前状态不能暂停（{run.state}）；写设备中请等本轮收尾"
+                )
+            self._to(run, TuningState.PAUSED, "已暂停（参数冻结，等待继续）")
+        self._persist_state(run)
+        return self.status(run_id)
+
+    def resume(self, run_id: str) -> TuningRunStatus:
+        """继续暂停的任务：有挂起候选则按模式继续执行 / 等待确认。"""
+        run = self._require(run_id)
+        with self._lock:
+            if run.state != TuningState.PAUSED:
+                raise TuningError(f"任务不处于暂停状态（{run.state}）")
+            self._to(run, TuningState.RUNNING, "继续调束")
+        self._persist_state(run)
+        if run.pending is not None:
+            if run.request.mode == MODE_AUTO:
+                return self._execute_pending(run.run_id, require_awaiting=False)
+            with self._lock:
+                self._to(
+                    run, TuningState.AWAITING_CONFIRMATION, "候选已生成，等待人工确认"
+                )
+            self._persist_state(run)
+        return self.status(run_id)
+
     def stop(self, run_id: str) -> TuningRunStatus:
         run = self._require(run_id)
         with self._lock:
             if run.state in TERMINAL_STATES:
                 return self._status_of(run)
             run.stopped = True
-            # 等确认期间可以直接停；正在写入的那一轮要等它收尾
-            if run.state == TuningState.AWAITING_CONFIRMATION:
+            # 等确认 / 暂停期间可以直接停；正在写入的那一轮要等它收尾
+            if run.state in (
+                TuningState.AWAITING_CONFIRMATION,
+                TuningState.PAUSED,
+            ):
                 self._finish_aborted(run)
                 return self._status_of(run)
             run.message = "已请求停止，等待当前轮收尾"
         self._persist_state(run)
         return self.status(run_id)
 
-    def _finish_completed(self, run: _Run) -> None:
+    def _finish_completed(self, run: _Run, reason: str | None = None) -> None:
         self._locks.release(owner=run.run_id)
         with self._lock:
             run.pending = None
-            self._to(run, TuningState.COMPLETED, f"完成 {len(run.iterations)} 轮")
+            self._to(
+                run, TuningState.COMPLETED, reason or f"完成 {len(run.iterations)} 轮"
+            )
             run.finished_at = _now()
         self._store.set_finished(run.run_id, run.finished_at)
         self._persist_state(run)
@@ -1003,6 +1322,9 @@ class TuningService:
         self._locks.release(owner=run.run_id)
         with self._lock:
             run.pending = None
+            drop = getattr(run.optimizer, "drop_pending_trial", None)
+            if callable(drop):
+                drop()
             self._to(run, TuningState.STOP_REQUESTED, "收到停止请求")
             self._to(run, TuningState.ABORTED, final)
             run.finished_at = _now()

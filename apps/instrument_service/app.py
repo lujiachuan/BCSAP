@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 
 from packages.contracts import (
+    ManualDashboardConfig,
     PvMappingConfig,
     PvMappingValidationError,
     ServiceStatus,
@@ -31,13 +32,49 @@ from packages.contracts.tuning import (
     TuningRunStatus,
 )
 
-from . import pv_mapping, tuning_catalog
+from . import manual_dashboard, pv_mapping, tuning_analysis_service, tuning_catalog
 from .device_locks import DeviceBusy
+from .pv_health import create_gateway, create_simulated_gateway
 from .runtime import InstrumentRuntime
 from .scan_service import ScanError
 from .scan_store import StoreUnavailable
 from .signal_io import WriteRejected
 from .tuning_service import TuningError
+
+
+def _gateway_factory_from_env():
+    """SPECTRUM_USE_SIM=1 时走内存 SIM 网关（无硬件联调用）。"""
+    import os
+    if os.environ.get("SPECTRUM_USE_SIM", "").strip().lower() in {"1", "true", "yes"}:
+        return create_simulated_gateway
+    return create_gateway
+
+
+def _start_optuna_dashboard(runtime) -> None:
+    """后台起 optuna-dashboard：浏览器看 Optuna 原生交互图（history/importance/slice/contour）。
+
+    端口 8001；绑失败或没装 optuna-dashboard 时静默跳过，不影响主服务。
+    """
+    import threading
+    try:
+        import optuna_dashboard  # noqa: F401
+    except ImportError:
+        return
+    storage_url = runtime.tuning.optuna_storage_url
+    port = 8001
+
+    def _serve() -> None:
+        try:
+            import optuna
+            storage = optuna.storages.RDBStorage(url=storage_url)
+            optuna_dashboard.run_server(storage, host="127.0.0.1", port=port)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[optuna-dashboard] 未启动：{exc}")
+
+    t = threading.Thread(target=_serve, daemon=True, name="optuna-dashboard")
+    t.start()
+    runtime.optuna_dashboard_started = True
+    print(f"[optuna-dashboard] http://127.0.0.1:{port}")
 
 
 def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
@@ -46,11 +83,12 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
     ``runtime`` 可注入，测试时用临时配置建立独立运行时。
     """
 
-    state = runtime if runtime is not None else InstrumentRuntime()
+    state = runtime if runtime is not None else InstrumentRuntime(gateway_factory=_gateway_factory_from_env())
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         state.recover_startup()
+        _start_optuna_dashboard(state)
         yield
 
     app = FastAPI(title="仪器执行服务", version="0.1.0", lifespan=lifespan)
@@ -159,6 +197,51 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
     def get_tuning_catalog() -> TuningCatalog:
         """按**当前**映射与束线拓扑给出可选目标与变量。"""
         return tuning_catalog.build_catalog(state.config)
+
+    @app.get("/control/v1/tuning/capabilities")
+    def get_tuning_capabilities() -> dict:
+        """引擎能力探测：界面按此显示可用引擎，不维护静态清单。"""
+        import importlib.util
+        cmaes_available = importlib.util.find_spec("cmaes") is not None
+        return {
+            "default_engine": "cmaes",
+            "engines": [
+                {"key": "tpe", "available": True, "reason": ""},
+                {"key": "gp", "available": True, "reason": "兼容旧配置"},
+                {
+                    "key": "cmaes",
+                    "available": cmaes_available,
+                    "reason": "" if cmaes_available else "缺少 cmaes 依赖",
+                },
+                {"key": "random", "available": True, "reason": ""},
+                {"key": "qmc", "available": True, "reason": ""},
+            ],
+            "dashboard": {
+                "available": getattr(state, "optuna_dashboard_started", False),
+                "url": "http://127.0.0.1:8001/",
+            },
+        }
+
+    @app.get("/control/v1/tuning/runs")
+    def get_tuning_runs(limit: int = 50) -> dict:
+        """历史调束 run 列表（服务重启后仍可查）。"""
+        rows = state.tuning._store.list_runs(limit=limit)
+        return {
+            "runs": [
+                {
+                    "run_id": r["run_id"],
+                    "started_at": r["created_at"],
+                    "finished_at": r["finished_at"],
+                    "state": r["state"],
+                    "message": r["message"],
+                    "algorithm": r["algorithm"],
+                    "best_objective": r["best_objective"],
+                    "max_iterations": r["max_iterations"],
+                    "mode": r["mode"],
+                                    }
+                for r in rows
+            ]
+        }
 
     # ------------------------------------------------------------------
     # 成组回落（与扫谱收尾同一套服务端逻辑）
@@ -294,11 +377,34 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
         "/control/v1/tuning/runs/{run_id}/iterations",
         response_model=TuningIterationsResponse,
     )
-    def get_tuning_iterations(run_id: str) -> TuningIterationsResponse:
+    def get_tuning_iterations(
+        run_id: str, after_iteration: int = -1
+    ) -> TuningIterationsResponse:
         try:
-            return state.tuning.iterations(run_id)
+            resp = state.tuning.iterations(run_id)
+            if after_iteration >= 0:
+                resp.iterations = [
+                    it for it in resp.iterations
+                    if getattr(it, "iteration", 0) > after_iteration
+                ]
+            return resp
         except TuningError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/control/v1/tuning/runs/{run_id}/analysis")
+    def get_tuning_analysis(run_id: str):
+        """结束后分析：爬山图数据 / 参数重要性 / 一维切片 / trial 表。
+
+        数据从持久化 Optuna study 取，前端用 pyqtgraph 画图。
+        """
+        storage_url = state.tuning.optuna_storage_url
+        result = tuning_analysis_service.analyze(storage_url, run_id)
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail="无可用 study 数据（未用 Optuna 引擎或未跑过）",
+            )
+        return result
 
     @app.post(
         "/control/v1/tuning/runs/{run_id}/approve", response_model=TuningRunStatus
@@ -310,6 +416,26 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
         """
         try:
             return state.tuning.approve(run_id)
+        except TuningError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post(
+        "/control/v1/tuning/runs/{run_id}/pause", response_model=TuningRunStatus
+    )
+    def post_tuning_pause(run_id: str) -> TuningRunStatus:
+        """暂停任务：不在写设备时可暂停，参数保持现状，resume 后继续。"""
+        try:
+            return state.tuning.pause(run_id)
+        except TuningError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post(
+        "/control/v1/tuning/runs/{run_id}/resume", response_model=TuningRunStatus
+    )
+    def post_tuning_resume(run_id: str) -> TuningRunStatus:
+        """继续暂停的任务：有挂起候选则按模式继续执行 / 等待确认。"""
+        try:
+            return state.tuning.resume(run_id)
         except TuningError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -352,6 +478,19 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
     @app.get("/control/v1/pv-mapping", response_model=PvMappingConfig)
     def get_pv_mapping() -> PvMappingConfig:
         return state.config
+
+    @app.get("/control/v1/manual-dashboard", response_model=ManualDashboardConfig)
+    def get_manual_dashboard() -> ManualDashboardConfig:
+        return manual_dashboard.load_config(state.config)
+
+    @app.put("/control/v1/manual-dashboard", response_model=ManualDashboardConfig)
+    def put_manual_dashboard(config: ManualDashboardConfig) -> ManualDashboardConfig:
+        """保存纯展示配置；不重建网关，也不改变设备锁和安全边界。"""
+        try:
+            manual_dashboard.save_config(config, state.config)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return config
 
     @app.put("/control/v1/pv-mapping", response_model=PvMappingConfig)
     def put_pv_mapping(

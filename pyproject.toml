@@ -21,6 +21,10 @@ client = [
 service = [
     "fastapi>=0.115,<1",
     "uvicorn[standard]>=0.34,<1",
+    "optuna>=4.0,<5",
+    "cmaes>=0.13",
+    "optuna-dashboard>=0.21",
+    "scikit-learn>=1.5",
 ]
 database = [
     "alembic>=1.14,<2",

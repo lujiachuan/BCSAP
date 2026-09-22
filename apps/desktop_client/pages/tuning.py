@@ -8,11 +8,10 @@
 
 两个刻意的设计：
 
-* **模式固定为「建议 → 人工确认」**。第一版不提供连续自动写入（文档 6.6 的
-  分阶段计划），界面只展示模式、不给切换开关——避免把"要不要自动写设备"
-  做成一个随手可点的复选框。
 * **候选值不等于已执行值**。每轮分别记录建议值、实际下发值、实际回读值与
   目标测量；只显示建议值会让人误以为设备已经动过了（文档 9.4）。
+* **自动模式必须带束流保护**。auto 模式（全自动写入）在服务端启动校验里
+  强制要求绝对/相对损失阈值至少一个有效；界面在切换模式时同步提示。
 """
 
 from __future__ import annotations
@@ -20,8 +19,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QTableWidget,
@@ -50,12 +52,14 @@ from apps.desktop_client.widgets import MetricCard, PageHeading, Panel
 
 POLL_INTERVAL_MS = 700
 DEFAULT_TARGET = "detector.fc1.beam_current"
+DASHBOARD_URL = "http://127.0.0.1:8001/"
 
 # 结束后的三种处置动作（与执行服务的动作名一一对应）。
 # 界面自己写一遍中文名，不 import 执行服务的模块——客户端不该依赖服务端实现。
 FINALIZE_LABELS = {
     "apply_best": "应用最优参数",
     "restore_initial": "恢复启动前参数",
+    "start_values": "回到起始值",
     "safe_values": "回安全值",
 }
 
@@ -67,6 +71,24 @@ STRATEGY_CHOICES = (
 
 # 阶段名 → 界面文案
 STAGE_TEXT = {"sequential": "逐参数优化", "joint": "联合微调"}
+
+# 优化引擎（键名与执行服务一致）。界面自己写中文名，不 import 服务端实现。
+# 默认 CMA-ES：自动调束的响应面是连续、光滑、单峰、需要多参数联合对准的类型，
+# 这正是 CMA-ES 的主场（实测同一 SIM 响应面 80 轮：CMA-ES 均值 11.65 nA，
+# TPE 50 轮均值仅 9.75 nA）。TPE 更适合离散/条件参数或响应面形状未知的场景，保留可选。
+ENGINE_CHOICES = (
+    ("cmaes", "CMA-ES（推荐：连续联合调参）"),
+    ("tpe", "TPE（离散/条件参数或形状未知）"),
+    ("qmc", "QMC（Optuna）"),
+    ("random", "Random（Optuna）"),
+    ("grid", "Grid（Optuna）"),
+)
+
+# 调束模式：confirm 每轮人工确认；auto 全自动（候选直接进执行层）
+MODE_CHOICES = (
+    ("auto", "全自动（无需确认）"),
+    ("confirm", "建议 → 人工确认"),
+)
 
 # 老版执行服务不带 tunable / beam_target 标记时的**过渡**回退规则。
 # 权威规则在设备档案（`apps/instrument_service/device_profiles.py`）里，这里只是
@@ -102,6 +124,7 @@ STATE_TEXT = {
     "running": "调束进行中",
     "awaiting_confirmation": "等待人工确认候选",
     "applying": "写入设备并等待稳定",
+    "paused": "已暂停（参数冻结）",
     "stop_requested": "停止中",
     "completed": "调束完成",
     "aborted": "已停止",
@@ -115,6 +138,8 @@ class TuningPage(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
+        self._last_completed = 0
+        self._iterations_in_flight = False
         self._mapping: list[dict] = []
         self._rows: list[dict] = []
         self._catalog: dict = {}
@@ -129,6 +154,9 @@ class TuningPage(QWidget):
         self._state = "idle"
         self._pending: dict | None = None
         self._iterations: list[dict] = []
+        self._analysis: dict | None = None  # 结束后从 /analysis 拉的 Optuna 分析结果
+        self._analysis_items: list[object] = []
+        self._dashboard_url = DASHBOARD_URL
         self._status_in_flight = False
         self._read_in_flight = False
         self._best_line = None
@@ -138,6 +166,7 @@ class TuningPage(QWidget):
         self._startup_advice: list[str] = []
         self._algorithm = ""
         self._seed: int | None = None
+        self._mode = "confirm"
 
         self._timer = QTimer(self)
         self._timer.setInterval(POLL_INTERVAL_MS)
@@ -174,19 +203,32 @@ class TuningPage(QWidget):
         splitter.setChildrenCollapsible(False)
 
         variables = Panel("优化变量", "勾选参与调束的参数并设定范围")
-        self.parameter_table = QTableWidget(0, 5)
+        select_row = QHBoxLayout()
+        select_row.addStretch()
+        self.select_all_button = QPushButton("全选")
+        self.select_none_button = QPushButton("取消全选")
+        for btn in (self.select_all_button, self.select_none_button):
+            btn.setFlat(True)
+            select_row.addWidget(btn)
+        self.select_all_button.clicked.connect(lambda: self._set_all_variables(True))
+        self.select_none_button.clicked.connect(lambda: self._set_all_variables(False))
+        variables.body.addLayout(select_row)
+        self.parameter_table = QTableWidget(0, 6)
         self.parameter_table.setHorizontalHeaderLabels(
-            ["启用", "设备参数", "下限", "上限", "当前回读"]
+            ["启用", "设备参数", "下限", "上限", "起始值", "当前回读"]
         )
         self.parameter_table.verticalHeader().setVisible(False)
+        self.parameter_table.itemChanged.connect(self._on_variable_item_changed)
         variables.body.addWidget(self.parameter_table, 1)
         self.variable_hint = QLabel("正在读取设备参数…", objectName="mutedText")
         self.variable_hint.setWordWrap(True)
         variables.body.addWidget(self.variable_hint)
         splitter.addWidget(variables)
 
-        strategy = Panel("目标与策略", "贝叶斯优化（GP + EI）")
-        form = QVBoxLayout()
+        strategy = Panel("目标与策略", "优化算法与搜索策略")
+        form_host = QWidget()
+        form_host.setAutoFillBackground(False)
+        form = QVBoxLayout(form_host)
         form.setSpacing(8)
 
         form.addWidget(QLabel("优化目标（最大化）", objectName="mutedText"))
@@ -194,13 +236,30 @@ class TuningPage(QWidget):
         self.target.currentIndexChanged.connect(self._on_target_changed)
         form.addWidget(self.target)
 
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("模式", objectName="mutedText"))
-        mode_label = QLabel("建议 → 人工确认（第一版固定）")
-        mode_label.setObjectName("modeChip")
-        mode_row.addWidget(mode_label)
-        mode_row.addStretch()
-        form.addLayout(mode_row)
+        form.addWidget(QLabel("调束模式", objectName="mutedText"))
+        self.mode_combo = QComboBox()
+        for key, label in MODE_CHOICES:
+            self.mode_combo.addItem(label, key)
+        self.mode_combo.setToolTip(
+            "auto：候选由执行服务自动写入（每轮仍过边界/单步/速率校验与束流保护）；"
+            "confirm：每轮等你点「确认并执行本轮」。auto 必须启用束流丢失保护。"
+        )
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        form.addWidget(self.mode_combo)
+        self.auto_hint = QLabel("", objectName="mutedText")
+        self.auto_hint.setWordWrap(True)
+        self.auto_hint.setVisible(False)
+        form.addWidget(self.auto_hint)
+
+        form.addWidget(QLabel("优化引擎", objectName="mutedText"))
+        self.engine_combo = QComboBox()
+        for key, label in ENGINE_CHOICES:
+            self.engine_combo.addItem(label, key)
+        self.engine_combo.setToolTip(
+            "CMA-ES 推荐用于连续联合调参；其余为 Optuna 采样器"
+            "（TPE/CMA-ES/QMC/随机/网格），同一份历史观测可复用。"
+        )
+        form.addWidget(self.engine_combo)
 
         # ---- 两阶段策略（改造报告 §5.2）----
         # 逐参数阶段容易把每个变量都推到各自的局部最优，联合微调再在这些最优点
@@ -219,7 +278,8 @@ class TuningPage(QWidget):
         self.calls_spin = QSpinBox()
         self.calls_spin.setRange(1, 50)
         self.calls_spin.setValue(3)
-        form.addWidget(QLabel("逐参数阶段：每个变量用几轮", objectName="mutedText"))
+        self.calls_label = QLabel("逐参数阶段：每个变量用几轮", objectName="mutedText")
+        form.addWidget(self.calls_label)
         form.addWidget(self.calls_spin)
 
         self.joint_frac_spin = QDoubleSpinBox()
@@ -227,7 +287,8 @@ class TuningPage(QWidget):
         self.joint_frac_spin.setSingleStep(5.0)
         self.joint_frac_spin.setValue(20.0)
         self.joint_frac_spin.setSuffix(" %")
-        form.addWidget(QLabel("联合微调范围（占各参数原范围）", objectName="mutedText"))
+        self.joint_frac_label = QLabel("联合微调范围（占各参数原范围）", objectName="mutedText")
+        form.addWidget(self.joint_frac_label)
         form.addWidget(self.joint_frac_spin)
 
         self.hold_spin = QDoubleSpinBox()
@@ -263,18 +324,6 @@ class TuningPage(QWidget):
         # 路径（同一份配置 + 同一种子可复现）。原 demo 的"初始采样数"没有对应物：
         # 平台的第一个候选固定取范围中心（见 packages/optimizer/bayes.py），
         # 不做初始随机撒点——给一个不受任何代码影响的输入框只会误导操作员。
-        self.noise_spin = QDoubleSpinBox()
-        self.noise_spin.setDecimals(6)
-        self.noise_spin.setRange(0.0, 1e6)
-        self.noise_spin.setSingleStep(0.01)
-        self.noise_spin.setValue(1e-6)
-        self.noise_spin.setToolTip(
-            "GP 假定的观测噪声（目标量纲）：目标读数本身抖得厉害就调大，"
-            "否则算法会把噪声当成真实差异去追"
-        )
-        form.addWidget(QLabel("观测噪声（目标量纲）", objectName="mutedText"))
-        form.addWidget(self.noise_spin)
-
         self.seed_spin = QSpinBox()
         self.seed_spin.setRange(0, 999999)
         self.seed_spin.setValue(0)
@@ -284,7 +333,48 @@ class TuningPage(QWidget):
         form.addWidget(QLabel("随机种子", objectName="mutedText"))
         form.addWidget(self.seed_spin)
 
+        # 每次使用随机种子：勾选后忽略固定 seed_spin，开始时现场生成
+        self.random_seed_check = QCheckBox("每次使用随机种子（忽略上面的固定种子）")
+        self.random_seed_check.setChecked(False)
+        self.random_seed_check.setToolTip(
+            "勾选后每次开始调束都用新的随机种子，第一轮点不再重复；"
+            "不勾选则用上面的固定种子，路径可复现。"
+        )
+        self.random_seed_check.toggled.connect(
+            lambda on: self.seed_spin.setEnabled(not on)
+        )
+        form.addWidget(self.random_seed_check)
+
+        # 随机探索轮次（CMA-ES / TPE 建模前的纯随机轮数）
+        self.startup_spin = QSpinBox()
+        self.startup_spin.setRange(0, 100)
+        self.startup_spin.setValue(5)
+        self.startup_spin.setToolTip(
+            "开始建模前先纯随机探索的轮数；仅 CMA-ES、TPE 生效，"
+            "Random/QMC/Grid/GP 不受影响。"
+        )
+        form.addWidget(QLabel("随机探索轮次（仅 CMA-ES / TPE）", objectName="mutedText"))
+        form.addWidget(self.startup_spin)
+
+        self.patience_spin = QSpinBox()
+        self.patience_spin.setRange(0, 50)
+        self.patience_spin.setValue(5)
+        self.patience_spin.setToolTip(
+            "收敛早停：连续这么多轮没有产生新的历史最优就正常结束（0 = 不启用）。"
+            "省掉后半段原地踏步的轮次，适合现场时间紧张时使用。"
+        )
+        form.addWidget(QLabel("收敛早停（连续无改进轮数，0=不启用）", objectName="mutedText"))
+        form.addWidget(self.patience_spin)
+
         # ---- 束流丢失保护（改造报告 §5.2）----
+        # 总开关：SIM/演示或确认不需要时可整个关掉
+        self.loss_protection_check = QCheckBox("启用束流丢失保护")
+        self.loss_protection_check.setChecked(True)
+        self.loss_protection_check.setToolTip(
+            "关掉后执行服务完全不做束流异常判定，也不会自动回退；"
+            "SIM 演示或确认不需要该保护时使用。"
+        )
+        form.addWidget(self.loss_protection_check)
         # 阈值必须现场可调：FC 量级、束流工况各不相同，写死在代码里等于没有保护。
         loss_row = QHBoxLayout()
         self.loss_absolute_check = QCheckBox("目标低于")
@@ -324,10 +414,49 @@ class TuningPage(QWidget):
         )
         form.addWidget(self.auto_recover_check)
 
+        # 总开关联动子控件
+        self._loss_protection_widgets = [
+            self.loss_absolute_check, self.loss_absolute_spin,
+            self.loss_relative_spin, self.loss_strikes_spin,
+            self.auto_recover_check,
+        ]
+        def _toggle_loss_protection(on: bool) -> None:
+            for w in self._loss_protection_widgets:
+                w.setEnabled(on)
+            if on:
+                # 恢复绝对阈值子联动
+                self.loss_absolute_spin.setEnabled(self.loss_absolute_check.isChecked())
+        self.loss_protection_check.toggled.connect(_toggle_loss_protection)
+
+        # 开始前复位：每次从安全起始点（各参数下限）开始，不继承上一次结果
+        self.reset_before_start_check = QCheckBox("开始前复位到起始值（不继承上一次结果）")
+        self.reset_before_start_check.setChecked(False)
+        self.reset_before_start_check.setToolTip(
+            "勾选后，开始调束会先把参与变量经执行层写到“起始值”列（默认为范围中值）再寻优，"
+            "保证每次起点一致；不勾选则从设备当前值（可能是上次最优）开始。"
+        )
+        form.addWidget(self.reset_before_start_check)
+
+        # ---- 停滞阈值（过程建议「近 10 轮提升不足 X%」的 X）----
+        self.stall_fraction_form_spin = QDoubleSpinBox()
+        self.stall_fraction_form_spin.setRange(0.1, 50.0)
+        self.stall_fraction_form_spin.setSingleStep(0.5)
+        self.stall_fraction_form_spin.setValue(5.0)
+        self.stall_fraction_form_spin.setSuffix(" %")
+        self.stall_fraction_form_spin.setDecimals(1)
+        self.stall_fraction_form_spin.setMaximumWidth(170)
+        self.stall_fraction_form_spin.setToolTip(
+            "过程建议里「近 10 轮目标提升不足 X%」的 X。"
+            "噪声大时调大（避免误报），要更早报警时调小。"
+        )
+        self.stall_fraction_form_spin.valueChanged.connect(lambda _v: self._refresh_advice())
+        form.addWidget(QLabel("停滞阈值（近 10 轮提升不足多少算停滞）", objectName="mutedText"))
+        form.addWidget(self.stall_fraction_form_spin)
+
         for widget in (
             self.iterations_spin, self.settle_spin, self.samples_spin,
             self.loss_relative_spin, self.loss_strikes_spin,
-            self.noise_spin, self.seed_spin,
+            self.seed_spin,
         ):
             widget.setMaximumWidth(170)
 
@@ -366,19 +495,23 @@ class TuningPage(QWidget):
         # 默认只保留启动任务必需的参数；低频策略与保护项按需展开，
         # 让 1320×820 下的开始按钮始终留在当前页内。
         advanced_label_texts = {
-            "逐参数阶段：每个变量用几轮",
-            "联合微调范围（占各参数原范围）",
-            "每轮写完后额外保持",
-            "观测噪声（目标量纲）",
             "随机种子",
+            "随机探索轮次（仅 CMA-ES / TPE）",
+            "收敛早停（连续无改进轮数，0=不启用）",
             "绝对归零阈值（束流接近零）",
             "相对损失阈值（低于启动前基线多少算丢失）",
             "连续异常次数才触发保护",
             "完成后处置建议（仅提示，执行仍需二次确认）",
         }
+        # 逐参数策略专属：只有选「逐参数 → 联合」时才可能显示
+        self._sequential_only_widgets = [
+            self.calls_spin, self.calls_label,
+            self.joint_frac_spin, self.joint_frac_label,
+        ]
         self._advanced_widgets = [
-            self.calls_spin, self.joint_frac_spin, self.hold_spin,
-            self.noise_spin, self.seed_spin,
+            self.seed_spin,
+            self.random_seed_check, self.startup_spin,
+            self.patience_spin,
             self.loss_absolute_check, self.loss_absolute_spin,
             self.loss_relative_spin, self.loss_strikes_spin,
             self.auto_recover_check, self.finalize_pref,
@@ -389,40 +522,173 @@ class TuningPage(QWidget):
             for label in strategy.findChildren(QLabel)
             if label.text() in advanced_label_texts
         )
+        self._advanced_visible = False
+        self.strategy.currentIndexChanged.connect(self._toggle_strategy_options)
         self.advanced_button = QPushButton("展开高级参数")
         self.advanced_button.setCheckable(True)
         self.advanced_button.toggled.connect(self._toggle_advanced_options)
-        form.addWidget(self.advanced_button)
         self._toggle_advanced_options(False)
 
         form.addStretch()
+        # 表单整体放进滚动区：展开高级参数后内容超高时滚动，而不是把控件压扁挤在一起。
+        # 1320×820 下开始按钮始终留在页内，靠下方固定区保证（与表单本身解耦）。
+        form_scroll = QScrollArea(objectName="groupScroll")
+        form_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        form_scroll.setWidgetResizable(True)
+        form_scroll.viewport().setAutoFillBackground(False)
+        form_scroll.setWidget(form_host)
+        strategy.body.addWidget(form_scroll, 1)
+
+        # 固定区：展开/收起开关、提示、开始按钮始终可见，不随表单滚动
+        strategy.body.addWidget(self.advanced_button)
+
+        self.run_plan_label = QLabel("正在生成运行计划…", objectName="mutedText")
+        self.run_plan_label.setWordWrap(True)
+        strategy.body.addWidget(self.run_plan_label)
+        self.preflight_label = QLabel("启动检查：请选择目标和优化变量", objectName="mutedText")
+        self.preflight_label.setWordWrap(True)
+        strategy.body.addWidget(self.preflight_label)
+
         hint = QLabel(
             "范围必须落在设备允许区间内，且参数需配置最大单步；否则启动时会被拒绝——"
             "让优化器提出一个必然写不进去的值没有意义。",
             objectName="mutedText",
         )
         hint.setWordWrap(True)
-        form.addWidget(hint)
+        strategy.body.addWidget(hint)
         # 全局只读部署：按钮压住的同时必须说明原因，否则操作员会反复怀疑参数
         self.read_only_note = QLabel("", objectName="mutedText")
         self.read_only_note.setWordWrap(True)
         self.read_only_note.setVisible(False)
-        form.addWidget(self.read_only_note)
+        strategy.body.addWidget(self.read_only_note)
         self.start_button = primary_button("开始自动调束")
         self.start_button.clicked.connect(self.start_tuning)
-        form.addWidget(self.start_button)
-        strategy.body.addLayout(form)
+        strategy.body.addWidget(self.start_button)
         splitter.addWidget(strategy)
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([980, 300])
         outer.addWidget(splitter)
+        for widget in (
+            self.strategy, self.mode_combo, self.engine_combo,
+            self.calls_spin, self.iterations_spin, self.settle_spin,
+            self.samples_spin, self.hold_spin, self.loss_relative_spin,
+        ):
+            if isinstance(widget, QComboBox):
+                widget.currentIndexChanged.connect(self._update_run_plan)
+            else:
+                widget.valueChanged.connect(self._update_run_plan)
+        self.loss_absolute_check.toggled.connect(self._update_run_plan)
+        self._update_run_plan()
         return tab
 
     def _toggle_advanced_options(self, visible: bool) -> None:
+        self._advanced_visible = bool(visible)
         for widget in self._advanced_widgets:
             widget.setVisible(visible)
+        self._toggle_strategy_options()
         self.advanced_button.setText("收起高级参数" if visible else "展开高级参数")
+
+    def _strategy_is_sequential(self) -> bool:
+        return self.strategy.currentData() == "sequential_then_joint"
+
+    def _toggle_strategy_options(self, *_args) -> None:
+        """逐参数专属配置：高级已展开且策略选了逐参数时才显示。"""
+        show = self._advanced_visible and self._strategy_is_sequential()
+        for widget in self._sequential_only_widgets:
+            widget.setVisible(show)
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        minutes = max(0, round(seconds / 60))
+        if minutes < 1:
+            return "不足 1 分钟"
+        if minutes < 60:
+            return f"约 {minutes} 分钟"
+        return f"约 {minutes // 60} 小时 {minutes % 60} 分钟"
+
+    def _set_all_variables(self, checked: bool) -> None:
+        """一键全选/取消全选；只改勾选列，范围与回读保持不动。"""
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for row in getattr(self, "_rows", []):
+            if row["check"].checkState() != state:
+                row["check"].setCheckState(state)
+        self._update_variable_hint()
+        self._update_run_plan()
+
+    def _on_variable_item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() != 0:
+            return
+        self._update_variable_hint()
+        self._update_run_plan()
+
+    def _update_run_plan(self, *_args) -> None:
+        """用现有配置生成紧凑计划与启动前检查，不复制服务端安全校验。"""
+        if not hasattr(self, "run_plan_label"):
+            return
+        selected = [
+            row for row in self._rows
+            if row["check"].checkState() == Qt.CheckState.Checked
+        ]
+        total = self.iterations_spin.value()
+        sequential = (
+            self.calls_spin.value() * len(selected)
+            if self.strategy.currentData() == "sequential_then_joint"
+            else 0
+        )
+        joint = max(0, total - sequential) if sequential else total
+        seconds = total * (
+            self.settle_spin.value() + self.hold_spin.value()
+            + max(0, self.samples_spin.value() - 1) * 0.05
+        )
+        plan = [
+            f"运行计划：{len(selected)} 个变量 · {total} 轮",
+            f"引擎 {self.engine_combo.currentText()}",
+        ]
+        if sequential:
+            plan.append(f"逐参数 {sequential} 轮 + 联合 {joint} 轮")
+        plan.append(f"预计至少 {self._format_duration(seconds)}")
+        self.run_plan_label.setText("；".join(plan))
+
+        checks = {
+            "目标": bool(self.target.currentData()),
+            "变量": bool(selected),
+            "范围": bool(selected) and all(
+                row["low"].value() < row["high"].value() for row in selected
+            ),
+            "最大单步": bool(selected) and all(
+                row["entry"].get("max_step") for row in selected
+            ),
+            "轮次预算": not sequential or sequential < total,
+        }
+        if self.mode_combo.currentData() == "auto":
+            checks["束流保护"] = self.loss_absolute_check.isChecked() or (
+                self.loss_relative_spin.value() > 0
+            )
+        passed = sum(checks.values())
+        pending = "、".join(name for name, ok in checks.items() if not ok)
+        self.preflight_label.setText(
+            f"启动检查：{passed}/{len(checks)} 项通过"
+            + (f"；待处理：{pending}" if pending else "；可以提交服务端最终校验")
+        )
+        state = "good" if passed == len(checks) else "warn"
+        self.preflight_label.setProperty("state", state)
+        self.preflight_label.style().unpolish(self.preflight_label)
+        self.preflight_label.style().polish(self.preflight_label)
+
+    def _on_mode_changed(self, _index: int) -> None:
+        """切换模式时同步提示：auto 必须启用束流丢失保护（服务端也会拒绝）。"""
+        auto = self.mode_combo.currentData() == "auto"
+        if auto:
+            self.auto_hint.setText(
+                "全自动模式：每轮候选由执行服务直接写入，仍需启用束流丢失保护"
+                "（勾选「目标低于」或把相对损失阈值设 > 0），否则启动会被拒绝；"
+                "运行中可随时暂停 / 停止。"
+            )
+            self.auto_hint.setVisible(True)
+        else:
+            self.auto_hint.setVisible(False)
+        self._update_run_plan()
 
     # ------------------------------------------------------------------
     # 页签 2：运行监控
@@ -441,6 +707,14 @@ class TuningPage(QWidget):
         self.acknowledge_button = QPushButton("确认设备状态")
         self.acknowledge_button.setVisible(False)
         self.acknowledge_button.clicked.connect(self._acknowledge)
+        self.tuning_pause_button = QPushButton("暂停")
+        self.tuning_pause_button.setEnabled(False)
+        self.tuning_pause_button.setToolTip("不在写设备时暂停任务，参数保持现状")
+        self.tuning_pause_button.clicked.connect(self.pause_tuning)
+        self.tuning_resume_button = QPushButton("继续")
+        self.tuning_resume_button.setEnabled(False)
+        self.tuning_resume_button.setVisible(False)
+        self.tuning_resume_button.clicked.connect(self.resume_tuning)
         self.tuning_stop_button = QPushButton("停止", objectName="dangerButton")
         self.tuning_stop_button.setEnabled(False)
         self.tuning_stop_button.clicked.connect(self.stop_tuning)
@@ -448,6 +722,8 @@ class TuningPage(QWidget):
         row.addWidget(self.iteration_label)
         row.addStretch()
         row.addWidget(self.acknowledge_button)
+        row.addWidget(self.tuning_pause_button)
+        row.addWidget(self.tuning_resume_button)
         row.addWidget(self.tuning_stop_button)
         outer.addWidget(bar)
 
@@ -474,8 +750,9 @@ class TuningPage(QWidget):
         metrics.setSpacing(10)
         self.current_card = MetricCard("本轮测量", "--")
         self.best_card = MetricCard("历史最优", "--", "", success=True)
-        self.gain_card = MetricCard("相对提升", "--")
-        for card in (self.current_card, self.best_card, self.gain_card):
+        self.gain_card = MetricCard("提升量", "--")
+        self.eta_card = MetricCard("预计剩余", "--")
+        for card in (self.current_card, self.best_card, self.gain_card, self.eta_card):
             card.setMaximumHeight(92)
             metrics.addWidget(card, 1)
         outer.addLayout(metrics)
@@ -487,14 +764,15 @@ class TuningPage(QWidget):
         # 原 demo 用同一个画布 + 一个下拉切换"收敛 / 某个变量的响应曲线"：
         # 响应曲线是分析用的，不该另开一屏把实时监控挤掉。
         plot_choice_row = QHBoxLayout()
-        plot_choice_row.addWidget(QLabel("曲线", objectName="mutedText"))
-        self.plot_choice = QComboBox()
-        self.plot_choice.setToolTip(
-            "目标量收敛：x = 轮次；单变量响应：x = 该参数的实际回读，y = 目标测量"
-        )
-        self.plot_choice.currentIndexChanged.connect(lambda _index: self._render_plot())
-        plot_choice_row.addWidget(self.plot_choice, 1)
+        plot_choice_row.addWidget(QLabel("视图", objectName="mutedText"))
+        self.plot_button_row = QHBoxLayout()
+        self.plot_button_row.setSpacing(6)
+        plot_choice_row.addLayout(self.plot_button_row, 1)
         plot_panel.body.addLayout(plot_choice_row)
+        # 兼容旧引用：_render_plot 读 currentData()，用一个隐藏的 QComboBox 存当前选择
+        from PySide6.QtWidgets import QComboBox as _QCB
+        self.plot_choice = _QCB()
+        self.plot_choice.hide()
         self.tuning_plot = SpectrumPlot("轮次", "目标量")
         plot_panel.body.addWidget(self.tuning_plot, 1)
         self.response_note = QLabel("", objectName="mutedText")
@@ -502,7 +780,18 @@ class TuningPage(QWidget):
         plot_panel.body.addWidget(self.response_note)
         outer.addWidget(plot_panel, 1)
 
+        recent = Panel("最近轮次", "建议值与设备实际结果分开记录")
+        self.recent_table = QTableWidget(0, 5)
+        self.recent_table.setHorizontalHeaderLabels(
+            ["轮次", "阶段", "目标值", "质量", "结果"]
+        )
+        self.recent_table.verticalHeader().setVisible(False)
+        self.recent_table.setMaximumHeight(150)
+        recent.body.addWidget(self.recent_table)
+        outer.addWidget(recent)
+
         confirm = QFrame(objectName="noticePanel")
+        self.proposal_panel = confirm
         confirm_layout = QVBoxLayout(confirm)
         confirm_layout.setContentsMargins(14, 10, 14, 10)
         confirm_row = QHBoxLayout()
@@ -533,9 +822,17 @@ class TuningPage(QWidget):
     # ------------------------------------------------------------------
     def _result_tab(self) -> QWidget:
         tab = QWidget()
-        outer = QVBoxLayout(tab)
+        root = QVBoxLayout(tab)
+        root.setContentsMargins(0, 8, 0, 0)
+        scroll = QScrollArea(objectName="groupScroll")
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setWidgetResizable(True)
+        host = QWidget()
+        outer = QVBoxLayout(host)
         outer.setContentsMargins(0, 8, 0, 0)
         outer.setSpacing(10)
+        scroll.setWidget(host)
+        root.addWidget(scroll)
 
         notice = QFrame(objectName="noticePanel")
         notice_row = QHBoxLayout(notice)
@@ -547,10 +844,71 @@ class TuningPage(QWidget):
         notice_row.addWidget(self.result_detail)
         outer.addWidget(notice)
 
+        summary = QHBoxLayout()
+        summary.setSpacing(10)
+        self.result_baseline_card = MetricCard("启动基线", "--")
+        self.result_best_card = MetricCard("最佳目标", "--", "", success=True)
+        self.result_gain_card = MetricCard("相对提升", "--")
+        self.result_quality_card = MetricCard("有效轮次", "0 / 0")
+        for card in (
+            self.result_baseline_card, self.result_best_card,
+            self.result_gain_card, self.result_quality_card,
+        ):
+            card.setMaximumHeight(92)
+            summary.addWidget(card, 1)
+        outer.addLayout(summary)
+
+        analysis = Panel("结果分析", "优化历史、参数重要性、切片与 Trial 明细")
+        analysis_toolbar = QHBoxLayout()
+        analysis_toolbar.addWidget(QLabel("分析视图", objectName="mutedText"))
+        # 按钮组：直接点切换，不再塞下拉里
+        self.analysis_button_group = QButtonGroup(self)
+        self.analysis_button_group.setExclusive(True)
+        self.analysis_buttons_row = QHBoxLayout()
+        self.analysis_buttons_row.setSpacing(4)
+        # 变量很多时按钮会溢出：放进可横向滚动条，仍是一键直接切换
+        buttons_host = QWidget()
+        buttons_host.setLayout(self.analysis_buttons_row)
+        buttons_host.setFixedHeight(30)
+        self.analysis_scroll = QScrollArea()
+        self.analysis_scroll.setWidget(buttons_host)
+        self.analysis_scroll.setWidgetResizable(False)
+        self.analysis_scroll.setFixedHeight(34)
+        self.analysis_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.analysis_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.analysis_scroll.setFrameShape(QFrame.NoFrame)
+        analysis_toolbar.addWidget(self.analysis_scroll, 1)
+        self.open_dashboard_button = QPushButton("浏览器深度分析（英文）")
+        self.open_dashboard_button.setFlat(True)
+        self.open_dashboard_button.setToolTip(
+            "常用分析（爬山图/参数重要性/多维切片/Trial 明细）已在左侧内嵌、"
+            "中文展示；浏览器版为 optuna-dashboard，另提供等高线、平行坐标等"
+            "深度交互，界面为英文。"
+        )
+        self.open_dashboard_button.clicked.connect(self._open_dashboard)
+        analysis_toolbar.addWidget(self.open_dashboard_button)
+        analysis.body.addLayout(analysis_toolbar)
+        self.analysis_current_choice = "history"
+        self._rebuild_analysis_buttons([("优化历史", "history")])
+        self.analysis_plot = SpectrumPlot("轮次", "目标量")
+        analysis.body.addWidget(self.analysis_plot)
+        self.analysis_note = QLabel(
+            "任务结束后自动加载 Optuna 分析；优化历史始终可由本地轮次生成。",
+            objectName="mutedText",
+        )
+        self.analysis_note.setWordWrap(True)
+        analysis.body.addWidget(self.analysis_note)
+        self.analysis_trial_table = QTableWidget(0, 3)
+        self.analysis_trial_table.setHorizontalHeaderLabels(["Trial", "状态", "目标值"])
+        self.analysis_trial_table.verticalHeader().setVisible(False)
+        self.analysis_trial_table.setMaximumHeight(180)
+        analysis.body.addWidget(self.analysis_trial_table)
+        outer.addWidget(analysis)
+
         # 必须是实例属性：旧版把它写成局部变量，真实结果根本回填不进去
-        self.changes_table = QTableWidget(0, 4)
+        self.changes_table = QTableWidget(0, 5)
         self.changes_table.setHorizontalHeaderLabels(
-            ["参数", "启动前回读", "最优回读", "变化"]
+            ["参数", "启动前", "最优轮", "最后一轮", "当前"]
         )
         self.changes_table.verticalHeader().setVisible(False)
         changes = Panel("参数变化", "来自每轮的实际回读，不用建议值")
@@ -598,9 +956,9 @@ class TuningPage(QWidget):
         disposal_row.addStretch()
         disposal.body.addLayout(disposal_row)
         note = QLabel(
-            "「应用最优参数」按最优轮的实际回读下发；「恢复启动前参数」用本次任务启动前"
-            "的快照；「回安全值」退到设备配置里的下限。三种都走执行层（含单步与速率约束），"
-            "并逐路等回读到位后才报成功。",
+            "「应用最优参数」按最优轮下发；「恢复启动前参数」用启动前快照；"
+            "「回到起始值」写到“起始值”列；「回安全值」退到配置下限。"
+            "四种都走执行层（含单步与速率约束），并逐路等回读到位后才报成功。",
             objectName="mutedText",
         )
         note.setWordWrap(True)
@@ -624,6 +982,26 @@ class TuningPage(QWidget):
         # tunable / beam_target 标记，界面照样能过滤，只是没有"按位置自动勾选上游"。
         self._catalog_request = instrument_api.request_tuning_catalog()
         self._catalog_request.completed.connect(self._on_catalog)
+        self._capabilities_request = instrument_api.request_tuning_capabilities()
+        self._capabilities_request.completed.connect(self._on_capabilities)
+
+    def _on_capabilities(self, payload: dict) -> None:
+        if not payload.get("ok"):
+            return
+        data = payload.get("payload") or {}
+        dashboard = data.get("dashboard") or {}
+        self._dashboard_url = str(dashboard.get("url") or DASHBOARD_URL)
+        available = bool(dashboard.get("available"))
+        self.open_dashboard_button.setEnabled(available)
+        if available:
+            self.open_dashboard_button.setToolTip(
+                "常用分析已在左侧内嵌、中文展示；浏览器版（英文）："
+                + self._dashboard_url
+            )
+        else:
+            self.open_dashboard_button.setToolTip(
+                "optuna-dashboard 未安装或未成功启动"
+            )
 
     def _on_catalog(self, payload: dict) -> None:
         if not payload.get("ok"):
@@ -717,22 +1095,39 @@ class TuningPage(QWidget):
                 )
             low_spin.setValue(float(low) if low is not None else 0.0)
             high_spin.setValue(float(high) if high is not None else 0.0)
+            # 起始值：默认范围中值，可改；开始前复位、结束后"回到起始值"都用它
+            start_spin = QDoubleSpinBox()
+            start_spin.setDecimals(2)
+            start_spin.setRange(
+                float(low) if low is not None else -1e9,
+                float(high) if high is not None else 1e9,
+            )
+            midpoint = (
+                (float(low) + float(high)) / 2.0
+                if low is not None and high is not None else 0.0
+            )
+            start_spin.setValue(midpoint)
+            low_spin.valueChanged.connect(self._update_run_plan)
+            high_spin.valueChanged.connect(self._update_run_plan)
             self.parameter_table.setCellWidget(row, 2, low_spin)
             self.parameter_table.setCellWidget(row, 3, high_spin)
+            self.parameter_table.setCellWidget(row, 4, start_spin)
             readback = QLabel("--")
             readback.setObjectName("mutedText")
-            self.parameter_table.setCellWidget(row, 4, readback)
+            self.parameter_table.setCellWidget(row, 5, readback)
             self._rows.append(
                 {
                     "entry": entry,
                     "check": check,
                     "low": low_spin,
                     "high": high_spin,
+                    "start": start_spin,
                     "readback": readback,
                 }
             )
         self.parameter_table.resizeColumnsToContents()
         self._update_variable_hint()
+        self._update_run_plan()
 
     def _build_targets(self) -> None:
         self.target.clear()
@@ -778,6 +1173,7 @@ class TuningPage(QWidget):
     def _on_target_changed(self, _index: int) -> None:
         self._refresh_readbacks()
         self._select_upstream_of_current_target()
+        self._update_run_plan()
 
     def _update_variable_hint(self) -> None:
         """把"为什么只列出这些参数"讲清楚，而不是让操作员猜。"""
@@ -859,10 +1255,14 @@ class TuningPage(QWidget):
                     "enabled": row["check"].checkState() == Qt.CheckState.Checked,
                     "low": float(row["low"].value()),
                     "high": float(row["high"].value()),
+                    "start": float(row["start"].value()),
                 }
                 for row in self._rows
             ],
             "strategy": self.strategy.currentData() or "",
+            "engine": self.engine_combo.currentData() or "cmaes",
+            "mode": self.mode_combo.currentData() or "confirm",
+            "patience": self.patience_spin.value(),
             "calls_per_variable": self.calls_spin.value(),
             "joint_frac": self.joint_frac_spin.value(),
             "hold_s": self.hold_spin.value(),
@@ -875,8 +1275,12 @@ class TuningPage(QWidget):
             "loss_relative": self.loss_relative_spin.value(),
             "loss_strikes": self.loss_strikes_spin.value(),
             "auto_recover": self.auto_recover_check.isChecked(),
-            "noise": self.noise_spin.value(),
+            "loss_protection": self.loss_protection_check.isChecked(),
+            "reset_before_start": self.reset_before_start_check.isChecked(),
+            "stall_fraction": self.stall_fraction_form_spin.value() / 100.0,
             "seed": self.seed_spin.value(),
+            "random_seed": self.random_seed_check.isChecked(),
+            "n_startup_trials": self.startup_spin.value(),
             "finalize_action": self.finalize_pref.currentData() or "",
         }
 
@@ -933,7 +1337,8 @@ class TuningPage(QWidget):
                 if item.get("enabled", True)
                 else Qt.CheckState.Unchecked
             )
-            for key, widget in (("low", row["low"]), ("high", row["high"])):
+            for key, widget in (("low", row["low"]), ("high", row["high"]),
+                                ("start", row["start"])):
                 if item.get(key) is not None:
                     # QDoubleSpinBox 会按自己的范围夹：配置越界时这里就是第一道提示，
                     # 真正能不能写仍由执行层在启动时判定
@@ -944,12 +1349,25 @@ class TuningPage(QWidget):
             index = self.strategy.findData(strategy)
             if index >= 0:
                 self.strategy.setCurrentIndex(index)
+
+        engine = config.get("engine")
+        if engine:
+            index = self.engine_combo.findData(engine)
+            if index >= 0:
+                self.engine_combo.setCurrentIndex(index)
+        mode = config.get("mode")
+        if mode:
+            index = self.mode_combo.findData(mode)
+            if index >= 0:
+                self.mode_combo.setCurrentIndex(index)
         for key, widget in (
             ("calls_per_variable", self.calls_spin),
             ("max_iterations", self.iterations_spin),
             ("samples_per_point", self.samples_spin),
             ("loss_strikes", self.loss_strikes_spin),
             ("seed", self.seed_spin),
+            ("n_startup_trials", self.startup_spin),
+            ("patience", self.patience_spin),
         ):
             if config.get(key) is not None:
                 widget.setValue(int(round(float(config[key]))))
@@ -958,7 +1376,6 @@ class TuningPage(QWidget):
             ("hold_s", self.hold_spin),
             ("settle_timeout_s", self.settle_spin),
             ("loss_relative", self.loss_relative_spin),
-            ("noise", self.noise_spin),
         ):
             if config.get(key) is not None:
                 widget.setValue(float(config[key]))
@@ -969,6 +1386,16 @@ class TuningPage(QWidget):
             self.loss_absolute_spin.setValue(float(absolute))
         if config.get("auto_recover") is not None:
             self.auto_recover_check.setChecked(bool(config["auto_recover"]))
+        if config.get("loss_protection") is not None:
+            self.loss_protection_check.setChecked(bool(config["loss_protection"]))
+        if config.get("reset_before_start") is not None:
+            self.reset_before_start_check.setChecked(bool(config["reset_before_start"]))
+        if config.get("random_seed") is not None:
+            self.random_seed_check.setChecked(bool(config["random_seed"]))
+        stall = config.get("stall_fraction")
+        if stall is not None:
+            # 存的是小数（0.05），表单是百分数（5）
+            self.stall_fraction_form_spin.setValue(float(stall) * 100.0)
 
         action = str(config.get("finalize_action") or "")
         index = self.finalize_pref.findData(action)
@@ -1010,6 +1437,7 @@ class TuningPage(QWidget):
                     "label": entry.get("label", entry["signal"]),
                     "low": float(row["low"].value()),
                     "high": float(row["high"].value()),
+                    "start": float(row["start"].value()),
                     "enabled": True,
                 }
             )
@@ -1039,9 +1467,32 @@ class TuningPage(QWidget):
             self._complain("请选择优化目标。")
             return
 
+        if self.mode_combo.currentData() == "auto":
+            protection = self.loss_absolute_check.isChecked() or (
+                self.loss_relative_spin.value() > 0
+            )
+            if not protection:
+                self._complain(
+                    "全自动模式必须启用束流丢失保护：勾选「目标低于」设一个绝对阈值，"
+                    "或把「相对损失阈值」设成大于 0——否则无人确认的自动写入没有兜底。"
+                )
+                return
+
         self._iterations = []
+        self._last_completed = 0
+        self._iterations_in_flight = False
         self._algorithm = ""
         self._seed = None
+        self._analysis = None  # 结束后从 /analysis 拉的 Optuna 分析结果
+        self._snapshot = {}
+        self._baseline = None
+        self._recovery = None
+        self.recent_table.setRowCount(0)
+        self.changes_table.setRowCount(0)
+        self.analysis_trial_table.setRowCount(0)
+        self._refresh_result_analysis_choices()
+        self._render_result_analysis()
+        self._update_result_summary()
         # 开跑前的建议（原 demo 的 R5）：变量太多时"每变量的轮次不够看出趋势"这件事
         # 必须在开跑前说，跑完再说就只是事后诸葛。
         self._startup_advice = tuning_analysis.startup_advice(
@@ -1060,7 +1511,9 @@ class TuningPage(QWidget):
             {
                 "target_signal": target,
                 "variables": variables,
-                "mode": "confirm",
+                "mode": self.mode_combo.currentData() or "confirm",
+                "engine": self.engine_combo.currentData() or "cmaes",
+                "patience": self.patience_spin.value(),
                 "max_iterations": self.iterations_spin.value(),
                 "settle_timeout_s": self.settle_spin.value(),
                 "samples_per_point": self.samples_spin.value(),
@@ -1069,9 +1522,8 @@ class TuningPage(QWidget):
                 "calls_per_variable": self.calls_spin.value(),
                 "joint_frac": self.joint_frac_spin.value() / 100.0,
                 "hold_s": self.hold_spin.value(),
-                # 高级参数：观测噪声进 GP 的核；种子决定随机探索路径（可复现）
-                "noise": self.noise_spin.value(),
-                "seed": self.seed_spin.value(),
+                "seed": self._effective_seed(),
+                "n_startup_trials": self.startup_spin.value(),
                 # 束流丢失保护：阈值随任务一起下发，由执行服务在每轮结束后判定
                 "loss_absolute": (
                     self.loss_absolute_spin.value()
@@ -1080,10 +1532,19 @@ class TuningPage(QWidget):
                 ),
                 "loss_relative": self.loss_relative_spin.value() / 100.0,
                 "loss_strikes": self.loss_strikes_spin.value(),
+                "loss_protection": self.loss_protection_check.isChecked(),
+                "stall_fraction": self.stall_fraction_form_spin.value() / 100.0,
                 "auto_recover": self.auto_recover_check.isChecked(),
             }
         )
         thread.completed.connect(self._on_started)
+
+    def _effective_seed(self) -> int:
+        """本次实际使用的种子：勾选随机则现场生成，否则用固定值。"""
+        if self.random_seed_check.isChecked():
+            import random
+            return random.randint(0, 2**31 - 1)
+        return int(self.seed_spin.value())
 
     def _complain(self, message: str) -> None:
         box = QMessageBox(self)
@@ -1119,8 +1580,7 @@ class TuningPage(QWidget):
         current = self._current_readbacks()
         self.proposal_table.setRowCount(len(suggestions))
         for row, (signal, value) in enumerate(suggestions.items()):
-            short = signal.split(".")[-1]
-            self.proposal_table.setItem(row, 0, QTableWidgetItem(short))
+            self.proposal_table.setItem(row, 0, QTableWidgetItem(self._row_label(signal)))
             cur = current.get(signal)
             self.proposal_table.setItem(
                 row, 1, QTableWidgetItem("--" if cur is None else f"{cur:.3f}")
@@ -1160,6 +1620,27 @@ class TuningPage(QWidget):
         if not payload.get("ok"):
             self.proposal_label.setText(f"执行失败：{payload.get('message', '')}")
             self.approve_button.setEnabled(self._writes_allowed())
+            return
+        self._apply_status(payload.get("payload") or {})
+        self._fetch_iterations()
+
+    def pause_tuning(self) -> None:
+        if not self._run_id:
+            return
+        self.tuning_pause_button.setEnabled(False)
+        thread = instrument_api.request_tuning_pause(self._run_id)
+        thread.completed.connect(self._on_flow_result)
+
+    def resume_tuning(self) -> None:
+        if not self._run_id:
+            return
+        self.tuning_resume_button.setEnabled(False)
+        thread = instrument_api.request_tuning_resume(self._run_id)
+        thread.completed.connect(self._on_flow_result)
+
+    def _on_flow_result(self, payload: dict) -> None:
+        """暂停 / 继续的返回：直接按新状态刷界面（失败时交给下一轮轮询纠正）。"""
+        if not payload.get("ok"):
             return
         self._apply_status(payload.get("payload") or {})
         self._fetch_iterations()
@@ -1286,6 +1767,9 @@ class TuningPage(QWidget):
         if not payload.get("ok"):
             return
         self._apply_status(payload.get("payload") or {})
+        # 运行中也必须增量拉轮次；旧逻辑只在结束/人工确认后拉，
+        # 因此“本轮测量 / 历史最优”会看起来到结束才刷新。
+        self._fetch_iterations()
 
     def _apply_status(self, status: dict) -> None:
         self._state = str(status.get("state", "idle"))
@@ -1302,6 +1786,16 @@ class TuningPage(QWidget):
         self._recovery = status.get("recovery")
         self._snapshot_note = str(status.get("snapshot_note") or "")
         completed = int(status.get("completed_iterations") or 0)
+        remaining = max(0, int(status.get("max_iterations") or 0) - completed)
+        remaining_s = remaining * (
+            self.settle_spin.value() + self.hold_spin.value()
+            + max(0, self.samples_spin.value() - 1) * 0.05
+        )
+        self.eta_card.value_label.setText(
+            "已结束" if self._state in TERMINAL_STATES
+            else self._format_duration(remaining_s).removeprefix("约 ")
+        )
+        self._last_completed = max(self._last_completed, completed)
         self.iteration_label.setText(
             f"已完成 {completed} / {status.get('max_iterations', 0)} 轮{self._stage_suffix(status)}"
         )
@@ -1312,8 +1806,11 @@ class TuningPage(QWidget):
         self.tuning_state.setText(text)
 
         self._pending = status.get("pending")
+        self._mode = str(status.get("mode") or self._mode)
         self._render_recovery()
         self._render_snapshot()
+        auto = self._mode == "auto"
+        self.proposal_panel.setVisible(not auto)
         if self._pending:
             active = list(self._pending.get("active_signals") or [])
             checked = {
@@ -1327,21 +1824,35 @@ class TuningPage(QWidget):
                 scope = f"本轮调整：{'、'.join(active)}"
             else:
                 scope = "本轮调整：全部选中参数"
+            prefix = "自动执行中" if auto else "待确认候选"
             self.proposal_label.setText(
-                f"第 {int(self._pending['iteration']) + 1} 轮候选（{scope}；"
+                f"第 {int(self._pending['iteration']) + 1} 轮{prefix}（{scope}；"
                 f"预测 {float(self._pending['predicted']):.3f}"
                 f" ± {float(self._pending['std']):.3f}）"
             )
             self._fill_proposal_table(self._pending)
             self.proposal_table.setVisible(True)
-            self.approve_button.setEnabled(self._writes_allowed())
-        else:
-            self.proposal_label.setText(
-                "本轮已执行，正在生成下一轮候选…"
-                if self._state not in TERMINAL_STATES
-                else "无待确认候选。"
+            # auto 模式的候选由服务端直接执行，按钮不给点（仅供查看与导出）
+            self.approve_button.setEnabled(
+                False if auto else self._writes_allowed()
             )
+        else:
+            if self._state == "paused":
+                self.proposal_label.setText("已暂停：参数冻结，可「继续」或「停止」。")
+            else:
+                self.proposal_label.setText(
+                    "本轮已执行，正在生成下一轮候选…"
+                    if self._state not in TERMINAL_STATES
+                    else "无待确认候选。"
+                )
             self.approve_button.setEnabled(False)
+
+        # 暂停 / 继续按钮：只在不写设备的状态可用（服务端同样会拒绝）
+        self.tuning_pause_button.setEnabled(
+            self._state in ("running", "awaiting_confirmation")
+        )
+        self.tuning_resume_button.setEnabled(self._state == "paused")
+        self.tuning_resume_button.setVisible(self._state == "paused")
 
         if self._state == "recovery_required":
             self.acknowledge_button.setVisible(True)
@@ -1350,6 +1861,9 @@ class TuningPage(QWidget):
             self._timer.stop()
             self.start_button.setEnabled(self._writes_allowed())
             self.tuning_stop_button.setEnabled(False)
+            self.tuning_pause_button.setEnabled(False)
+            self.tuning_resume_button.setEnabled(False)
+            self.tuning_resume_button.setVisible(False)
             self.approve_button.setEnabled(False)
             self.tabs.setTabEnabled(2, True)
             # 结束后才能处置设备；恢复待确认状态下设备实际状态未知，必须先确认
@@ -1358,6 +1872,8 @@ class TuningPage(QWidget):
                     self._state != "recovery_required" and self._writes_allowed()
                 )
             self._render_finalize(status.get("finalize"))
+            # 任何终态都尝试拉分析（failed/aborted 也可能已跑了几轮，有数据可看）
+            self._load_analysis()
             if self._state == "completed":
                 self.result_notice.setText("调束已完成")
                 self.tabs.setCurrentIndex(2)
@@ -1371,9 +1887,13 @@ class TuningPage(QWidget):
                     )
             elif self._state == "aborted":
                 self.result_notice.setText("调束已停止")
+                self.tabs.setCurrentIndex(2)
             else:
                 self.result_notice.setText(text)
+                if self._state == "failed":
+                    self.tabs.setCurrentIndex(2)
             self._fetch_iterations()
+        self._update_result_summary()
 
     def _stage_suffix(self, status: dict) -> str:
         """把"现在在哪个阶段、正在调哪个参数"写进轮次标签。
@@ -1436,51 +1956,118 @@ class TuningPage(QWidget):
         self.snapshot_label.setVisible(True)
 
     def _fetch_iterations(self) -> None:
+        """增量拉取：只有服务端 completed_iterations 比本地多才请求，防并发。"""
         if not self._run_id:
             return
+        if getattr(self, "_iterations_in_flight", False):
+            return
+        completed = int(getattr(self, "_last_completed", 0))
+        local = len(self._iterations)
+        if local >= completed:
+            return
+        self._iterations_in_flight = True
         thread = instrument_api.request_tuning_iterations(self._run_id)
         thread.completed.connect(self._on_iterations)
 
     def _on_iterations(self, payload: dict) -> None:
+        self._iterations_in_flight = False
         if not payload.get("ok"):
             return
         self._iterations = list(
             (payload.get("payload") or {}).get("iterations") or []
         )
+        self._last_completed = len(self._iterations)
         self._redraw()
         self._fill_changes()
         self._refresh_plot_choices()
         self._refresh_advice()
         self._fill_log()
+        self._fill_recent_iterations()
+        self._update_result_summary()
+        self._refresh_result_analysis_choices()
+        self._render_result_analysis()
+        self._fill_analysis_trials()
+
+    def _fill_recent_iterations(self) -> None:
+        """用最近 5 轮表格补足曲线的精确读数。"""
+        rows = self._iterations[-5:]
+        self.recent_table.setRowCount(len(rows))
+        best: float | None = None
+        best_flags: dict[int, bool] = {}
+        for record in self._iterations:
+            value = record.get("objective")
+            if value is None:
+                continue
+            number = float(value)
+            improved = best is None or number > best
+            best = number if improved else best
+            best_flags[id(record)] = improved
+        for row, record in enumerate(rows):
+            value = record.get("objective")
+            quality = str(record.get("quality") or "--")
+            cells = (
+                str(int(record.get("iteration", row)) + 1),
+                tuning_analysis.stage_of(record),
+                "--" if value is None else f"{float(value):.3f}",
+                quality,
+                "刷新最优" if best_flags.get(id(record)) else "已完成",
+            )
+            for column, text in enumerate(cells):
+                self.recent_table.setItem(row, column, QTableWidgetItem(text))
+        self.recent_table.resizeColumnsToContents()
+
+    def _update_result_summary(self) -> None:
+        """结果页摘要始终从基线和已拉取轮次派生。"""
+        usable = [it for it in self._iterations if it.get("objective") is not None]
+        baseline = self._baseline
+        best = max((float(it["objective"]) for it in usable), default=None)
+        self.result_baseline_card.value_label.setText(
+            "--" if baseline is None else f"{baseline:.3f}"
+        )
+        self.result_best_card.value_label.setText(
+            "--" if best is None else f"{best:.3f}"
+        )
+        if baseline is None or best is None or baseline == 0:
+            gain = "--"
+        else:
+            gain = f"{(best - baseline) / abs(baseline) * 100:+.1f}%"
+        self.result_gain_card.value_label.setText(gain)
+        self.result_quality_card.value_label.setText(
+            f"{len(usable)} / {len(self._iterations)}"
+        )
 
     # ------------------------------------------------------------------
-    # 分析视图：收敛曲线 / 单变量响应曲线 / 过程建议 / 日志（报告 §8.9 P2.4）
+    # 过程视图：收敛曲线 / 单变量响应曲线 / 过程建议 / 日志
     # ------------------------------------------------------------------
     def _refresh_plot_choices(self) -> None:
-        """下拉里"收敛 + 每个变量的响应曲线"，按当前轮次记录重建。
-
-        只在变量集合真的变了时重建：否则每次轮询都会把操作员选中的曲线重置回
-        "目标量收敛"，看着像图自己乱跳。
-        """
+        """过程页只保留收敛与变量响应，事后分析统一放在结果页。"""
         variables = tuning_analysis.curve_variables(self._iterations)
-        labels = [self._row_label(signal) for signal in variables]
         current = self.plot_choice.currentData() or ""
-        existing = [
-            self.plot_choice.itemData(index) for index in range(self.plot_choice.count())
-        ]
-        wanted = ["", *variables]
-        if existing == wanted:
-            for index, label in enumerate(labels, start=1):
-                self.plot_choice.setItemText(index, f"响应：{label}")
-            return
+        # 清空旧按钮
+        while self.plot_button_row.count():
+            item = self.plot_button_row.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
         self.plot_choice.blockSignals(True)
         self.plot_choice.clear()
-        self.plot_choice.addItem("目标量收敛（x = 轮次）", "")
-        for signal, label in zip(variables, labels, strict=True):
-            self.plot_choice.addItem(f"响应：{label}", signal)
+        from PySide6.QtWidgets import QPushButton
+        def _add_btn(label: str, data: str) -> None:
+            self.plot_choice.addItem(label, data)
+            btn = QPushButton(label, checkable=True, objectName="plotToolButton")
+            btn.setChecked(data == current)
+            btn.clicked.connect(lambda _checked=False, d=data: self._select_view(d))
+            self.plot_button_row.addWidget(btn)
+        _add_btn("收敛", "")
+        for signal in variables:
+            _add_btn(self._row_label(signal), signal)
         index = self.plot_choice.findData(current)
         self.plot_choice.setCurrentIndex(max(index, 0))
         self.plot_choice.blockSignals(False)
+
+    def _select_view(self, data: str) -> None:
+        self.plot_choice.setCurrentIndex(self.plot_choice.findData(data))
+        self._render_plot()
 
     def _row_label(self, signal: str) -> str:
         for row in self._rows:
@@ -1550,6 +2137,174 @@ class TuningPage(QWidget):
             + "。曲线只反映已采过的点，不表示范围外的情况。"
         )
 
+    def _load_analysis(self) -> None:
+        """结束后从服务端拉 Optuna 分析数据（importance / slice / history）。"""
+        if not self._run_id or self._analysis is not None:
+            return
+        try:
+            thread = instrument_api.request_tuning_analysis(self._run_id)
+            thread.completed.connect(self._on_analysis_ready)
+        except Exception as exc:
+            self.analysis_note.setText(f"Optuna 分析加载失败：{exc}")
+
+    def _on_analysis_ready(self, payload: dict) -> None:
+        if not payload.get("ok"):
+            self.analysis_note.setText(
+                f"Optuna 分析暂不可用：{payload.get('message', '未知错误')}"
+                "；优化历史仍使用本地轮次展示。"
+            )
+            self._render_result_analysis()
+            return
+        self._analysis = payload.get("payload") or {}
+        self._refresh_result_analysis_choices()
+        self._render_result_analysis()
+        self._fill_analysis_trials()
+
+    def _rebuild_analysis_buttons(self, choices: list[tuple[str, str]]) -> None:
+        """把分析视图选项做成一排可点按钮（不再用下拉）。"""
+        # 清掉旧按钮
+        for button in getattr(self, "_analysis_buttons", []):
+            self.analysis_button_group.removeButton(button)
+            self.analysis_buttons_row.removeWidget(button)
+            button.deleteLater()
+        self._analysis_buttons = []
+        current = getattr(self, "analysis_current_choice", "history")
+        picked = False
+        for label, data in choices:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setAutoExclusive(True)
+            btn.setMaximumHeight(26)
+            btn.clicked.connect(lambda _checked=False, d=data: self._set_analysis_choice(d))
+            self.analysis_button_group.addButton(btn)
+            self.analysis_buttons_row.addWidget(btn)
+            self._analysis_buttons.append(btn)
+            if data == current:
+                btn.setChecked(True)
+                picked = True
+        if not picked and self._analysis_buttons:
+            self._analysis_buttons[0].setChecked(True)
+            self.analysis_current_choice = self._analysis_buttons[0].text()
+
+    def _set_analysis_choice(self, data: str) -> None:
+        self.analysis_current_choice = data
+        self._render_result_analysis()
+
+    def _refresh_result_analysis_choices(self) -> None:
+        """根据 Optuna 返回数据生成结果页分析入口（按钮组）。"""
+        choices = [("优化历史", "history")]
+        importance = (self._analysis or {}).get("importance", {})
+        if importance.get("values"):
+            choices.append(("参数重要性", "importance"))
+        for name in (self._analysis or {}).get("slice", {}):
+            choices.append((f"切片 · {self._row_label(name)}", f"slice:{name}"))
+        self._rebuild_analysis_buttons(choices)
+
+    def _clear_result_analysis_items(self) -> None:
+        for item in self._analysis_items:
+            self.analysis_plot.view.removeItem(item)
+        self._analysis_items.clear()
+        self.analysis_plot.set_series([])
+        self.analysis_plot.view.getAxis("bottom").setTicks(None)
+
+    def _render_result_analysis(self, *_args) -> None:
+        """在结果页渲染历史、重要性或单参数切片。"""
+        import pyqtgraph as pg
+
+        self._clear_result_analysis_items()
+        choice = getattr(self, "analysis_current_choice", "history") or "history"
+        if choice == "importance":
+            values = ((self._analysis or {}).get("importance") or {}).get("values") or {}
+            names = list(values)
+            scores = [float(values[name]) for name in names]
+            xs = list(range(len(names)))
+            if scores:
+                item = pg.BarGraphItem(x=xs, height=scores, width=0.65, brush="#8BC8EA")
+                self.analysis_plot.view.addItem(item)
+                self._analysis_items.append(item)
+            self.analysis_plot.view.setLabel("bottom", "参数")
+            self.analysis_plot.view.setLabel("left", "重要性（FANOVA）")
+            self.analysis_plot.view.getAxis("bottom").setTicks(
+                [[(i, self._row_label(name)) for i, name in enumerate(names)]]
+            )
+            self.analysis_note.setText(
+                f"已基于有效 Trial 计算 {len(names)} 个参数的重要性。"
+            )
+            return
+        if choice.startswith("slice:"):
+            name = choice.split(":", 1)[1]
+            points = ((self._analysis or {}).get("slice") or {}).get(name) or []
+            xs = [float(point[0]) for point in points]
+            ys = [float(point[1]) for point in points]
+            if xs:
+                item = pg.ScatterPlotItem(
+                    x=xs, y=ys, size=9, symbol="o", brush="#3b82f6", pen=None
+                )
+                self.analysis_plot.view.addItem(item)
+                self._analysis_items.append(item)
+            self.analysis_plot.view.setLabel("bottom", self._row_label(name))
+            self.analysis_plot.view.setLabel("left", "目标量")
+            self.analysis_note.setText(f"共 {len(points)} 个切片样本点。")
+            return
+
+        points = ((self._analysis or {}).get("history") or {}).get("points") or []
+        if points:
+            xs = [float(point["trial"]) + 1 for point in points]
+            ys = [float(point["value"]) for point in points]
+            best = [float(point["best"]) for point in points]
+        else:
+            usable = [it for it in self._iterations if it.get("objective") is not None]
+            xs = [float(it.get("iteration", i)) + 1 for i, it in enumerate(usable)]
+            ys = [float(it["objective"]) for it in usable]
+            running: float | None = None
+            best = []
+            for value in ys:
+                running = value if running is None else max(running, value)
+                best.append(running)
+        self.analysis_plot.view.setLabel("bottom", "Trial / 轮次")
+        self.analysis_plot.view.setLabel("left", "目标量")
+        self.analysis_plot.set_series([(xs, ys)], best=best)
+        self.analysis_note.setText(
+            f"共 {len(ys)} 个有效点；实线为本轮测量，虚线为历史最优。"
+        )
+
+    def _fill_analysis_trials(self) -> None:
+        """展示 Optuna Trial 明细，无分析数据时回退到本地轮次。"""
+        trials = list((self._analysis or {}).get("trials") or [])
+        if trials:
+            params = sorted(
+                {key for row in trials for key in row}
+                - {"number", "state", "value"}
+            )
+            headers = ["Trial", "状态", "目标值", *[self._row_label(p) for p in params]]
+            self.analysis_trial_table.setColumnCount(len(headers))
+            self.analysis_trial_table.setHorizontalHeaderLabels(headers)
+            self.analysis_trial_table.setRowCount(len(trials))
+            for row, trial in enumerate(trials):
+                values = [
+                    trial.get("number", "--"),
+                    trial.get("state", "--"),
+                    trial.get("value", "--"),
+                    *[trial.get(param, "--") for param in params],
+                ]
+                for column, value in enumerate(values):
+                    text = f"{value:.3f}" if isinstance(value, float) else str(value)
+                    self.analysis_trial_table.setItem(row, column, QTableWidgetItem(text))
+        else:
+            self.analysis_trial_table.setColumnCount(3)
+            self.analysis_trial_table.setHorizontalHeaderLabels(["Trial", "状态", "目标值"])
+            self.analysis_trial_table.setRowCount(len(self._iterations))
+            for row, record in enumerate(self._iterations):
+                value = record.get("objective")
+                cells = (
+                    str(int(record.get("iteration", row)) + 1),
+                    str(record.get("quality") or "--"),
+                    "--" if value is None else f"{float(value):.3f}",
+                )
+                for column, text in enumerate(cells):
+                    self.analysis_trial_table.setItem(row, column, QTableWidgetItem(text))
+        self.analysis_trial_table.resizeColumnsToContents()
+
     def _configured_range(self, signal: str) -> tuple[float, float] | None:
         """界面上给这个变量设的范围（响应曲线的参照系）。"""
         for row in self._rows:
@@ -1569,10 +2324,14 @@ class TuningPage(QWidget):
         self.response_note.setText(text)
         self.response_note.setVisible(bool(text))
 
+    def _stall_fraction(self) -> float:
+        return float(self.stall_fraction_form_spin.value()) / 100.0
+
     def _refresh_advice(self) -> None:
         """过程建议：开跑前的（变量数）+ 按轮次统计出来的。"""
         lines = list(self._startup_advice) + tuning_analysis.advice(
-            self._iterations, self._variable_ranges()
+            self._iterations, self._variable_ranges(),
+            stall_fraction=self._stall_fraction(),
         )
         self.advice_label.setText("；".join(lines))
         self.advice_label.setVisible(bool(lines))
@@ -1588,7 +2347,8 @@ class TuningPage(QWidget):
 
     def _current_advice(self) -> list[str]:
         lines = list(self._startup_advice) + tuning_analysis.advice(
-            self._iterations, self._variable_ranges()
+            self._iterations, self._variable_ranges(),
+            stall_fraction=self._stall_fraction(),
         )
         return lines
 
@@ -1617,6 +2377,10 @@ class TuningPage(QWidget):
             if best is None or value > best[0]:
                 best = (value, int(record.get("iteration", 0)))
         return None if best is None else best[1]
+
+    def _open_dashboard(self) -> None:
+        """在默认浏览器打开本机 optuna-dashboard。"""
+        QDesktopServices.openUrl(QUrl(self._dashboard_url))
 
     def export_tuning_log(self) -> None:
         """导出调束日志（JSONL：一轮一行，便于事后用脚本复盘）。"""
@@ -1712,25 +2476,36 @@ class TuningPage(QWidget):
         else:
             first = self._iterations[0].get("readback") or {}
         best = max(usable, key=lambda it: float(it["objective"])).get("readback") or {}
-        keys = sorted(set(first) | set(best))
+        last = self._iterations[-1].get("readback") or {} if self._iterations else {}
+        current = self._current_readbacks()
+        keys = sorted(set(first) | set(best) | set(last) | set(current))
         self.changes_table.setRowCount(len(keys))
         for row, key in enumerate(keys):
             start = first.get(key)
             end = best.get(key)
-            self.changes_table.setItem(row, 0, QTableWidgetItem(key))
+            last_v = last.get(key)
+            current_v = current.get(key)
+            self.changes_table.setItem(row, 0, QTableWidgetItem(self._row_label(key)))
             self.changes_table.setItem(
                 row, 1, QTableWidgetItem("--" if start is None else f"{start:.3f}")
             )
             self.changes_table.setItem(
                 row, 2, QTableWidgetItem("--" if end is None else f"{end:.3f}")
             )
-            delta = "--" if start is None or end is None else f"{end - start:+.3f}"
-            self.changes_table.setItem(row, 3, QTableWidgetItem(delta))
+            self.changes_table.setItem(
+                row, 3, QTableWidgetItem("--" if last_v is None else f"{last_v:.3f}")
+            )
+            self.changes_table.setItem(
+                row, 4, QTableWidgetItem("--" if current_v is None else f"{current_v:.3f}")
+            )
         self.changes_table.resizeColumnsToContents()
         self.change_note.setText(
             "起点 = 启动前快照（执行服务在占用设备后立即记录的实际回读）"
             if self._snapshot
             else "起点 = 第一轮回读（本次没有拿到启动前快照）"
+        )
+        self.change_note.setText(
+            self.change_note.text() + "；“当前”来自页面最近一次设备回读。"
         )
 
     # ------------------------------------------------------------------

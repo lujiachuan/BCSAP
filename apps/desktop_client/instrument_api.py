@@ -27,6 +27,7 @@ SIGNALS_WRITE_PATH = "/control/v1/signals/write"
 SCAN_RUNS_PATH = "/control/v1/scan/runs"
 TUNING_RUNS_PATH = "/control/v1/tuning/runs"
 TUNING_CATALOG_PATH = "/control/v1/tuning/catalog"
+TUNING_CAPABILITIES_PATH = "/control/v1/tuning/capabilities"
 RECOVERY_PATH = "/control/v1/recovery"
 # 成组写入一次要下发多路，且服务端会逐路走斜坡（受 max_rate 限制），超时给足
 BATCH_WRITE_TIMEOUT_S = 60.0
@@ -251,6 +252,11 @@ def request_tuning_catalog(base_url: str | None = None):
     return _get(TUNING_CATALOG_PATH, base_url)
 
 
+def request_tuning_capabilities(base_url: str | None = None):
+    """引擎能力 + optuna-dashboard 运行状态。"""
+    return _get(TUNING_CAPABILITIES_PATH, base_url)
+
+
 def request_recovery_items(base_url: str | None = None):
     return _get(RECOVERY_PATH, base_url)
 
@@ -275,6 +281,11 @@ def request_tuning_iterations(run_id: str, base_url: str | None = None):
     return _get(f"{TUNING_RUNS_PATH}/{run_id}/iterations", base_url)
 
 
+def request_tuning_analysis(run_id: str, base_url: str | None = None):
+    """结束后分析：history / importance / slice / trials（从持久化 Optuna study 取）。"""
+    return _get(f"{TUNING_RUNS_PATH}/{run_id}/analysis", base_url)
+
+
 def request_tuning_approve(run_id: str, base_url: str | None = None):
     """确认候选并执行一轮（写设备 + 等稳定 + 采目标），超时要比普通请求长。"""
     return _post(
@@ -286,6 +297,22 @@ def request_tuning_approve(run_id: str, base_url: str | None = None):
 def request_tuning_stop(run_id: str, base_url: str | None = None):
     return _post(
         f"{TUNING_RUNS_PATH}/{run_id}/stop", {}, base_url,
+        timeout=SCAN_START_TIMEOUT_S,
+    )
+
+
+def request_tuning_pause(run_id: str, base_url: str | None = None):
+    """暂停任务：不在写设备时可暂停，参数保持现状。"""
+    return _post(
+        f"{TUNING_RUNS_PATH}/{run_id}/pause", {}, base_url,
+        timeout=SCAN_START_TIMEOUT_S,
+    )
+
+
+def request_tuning_resume(run_id: str, base_url: str | None = None):
+    """继续暂停的任务：有挂起候选则按模式继续执行 / 等待确认。"""
+    return _post(
+        f"{TUNING_RUNS_PATH}/{run_id}/resume", {}, base_url,
         timeout=SCAN_START_TIMEOUT_S,
     )
 

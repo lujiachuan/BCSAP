@@ -10,9 +10,38 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-# 调束模式。第一版只开放「建议→人工确认」（文档 6.6 的分阶段计划）。
+# 调束模式。
+#   confirm — 建议 → 人工确认 → 执行（第一版默认）
+#   auto    — 全自动：候选生成后直接进执行层（需启动前校验束流保护已启用）
 MODE_CONFIRM = "confirm"
-SUPPORTED_MODES: tuple[str, ...] = (MODE_CONFIRM,)
+MODE_AUTO = "auto"
+SUPPORTED_MODES: tuple[str, ...] = (MODE_CONFIRM, MODE_AUTO)
+
+# 优化引擎。
+#   gp     — 自研 GpEiOptimizer（高斯过程 + 期望改进，仅 numpy）
+#   tpe / cmaes / random / qmc / grid — Optuna 采样器（ask/tell 适配）
+ENGINE_GP = "gp"
+ENGINE_TPE = "tpe"
+ENGINE_CMAES = "cmaes"
+ENGINE_RANDOM = "random"
+ENGINE_QMC = "qmc"
+ENGINE_GRID = "grid"
+SUPPORTED_ENGINES: tuple[str, ...] = (
+    ENGINE_GP,
+    ENGINE_TPE,
+    ENGINE_CMAES,
+    ENGINE_RANDOM,
+    ENGINE_QMC,
+    ENGINE_GRID,
+)
+ENGINE_LABELS: dict[str, str] = {
+    ENGINE_GP: "GP + EI（自研）",
+    ENGINE_TPE: "TPE（Optuna）",
+    ENGINE_CMAES: "CMA-ES（Optuna）",
+    ENGINE_RANDOM: "Random（Optuna）",
+    ENGINE_QMC: "QMC（Optuna）",
+    ENGINE_GRID: "Grid（Optuna）",
+}
 
 # 优化策略（改造报告 §5.2「两阶段优化策略」）
 #   joint                 — 所有勾选变量一起做贝叶斯优化（第一版行为）
@@ -37,9 +66,12 @@ STAGE_LABELS: dict[str, str] = {
 ACTION_APPLY_BEST = "apply_best"
 ACTION_RESTORE_INITIAL = "restore_initial"
 ACTION_SAFE_VALUES = "safe_values"
+# 回到（复位用的）起始值：每参数的自定义起始值，未填则取范围中值
+ACTION_START_VALUES = "start_values"
 FINALIZE_ACTIONS: tuple[str, ...] = (
     ACTION_APPLY_BEST,
     ACTION_RESTORE_INITIAL,
+    ACTION_START_VALUES,
     ACTION_SAFE_VALUES,
 )
 
@@ -54,8 +86,10 @@ class TuningVariable(BaseModel):
     low: float
     high: float
     enabled: bool = True
+    # 自定义起始值：开始前复位、结束后"回到起始值"都用它；None = 取范围中值
+    start: float | None = None
 
-    @field_validator("low", "high", mode="before")
+    @field_validator("low", "high", "start", mode="before")
     @classmethod
     def _coerce_number(cls, value: object) -> object:
         if value is None or isinstance(value, bool):
@@ -63,6 +97,12 @@ class TuningVariable(BaseModel):
         if isinstance(value, int):
             return float(value)
         return value
+
+    def resolved_start(self) -> float:
+        """本参数的起始值：填了用填的，没填用范围中值。"""
+        if self.start is not None:
+            return float(self.start)
+        return (float(self.low) + float(self.high)) / 2.0
 
 
 class TuningCatalogStage(BaseModel):
@@ -149,6 +189,21 @@ class TuningRecovery(BaseModel):
     detail: str = ""
 
 
+class TuningInterlock(BaseModel):
+    """一条应用层安全红线：监控 PV + 比较符 + 阈值。
+
+    对应 demo/auto_scan 的 InterlockRule：在每轮写设备之前检查监控 PV，
+    越界就拒绝本轮写入并终止任务（补充巡检，不替代硬件联锁）。
+    """
+
+    model_config = ConfigDict(strict=True)
+
+    enabled: bool = True
+    pv: str
+    op: str = ">"
+    threshold: float = 0.0
+
+
 class TuningRunRequest(BaseModel):
     """一次调束任务的参数。"""
 
@@ -176,6 +231,15 @@ class TuningRunRequest(BaseModel):
     # GP 观测噪声（归一化到目标量纲），物理量带噪时按实测填写
     noise: float = 1e-6
     seed: int = 0
+    # 开始建模前先纯随机探索的轮数（仅 CMA-ES / TPE 生效；其余引擎忽略）
+    n_startup_trials: int = 5
+
+    # 优化引擎（见上 ENGINE_*）；gp 保留自研回退
+    engine: str = ENGINE_GP
+    # 收敛早停：连续多少轮没有产生新的历史最优即正常结束；0 = 不启用
+    patience: int = 0
+    # 应用层联锁规则：每轮写设备前巡检，越界即停止本轮并终止任务
+    interlocks: list[TuningInterlock] = []
 
     # ---- 束流丢失保护（改造报告 §5.2）----
     # 启动时会记录各路**实际回读**作为回退快照；没有快照就无法保证退得回去，
@@ -188,6 +252,12 @@ class TuningRunRequest(BaseModel):
     loss_strikes: int = 2
     # 触发后是否自动回退到启动前快照；False = 只标记异常并停下等人工处理
     auto_recover: bool = True
+    # 束流丢失保护总开关：False = 完全不做异常判定（SIM/演示或确认不需要时关掉）
+    loss_protection: bool = True
+
+    # 开始前先把参与变量复位到起始值（每参数自定义 start，未填取范围中值）：
+    # 默认 False = 从设备当前值开始；True = 每次同一起点，不继承上一次结束位置。
+    reset_before_start: bool = False
 
     @field_validator("settle_tol", "noise", "loss_absolute", "loss_relative",
                      "joint_frac", "hold_s", mode="before")
@@ -294,6 +364,7 @@ class TuningRunStatus(BaseModel):
     algorithm: str | None = None
     algorithm_version: str | None = None
     seed: int | None = None
+    engine: str = ""
     locked_groups: list[str] = []
     started_at: str | None = None
     finished_at: str | None = None

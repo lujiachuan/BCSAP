@@ -27,7 +27,7 @@ from PySide6.QtCore import QSettings
 
 _DEFAULT_INSTRUMENT_URL = "http://127.0.0.1:8765"
 _HEALTH_PATH = "/control/v1/health/live"
-_START_TIMEOUT_S = 20.0
+_START_TIMEOUT_S = 30.0
 _POLL_INTERVAL_S = 0.25
 
 _QSETTINGS_ORG = "SpectrumPlatform"

@@ -158,7 +158,12 @@ def main() -> int:
     sim_only_pvs = {entry.pv for entry in sim_only_entries}
     db_pvs = set(db_records)
     missing = sorted(mapped_pvs - db_pvs)
-    extra = sorted(db_pvs - mapped_pvs - sim_only_pvs)
+    # 物理模型的内部辅助记录（如 BD:FC:01:BeamCurrent:n1..）不在台账内，豁免。
+    extra = sorted(
+        pv
+        for pv in (db_pvs - mapped_pvs - sim_only_pvs)
+        if not re.search(r":n\d+$", pv)
+    )
     missing_sim = sorted(sim_only_pvs - db_pvs)
     report.check(
         not missing, "映射里的 PV 在 ioc.db 中都有定义", f"缺失 {missing}" if missing else ""

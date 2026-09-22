@@ -117,6 +117,11 @@ class GpEiOptimizer:
         self._y.append(float(objective))
         self._cache = None
 
+    def seed_history(self, observations: list[tuple[list[float], float]]) -> None:
+        """批量喂历史观测（阶段切换重建后接续记忆；与 OptunaAsker 接口对齐）。"""
+        for values, objective in observations:
+            self.observe(values, objective)
+
     @property
     def n_observed(self) -> int:
         return len(self._y)

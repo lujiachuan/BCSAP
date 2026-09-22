@@ -119,8 +119,14 @@ def startup_advice(variables: Sequence[str]) -> list[str]:
 def advice(
     iterations: Sequence[Mapping],
     ranges: Mapping[str, tuple[float, float]] | None = None,
+    *,
+    stall_fraction: float = STALL_FRACTION,
 ) -> list[str]:
-    """按轮次记录给过程建议（每条最多出现一次）。"""
+    """按轮次记录给过程建议（每条最多出现一次）。
+
+    ``stall_fraction`` 是「停滞」的相对阈值（默认 5%）：最近 5 轮最优相对最早 5 轮
+    提升不足该比例就提示。现场可在界面上调大（噪声大时别误报）或调小（要更早报警）。
+    """
     out: list[str] = []
     rounds = [r for r in iterations if _objective(r) is not None]
     count = len(rounds)
@@ -161,10 +167,10 @@ def advice(
         first = max(values[:5])
         last = max(values[-5:])
         reference = max(abs(first), 1e-9)
-        if (last - first) < STALL_FRACTION * reference:
+        if (last - first) < stall_fraction * reference:
             out.append(
-                "近 10 轮目标提升不足 5%：可增加每变量轮次，或确认装置是否已稳定、"
-                "是否已经到达物理上限"
+                f"近 10 轮目标提升不足 {stall_fraction * 100:g}%：可增加每变量轮次，"
+                "或确认装置是否已稳定、是否已经到达物理上限"
             )
 
     # R3 抖动：相邻轮差值远大于整体中位差

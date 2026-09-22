@@ -593,8 +593,11 @@ class SystemSettingsPage(QWidget):
         )
         self.pv_probe_button.clicked.connect(lambda: self._probe_pvs())
         tools.addWidget(self.pv_probe_button)
-        self.pv_copy_button = QPushButton("复制选中行")
-        self.pv_copy_button.setToolTip("把选中行的「设备参数 / 业务信号 / PV 名」贴到剪贴板")
+        self.pv_copy_button = QPushButton("复制到剪贴板")
+        self.pv_copy_button.setToolTip(
+            "把选中行的「设备参数 / 业务信号 / PV 名」以制表符贴到剪贴板，"
+            "用于粘贴到别处（脚本 / 报修）"
+        )
         self.pv_copy_button.clicked.connect(self._copy_pv_rows)
         tools.addWidget(self.pv_copy_button)
         panel.body.addLayout(tools)
@@ -610,6 +613,12 @@ class SystemSettingsPage(QWidget):
         actions.addStretch()
         add_row = QPushButton("新增")
         add_row.clicked.connect(self._add_pv_row)
+        duplicate_row = QPushButton("复制为新增")
+        duplicate_row.setToolTip(
+            "把选中行**整行**复制成一行新行（含设备属性与安全边界），追加到表格底部；"
+            "只改业务信号和 PV 名称即可新增一路同类通道"
+        )
+        duplicate_row.clicked.connect(self._duplicate_pv_rows)
         edit_properties = QPushButton("设备属性")
         edit_properties.setToolTip("配置分组、控件类型、安全边界，以及扫谱/调束能力")
         edit_properties.clicked.connect(self._edit_pv_properties)
@@ -619,7 +628,7 @@ class SystemSettingsPage(QWidget):
         reload_button.clicked.connect(lambda: self._load_pv_mapping(force=True))
         self.pv_save_button = QPushButton("保存映射", objectName="primaryButton")
         self.pv_save_button.clicked.connect(self._save_pv_mapping)
-        for button in (add_row, edit_properties, remove_row, reload_button):
+        for button in (add_row, duplicate_row, edit_properties, remove_row, reload_button):
             actions.addWidget(button)
         actions.addWidget(self.pv_save_button)
         panel.body.addLayout(actions)
@@ -949,6 +958,55 @@ class SystemSettingsPage(QWidget):
         return dict(stored) if isinstance(stored, dict) else None
 
     # ---- PV 映射：表格增删改 ----
+
+    def _duplicate_pv_rows(self) -> None:
+        """把选中行**整行**复制成新增行（显示字段 + 未显示安全字段），
+        追加到表格底部：操作员选中一路已配好的 PV，复制后只改编号就能得到
+        一路同类通道，不必从空行重填一遍边界/限速/稳定判据。
+
+        注意 signal / pv 是身份字段，复制后必然与源行重复（服务端会拒），
+        反馈里点明要改编号；readback / rate 配对指向源通道，复制时一并清空
+        （与保存时改名 signal 的语义一致，见 ``_collect_pv_mapping``）。
+        """
+        rows = sorted({index.row() for index in self.pv_table.selectedIndexes()})
+        if not rows:
+            self._set_pv_feedback("warn", "请先选中要复制的行。")
+            return
+        created: list[int] = []
+        base = self.pv_table.rowCount()
+        # 全部追加到底部，行号互不影响；多选时按选中顺序（从上到下）依次追加。
+        for offset, row in enumerate(rows):
+            new_row = base + offset
+            self.pv_table.insertRow(new_row)
+            self._duplicate_pv_row(row, new_row)
+            created.append(new_row)
+        self.pv_table.clearSelection()
+        for row in created:
+            self.pv_table.selectRow(row)
+        first = created[0]
+        self.pv_table.setCurrentCell(first, PV_SIGNAL_COLUMN)
+        self.pv_table.editItem(self.pv_table.item(first, PV_SIGNAL_COLUMN))
+        self._apply_pv_filter()
+        self._set_pv_feedback(
+            "idle",
+            f"已复制 {len(created)} 行为新增行，请修改业务信号与 PV 名称"
+            "（不能与现有行重复）后保存。",
+        )
+
+    def _duplicate_pv_row(self, source: int, target: int) -> None:
+        """把 source 行的 6 个显示字段 + 未显示安全字段整体复制到 target 行。"""
+        for column in (0, PV_SIGNAL_COLUMN, 2, 3):
+            self._set_pv_text(target, column, self._pv_text(source, column))
+        for column in (4, 5):
+            self._set_pv_flag(target, column, self._pv_flag(source, column))
+        entry = dict(self._pv_row_entry(source) or {})
+        # signal/pv 保留原值让操作员改编号；回读/速率配对指向源通道，新行改了
+        # 编号就失效，先清空再让操作员在「设备属性」里重配。
+        entry["readback_signal"] = ""
+        entry["rate_signal"] = ""
+        entry["display_order"] = target
+        self._remember_pv_entry(target, entry)
+        self._reset_pv_probe_cells(target)
 
     def _add_pv_row(self) -> None:
         row = self.pv_table.rowCount()

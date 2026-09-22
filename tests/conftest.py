@@ -30,6 +30,7 @@ DEV_SERVICE_PORTS = {"8765", "8767", "8000"}
 # 会改配置或改设备的端点（前缀匹配）
 GUARDED_WRITE_PATHS = (
     "/control/v1/pv-mapping",
+    "/control/v1/manual-dashboard",
     "/control/v1/signals/write",
     "/control/v1/signals/write-batch",
     "/control/v1/magnets/retract",

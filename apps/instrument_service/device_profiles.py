@@ -143,6 +143,33 @@ def beam_target_for(signal: str) -> bool:
     return signal.endswith(_BEAM_TARGET_SUFFIXES)
 
 
+def device_id_for(signal: str) -> str:
+    """设备稳定 ID：业务信号去掉最后一个字段名。"""
+    head, _, _tail = signal.rpartition(".")
+    return head or signal
+
+
+def device_label_for(labels: list[str]) -> str:
+    """从同一设备的信号标签提取设备显示名，并忽略无公共前缀的动作标签。"""
+    if not labels:
+        return ""
+    if len(labels) == 1:
+        return labels[0].strip()
+    prefix = max(labels, key=len)
+    for label in labels:
+        limit = min(len(prefix), len(label))
+        index = 0
+        while index < limit and prefix[index] == label[index]:
+            index += 1
+        if index:
+            prefix = prefix[:index]
+    ended_on_boundary = prefix.endswith(" ")
+    prefix = prefix.strip(" ·-(")
+    if prefix and not ended_on_boundary and " " in prefix:
+        prefix = prefix.rsplit(" ", 1)[0].strip(" ·-(")
+    return prefix or labels[0].strip()
+
+
 def _build_entries() -> list[PvMappingEntry]:
     entries: list[PvMappingEntry] = []
 
@@ -330,9 +357,20 @@ def _with_roles(entries: list[PvMappingEntry]) -> tuple[PvMappingEntry, ...]:
     漏标一条的后果是界面上少一个可调参数、或者把不该优化的量（磁铁速率）列进去。
     规则本身受 ``tests/test_signal_io.py`` 的用例保护。
     """
+    labels_by_device: dict[str, list[str]] = {}
+    for entry in entries:
+        device_id = entry.device_id or device_id_for(entry.signal)
+        labels_by_device.setdefault(device_id, []).append(entry.label)
+    device_labels = {
+        device_id: device_label_for(labels)
+        for device_id, labels in labels_by_device.items()
+    }
     return tuple(
         entry.model_copy(
             update={
+                "device_id": entry.device_id or device_id_for(entry.signal),
+                "device_label": entry.device_label
+                or device_labels[entry.device_id or device_id_for(entry.signal)],
                 "role": role_for(entry.signal, entry.writable),
                 "tunable": tunable_for(
                     entry.signal, role_for(entry.signal, entry.writable)

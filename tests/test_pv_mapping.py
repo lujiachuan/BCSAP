@@ -52,6 +52,16 @@ class ValidationTests(unittest.TestCase):
     def test_default_config_has_no_issues(self) -> None:
         self.assertEqual(pv_mapping.validate_config(pv_mapping.default_config()), [])
 
+    def test_default_config_has_persistent_device_identity(self) -> None:
+        entries = pv_mapping.default_config().entries
+
+        self.assertTrue(all(entry.device_id for entry in entries))
+        self.assertTrue(all(entry.device_label for entry in entries))
+        labels_by_device: dict[str, set[str]] = {}
+        for entry in entries:
+            labels_by_device.setdefault(entry.device_id, set()).add(entry.device_label)
+        self.assertTrue(all(len(labels) == 1 for labels in labels_by_device.values()))
+
     def test_duplicate_pv_and_signal_are_reported_per_row(self) -> None:
         config = config_with(
             entry(),
@@ -205,6 +215,44 @@ class PersistenceTests(unittest.TestCase):
         )
         magnet.pop("scan_axis")
         magnet.pop("safe_value")
+        magnet.pop("tunable")
+        magnet["device_id"] = ""
+        magnet["device_label"] = ""
+        detector = next(
+            item for item in entries if item["signal"] == "detector.fc1.beam_current"
+        )
+        detector.pop("beam_target")
+        Path(os.environ["SPECTRUM_PV_MAPPING"]).write_text(
+            json.dumps({"version": 1, "entries": entries}), encoding="utf-8"
+        )
+
+        loaded = next(
+            item
+            for item in pv_mapping.load_config_checked().entries
+            if item.signal == "magnet.m1.current_setpoint"
+        )
+        loaded_detector = next(
+            item
+            for item in pv_mapping.load_config_checked().entries
+            if item.signal == "detector.fc1.beam_current"
+        )
+
+        self.assertTrue(loaded.scan_axis)
+        self.assertEqual(loaded.safe_value, 0.0)
+        self.assertEqual(loaded.device_id, "magnet.m1")
+        self.assertEqual(loaded.device_label, "磁铁1")
+        # 调束用途标记也必须回填：缺失的 tunable 让"优化变量"少参，缺失的
+        # beam_target 让"优化目标"下拉为空（2026-09-20 现场）
+        self.assertTrue(loaded.tunable)
+        self.assertTrue(loaded_detector.beam_target)
+
+    def test_runtime_loader_keeps_explicit_tuning_flags(self) -> None:
+        """现场显式写过的 tunable / beam_target 不被迁移覆盖。"""
+        entries = [item.model_dump() for item in pv_mapping.default_config().entries]
+        magnet = next(
+            item for item in entries if item["signal"] == "magnet.m1.current_setpoint"
+        )
+        magnet["tunable"] = False  # 现场明确不让它参与调束
         Path(os.environ["SPECTRUM_PV_MAPPING"]).write_text(
             json.dumps({"version": 1, "entries": entries}), encoding="utf-8"
         )
@@ -215,8 +263,7 @@ class PersistenceTests(unittest.TestCase):
             if item.signal == "magnet.m1.current_setpoint"
         )
 
-        self.assertTrue(loaded.scan_axis)
-        self.assertEqual(loaded.safe_value, 0.0)
+        self.assertFalse(loaded.tunable)
 
     def test_save_leaves_no_temp_files(self) -> None:
         pv_mapping.save_config(config_with(entry()))

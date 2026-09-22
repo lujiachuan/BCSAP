@@ -255,6 +255,18 @@ class TuningStore:
                 )
             )
 
+    def list_runs(self, limit: int = 50) -> list[sqlite3.Row]:
+        """历史 run 列表（按开始时间倒序，最新在前）。"""
+        with self._session() as connection:
+            return list(
+                connection.execute(
+                    "SELECT run_id, created_at, finished_at, state, message,"
+                    " algorithm, best_objective, max_iterations, mode"
+                    " FROM tuning_runs ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                )
+            )
+
     def db_path(self) -> Path:
         return self._db_path
 

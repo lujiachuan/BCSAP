@@ -20,6 +20,8 @@ class TuningState(StrEnum):
     AWAITING_CONFIRMATION = "awaiting_confirmation"
     # 正在写入并等待读回稳定
     APPLYING = "applying"
+    # 用户暂停：参数冻结，等待继续（只在不写设备时进入）
+    PAUSED = "paused"
     STOP_REQUESTED = "stop_requested"
     COMPLETED = "completed"
     ABORTED = "aborted"
@@ -34,6 +36,9 @@ ALLOWED_TRANSITIONS: dict[TuningState, frozenset[TuningState]] = {
     TuningState.RUNNING: frozenset(
         {
             TuningState.AWAITING_CONFIRMATION,
+            # auto 模式：候选生成后不经过等待确认，直接进写设备
+            TuningState.APPLYING,
+            TuningState.PAUSED,
             TuningState.STOP_REQUESTED,
             TuningState.COMPLETED,
             TuningState.FAILED,
@@ -41,8 +46,12 @@ ALLOWED_TRANSITIONS: dict[TuningState, frozenset[TuningState]] = {
     ),
     # 等确认期间用户可以直接停止，或确认后进入写入
     TuningState.AWAITING_CONFIRMATION: frozenset(
-        {TuningState.APPLYING, TuningState.STOP_REQUESTED, TuningState.COMPLETED,
-         TuningState.FAILED}
+        {TuningState.APPLYING, TuningState.PAUSED, TuningState.STOP_REQUESTED,
+         TuningState.COMPLETED, TuningState.FAILED}
+    ),
+    # 暂停后可继续（RUNNING），也可直接停止
+    TuningState.PAUSED: frozenset(
+        {TuningState.RUNNING, TuningState.STOP_REQUESTED}
     ),
     TuningState.APPLYING: frozenset(
         {TuningState.RUNNING, TuningState.STOP_REQUESTED, TuningState.COMPLETED,

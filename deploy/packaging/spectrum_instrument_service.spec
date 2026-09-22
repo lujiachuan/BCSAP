@@ -8,18 +8,35 @@
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
 ROOT = Path(SPECPATH).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-hiddenimports = collect_submodules("apps.instrument_service") + collect_submodules("packages")
+hiddenimports = (
+    collect_submodules("apps.instrument_service")
+    + collect_submodules("packages")
+    + collect_submodules("alembic")
+    + collect_submodules("optuna_dashboard")
+)
+# Optuna RDB storage 运行时要用 alembic 迁移脚本目录（非 .py 数据文件），
+# PyInstaller 默认只收字节码，必须显式把数据目录打进去，否则 create_study 报
+# “Path doesn't exist: .../optuna/storages/_rdb/alembic”（启动调束 HTTP 500）。
+# include_py_files：alembic 迁移脚本（env.py / versions/v*.a.py 等）文件名不是
+# 合法模块名，不会被当模块收集，必须整目录、连同 .py 原样打进去。
+# optuna-dashboard 自身是独立包，前端 HTML/JS 模板与静态资源必须打进去，
+# 否则打包后浏览器访问 dashboard 所有路由都 404（开发态因 site-packages 在而正常）。
+datas = (
+    collect_data_files("optuna", include_py_files=True)
+    + collect_data_files("alembic")
+    + collect_data_files("optuna_dashboard")
+)
 
 a = Analysis(
     [str(ROOT / "apps" / "instrument_service" / "main.py")],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=[],
+    datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
