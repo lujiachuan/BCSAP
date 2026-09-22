@@ -52,11 +52,16 @@ class TuningProcessLogTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
-        self._read_patch = mock.patch.object(
-            instrument_api, "request_read", lambda *a, **k: None
-        )
-        self._read_patch.start()
-        self.addCleanup(self._read_patch.stop)
+        def _never(*_args, **_kwargs):
+            return None
+
+        self._patches = [
+            mock.patch.object(instrument_api, "request_read", _never),
+            mock.patch.object(instrument_api, "request_tuning_runs", _never),
+        ]
+        for patcher in self._patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self._directory = tempfile.TemporaryDirectory()
         self.addCleanup(self._directory.cleanup)
 

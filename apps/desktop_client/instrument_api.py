@@ -277,6 +277,14 @@ def request_tuning_status(run_id: str, base_url: str | None = None):
     return _get(f"{TUNING_RUNS_PATH}/{run_id}", base_url)
 
 
+def request_tuning_runs(limit: int = 50, base_url: str | None = None):
+    """历史/在跑的调束任务列表：客户端重启后靠它**认领**正在运行的任务。
+
+    没有这个入口时，界面重启后再也看不到那个任务——既停不掉，也不知道它在写设备。
+    """
+    return _get(f"{TUNING_RUNS_PATH}?limit={int(limit)}", base_url)
+
+
 def request_tuning_iterations(run_id: str, base_url: str | None = None):
     return _get(f"{TUNING_RUNS_PATH}/{run_id}/iterations", base_url)
 

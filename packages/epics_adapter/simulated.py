@@ -70,9 +70,12 @@ class SimulatedEpicsGateway:
 
     def read(self, signal: str) -> Reading:
         with self._lock:
-            if signal == "detector.fc1.beam_current":
+            # 束流由各 DW 电压算出来（见 _compute_fc1_beam），但**前提是这个信号
+            # 在网关里配置过**：没配置就是"这一路读不到"，不能凭空给一个数——
+            # 真实 CA 对没配的 PV 正是这个语义，模拟器的宽容会掩盖现场的读不到。
+            if signal == "detector.fc1.beam_current" and signal in self._values:
                 value = _compute_fc1_beam(self._values)
-                unit = self._values[signal][1] if signal in self._values else "nA"
+                unit = self._values[signal][1]
             else:
                 try:
                     value, unit = self._values[signal]

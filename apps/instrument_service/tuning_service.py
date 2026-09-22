@@ -164,6 +164,16 @@ class _Run:
     recovery: TuningRecovery | None = None
     # 连续"没有产生新的历史最优"的轮数（收敛早停的计数）
     no_improvement: int = 0
+    # ---- 批次 3：有效轮次与无效轮次守卫 ----
+    # 真的测到目标且回读到位的轮数（阶段推进与早停都只看它）
+    valid_rounds: int = 0
+    # 连续无效轮数（写入被拒 / 目标读不到 / 未稳定）；与束流异常分开计数
+    invalid_streak: int = 0
+    # 最近一次"软阈值区间"的说明（供事件日志使用；不进异常计数）
+    last_soft_warning: str = ""
+    # 本轮结果喂给优化器**之前**它已有多少观测。判断"模型是否事先预期了这次下探"
+    # 必须用它：本轮结果一旦喂进去，模型"预测"什么都成了事后诸葛。
+    prior_observations: int = 0
     # 全自动模式的后台驱动线程（测试用 join 等它彻底结束，避免写库竞态）
     driver: threading.Thread | None = None
     # 结束后的处置（应用最优/恢复初始/回安全值）最近一次结果
@@ -580,6 +590,15 @@ class TuningService:
             run, f"已占用设备组：{'、'.join(sorted(groups)) or '（无）'}",
             phase=PHASE_PRECHECKING, groups=sorted(groups),
         )
+        # 启动前快照：**必须先取到**再进入 RUNNING。取不到就等于退不回去，
+        # 宁可不开（改造报告 §5.2 第一条）。
+        # 顺序很关键：快照必须在"开始前复位"**之前**取。否则快照记的是复位后的值，
+        # 现场看到的"恢复启动前参数"实际退回到的是复位点，而不是任务真正开始前的位置。
+        problem = self._capture_snapshot(run)
+        if problem is not None:
+            self._emit(run, problem, level=LEVEL_ERROR)
+            self._finish_failed(run, problem)
+            return self.status(run.run_id)
         # 开始前复位：把参与变量写到起始值（自定义 start，未填取范围中值），
         # 保证每次同一起点、不继承上一次结果。
         if request.reset_before_start:
@@ -595,7 +614,7 @@ class TuningService:
                 phase=PHASE_WRITING,
                 targets=reset_targets,
             )
-            _, reset_problems = self._write_and_settle(run, reset_targets)
+            reset_applied, reset_problems = self._write_and_settle(run, reset_targets)
             if reset_problems:
                 self._emit(
                     run, "开始前复位未完成：" + "；".join(reset_problems),
@@ -603,13 +622,19 @@ class TuningService:
                 )
                 self._finish_failed(run, "开始前复位未完成：" + "；".join(reset_problems))
                 return self.status(run.run_id)
-        # 启动前快照：**必须先取到**再进入 RUNNING。取不到就等于退不回去，
-        # 宁可不开（改造报告 §5.2 第一条）。
-        problem = self._capture_snapshot(run)
-        if problem is not None:
-            self._emit(run, problem, level=LEVEL_ERROR)
-            self._finish_failed(run, problem)
-            return self.status(run.run_id)
+            with self._lock:
+                # 复位后设备停在新位置：两阶段策略的"保持值"从这里重新起算
+                # （快照仍然保留复位前的值，供"恢复启动前参数"使用）
+                run.held_values = {
+                    signal: float(reset_applied.get(signal, target))
+                    for signal, target in reset_targets.items()
+                }
+            self._emit(
+                run,
+                "复位完成：设备现停在各起始值（启动前快照仍保留，可随时退回）",
+                phase=PHASE_PRECHECKING,
+                applied=dict(reset_applied),
+            )
         # auto 模式二次保护：基线读不到时相对判据无效，必须有绝对阈值兜底
         if request.mode == MODE_AUTO and run.baseline_objective is None:
             if request.loss_absolute is None:
@@ -643,24 +668,48 @@ class TuningService:
         return self.status(run.run_id)
 
     def _spawn_auto_driver(self, run: _Run) -> None:
-        """启动全自动模式的后台驱动线程。
+        """启动全自动模式的后台驱动线程（循环，不是递归）。
 
-        start 请求必须立即返回（客户端要轮询状态与进度），而每轮要写设备、
+        start / resume 请求必须立即返回（客户端要轮询状态与进度），而每轮要写设备、
         等稳定、采样，耗时秒级——放进请求里会让 HTTP 挂起整个任务时长。
         线程与 stop() / pause() 通过 RLock 与 stopped 标志协作；任何异常
         都收尾为 FAILED（驱动线程兜底，不让异常无声消失）。
+
+        为什么改成循环：旧实现在 ``_propose_next`` 与 ``_execute_pending`` 之间互相调用，
+        每轮往调用栈上压两层帧。200 轮的 auto 任务要压 400+ 帧，再叠加 Python 默认
+        1000 帧上限，属于"跑得越久越接近崩"的隐患；循环写法与轮次多少无关。
         """
-
-        def driver() -> None:
-            try:
-                self._propose_next(run)
-            except Exception as exc:  # noqa: BLE001 —— 驱动线程兜底
-                self._finish_failed(run, str(exc))
-
-        thread = threading.Thread(target=driver, daemon=True)
+        thread = threading.Thread(
+            target=self._auto_driver_loop, args=(run,), daemon=True
+        )
         with self._lock:
             run.driver = thread
         thread.start()
+
+    def _auto_driver_loop(self, run: _Run) -> None:
+        """全自动主循环：提候选 → 执行一轮 → 再提候选，直到终态 / 暂停 / 出错。"""
+        try:
+            while True:
+                with self._lock:
+                    if run.state in TERMINAL_STATES or run.stopped:
+                        return
+                    if run.state == TuningState.PAUSED:
+                        # 暂停：参数冻结，候选先不提（resume 会重新拉起驱动）
+                        return
+                if run.pending is None:
+                    self._propose_next(run)
+                    with self._lock:
+                        if run.state in TERMINAL_STATES or run.stopped:
+                            return
+                        if run.pending is None:
+                            return  # 暂停或没提出候选（例如已到轮次上限但未收尾）
+                status = self._execute_pending(
+                    run.run_id, require_awaiting=False, chain=False
+                )
+                if status.state in TERMINAL_STATES:
+                    return
+        except Exception as exc:  # noqa: BLE001 —— 驱动线程兜底
+            self._finish_failed(run, f"自动调束驱动异常：{exc}")
 
     def _read_with_retry(self, read: Callable[[], float | None]) -> float | None:
         """读一次现场值，失败就退避重试几次再认输。
@@ -966,22 +1015,63 @@ class TuningService:
         # 内存 study 或首次创建时，把已观测投影到新维度接续记忆。
         if optimizer.n_observed == 0:
             history: list[tuple[list[float], float]] = []
+            dropped = 0
             for iteration in run.iterations:
                 if iteration.objective is None:
                     continue
-                try:
-                    history.append(
-                        ([iteration.proposed[name] for name in names], iteration.objective)
-                    )
-                except (KeyError, ValueError, TypeError):
+                # **用设备实际回读**，而不是算法建议值：优化器学到的应该是
+                # "设备在这个位置上的表现"。建议值与实际位置不一致时（斜坡限制、
+                # 未到位、被钳位），拿建议值回灌等于喂给模型一对错配的 (x, y)。
+                values = []
+                for name in names:
+                    raw = (iteration.readback or {}).get(name)
+                    if raw is None:
+                        raw = iteration.proposed.get(name)
+                    if raw is None:
+                        break
+                    values.append(float(raw))
+                if len(values) != len(names):
+                    dropped += 1
                     continue
+                history.append((values, iteration.objective))
+            # 越界的观测**夹到当前范围的边界**而不是丢掉：
+            # 设备当时的位置可能本来就在"设定范围"之外（操作员收窄了搜索区间），
+            # 那条观测仍然带着真实响应面的信息；而 Optuna 的 create_trial 不接受
+            # 落在分布之外的参数，所以必须夹。夹了多少条会写进事件日志。
             bounds = {d.name: (float(d.low), float(d.high)) for d in dimensions}
-            clean = []
+            clean: list[tuple[list[float], float]] = []
+            clamped = 0
             for values, obj in history:
-                if all(bounds[n][0] <= float(v) <= bounds[n][1] for n, v in zip(names, values)):
-                    clean.append((values, obj))
+                adjusted: list[float] = []
+                touched = False
+                for name, value in zip(names, values):
+                    low, high = bounds[name]
+                    if value < low:
+                        adjusted.append(low)
+                        touched = True
+                    elif value > high:
+                        adjusted.append(high)
+                        touched = True
+                    else:
+                        adjusted.append(value)
+                clean.append((adjusted, obj))
+                clamped += 1 if touched else 0
             if clean:
                 optimizer.seed_history(clean)
+            self._emit(
+                run,
+                f"阶段切换：{stage}"
+                + (
+                    f"（{active_signals[0]}）" if stage == STAGE_SEQUENTIAL and active_signals else ""
+                )
+                + f"；接续 {len(clean)} 条历史观测（按实际回读投影，"
+                f"{clamped} 条被夹到当前范围边界，{dropped} 条因缺回读未接续）",
+                phase=PHASE_PROPOSING,
+                stage=stage,
+                seeded=len(clean),
+                clamped=clamped,
+                dropped=dropped,
+            )
         run.optimizer = optimizer
 
     # ------------------------------------------------------------------
@@ -1047,14 +1137,12 @@ class TuningService:
         with self._lock:
             if run.request.mode == MODE_AUTO:
                 # 全自动：不进"等待人工确认"。暂停中候选先挂着（不迁移状态，
-                # 等 resume 再执行），否则直接进执行层（内部再转 APPLYING）。
+                # 等 resume 再执行）。执行由驱动线程的循环负责（见 _auto_driver_loop）——
+                # 这里**不再**直接调 _execute_pending，否则又会变成互相递归。
                 if run.state == TuningState.PAUSED:
                     self._persist_state(run)
                     return self.status(run.run_id)
                 self._persist_state(run)
-                # 只标记：写设备/等稳定/采目标耗时秒级，必须在锁外跑，
-                # 否则 start() 主线程在 return status() 时会被堵到整个任务结束。
-                schedule_execute = True
             else:
                 self._to(
                     run,
@@ -1069,9 +1157,6 @@ class TuningService:
                 iteration=proposal.iteration,
             )
         self._persist_state(run)
-        if schedule_execute:
-            self._execute_pending(run.run_id, require_awaiting=False)
-            return self.status(run.run_id)
 
     # ------------------------------------------------------------------
     # 确认并执行
@@ -1081,12 +1166,17 @@ class TuningService:
         return self._execute_pending(run_id, require_awaiting=True)
 
     def _execute_pending(
-        self, run_id: str, *, require_awaiting: bool = True
+        self,
+        run_id: str,
+        *,
+        require_awaiting: bool = True,
+        chain: bool = True,
     ) -> TuningRunStatus:
         """执行当前候选：联锁巡检 → 执行层写入 → 读回 → 采目标 → 记录 → 下一轮。
 
-        confirm 模式由 /approve 触发（require_awaiting=True）；
-        auto 模式由 _propose_next 直接触发（require_awaiting=False）。
+        ``chain=True``（confirm 模式与 /approve）：本轮结束后顺手提出下一轮候选；
+        ``chain=False``（auto 模式驱动循环）：只执行这一轮，由循环继续推进——
+        避免"提议 ↔ 执行"互相调用把调用栈越压越深。
         """
         run = self._require(run_id)
         with self._lock:
@@ -1149,6 +1239,18 @@ class TuningService:
             run.iterations.append(iteration)
             run.latest_objective = iteration.objective
             quality = getattr(iteration, "quality", "ok")
+            # 有效轮次 = 真的测到目标且回读到位。阶段推进、早停计数、无效轮次守卫
+            # 都只看它：把"写入被拒/读不到目标"的轮次也算成一轮进展，会让一个变量在
+            # 一次有效测量都没有的情况下被判定"调完了"。
+            scored = iteration.objective is not None and quality == "ok"
+            # 先把"本轮之前的观测数"记下来，再喂本轮结果：区分"模型事先预期了这次下探"
+            # 还是"看到结果之后才觉得正常"，靠的正是这个先后顺序。
+            run.prior_observations = int(getattr(run.optimizer, "n_observed", 0) or 0)
+            if scored:
+                run.valid_rounds += 1
+                run.invalid_streak = 0
+            else:
+                run.invalid_streak += 1
             if iteration.objective is not None and quality == "ok":
                 ob_kwargs = {}
                 if hasattr(run.optimizer, "study"):  # OptunaAsker 才有 user_attrs
@@ -1162,18 +1264,24 @@ class TuningService:
                     [proposal.values[d.name] for d in run.optimizer.dimensions],
                     iteration.objective,
                     **ob_kwargs,
-                )
-                if (
+                )                # "有意义"的改进：提升幅度要超过 stall_fraction（相对当前最优）。
+                # stall_fraction=0 时任何刷新都算改进（与旧行为一致）。
+                threshold = run.best_objective
+                meaningful = (
                     run.best_objective is None
-                    or iteration.objective > run.best_objective
-                ):
+                    or threshold is None
+                    or iteration.objective
+                    > threshold * (1.0 + max(0.0, run.request.stall_fraction))
+                )
+                if run.best_objective is None or iteration.objective > run.best_objective:
                     run.best_objective = iteration.objective
                     run.best_values = dict(iteration.readback)
                     run.best_iteration = iteration.iteration
-                    run.no_improvement = 0
                     self._store.set_best(
                         run.run_id, dict(iteration.readback), iteration.objective
                     )
+                if meaningful:
+                    run.no_improvement = 0
                 else:
                     run.no_improvement += 1
             else:
@@ -1194,11 +1302,14 @@ class TuningService:
                 previous = run.variable_best.get(signal)
                 if previous is None or iteration.objective > previous[1]:
                     run.variable_best[signal] = (float(value), iteration.objective)
-            if run.stage == STAGE_SEQUENTIAL:
+            if run.stage == STAGE_SEQUENTIAL and scored:
+                # 只有真的测到目标才推进阶段：否则"这个变量调完了"是假的
                 run.stage_rounds += 1
             improved = run.best_iteration == iteration.iteration
             best_objective = run.best_objective
             no_improvement = run.no_improvement
+            valid_rounds = run.valid_rounds
+            invalid_streak = run.invalid_streak
         self._store.append_iteration(run.run_id, iteration)
         self._emit(
             run,
@@ -1214,8 +1325,9 @@ class TuningService:
                 f"，耗时 {iteration.duration_ms / 1000:.2f}s"
                 if iteration.duration_ms
                 else ""
-            ),
-            level=LEVEL_INFO if iteration.quality == "ok" else LEVEL_WARN,
+            )
+            + f"；累计有效 {valid_rounds}/{len(run.iterations)} 轮",
+            level=LEVEL_INFO if scored else LEVEL_WARN,
             phase=PHASE_RECORDING,
             iteration=iteration.iteration,
             objective=iteration.objective,
@@ -1226,14 +1338,23 @@ class TuningService:
             sample_spread=iteration.sample_spread,
             failure_step=iteration.failure_step,
             detail=iteration.detail,
+            valid_rounds=valid_rounds,
         )
 
-        reason = self._guard_reason(run, iteration)
+        reason = self._guard_reason(run, proposal, iteration)
         with self._lock:
             run.anomalies = 0 if reason is None else run.anomalies + 1
             strikes = max(1, run.request.loss_strikes)
             tripped = reason is not None and run.anomalies >= strikes
             anomaly_count = run.anomalies
+            soft_warning = run.last_soft_warning
+            run.last_soft_warning = ""
+        if soft_warning:
+            # 软阈值区间（探索下探）：只在日志里说明，不计数、不中止、不回退
+            self._emit(
+                run, soft_warning, level=LEVEL_WARN, phase=PHASE_RECORDING,
+                iteration=iteration.iteration, soft_warning=True,
+            )
         if reason is not None:
             self._emit(
                 run,
@@ -1244,8 +1365,6 @@ class TuningService:
                 anomalies=anomaly_count,
                 strikes=strikes,
             )
-        elif anomaly_count == 0:
-            pass
         if tripped:
             if not run.request.auto_recover:
                 # 不自动回退：把异常摆到台面上，让操作员决定（设备锁仍握着）
@@ -1263,17 +1382,38 @@ class TuningService:
             self._recover(run, reason)
             return self.status(run_id)
 
-        # 收敛早停：连续 patience 轮没有新的历史最优即正常结束
+        # 连续无效轮次守卫：执行层/测量一直在失败时，继续跑只是在烧机时。
+        # 它与束流保护分开：写入被拒是执行问题，不是束流丢失，收尾方式也不同。
+        limit = max(1, int(run.request.max_invalid_rounds))
+        if invalid_streak >= limit:
+            self._emit(
+                run,
+                f"连续 {invalid_streak} 轮无效（写入被拒 / 目标读不到 / 未稳定），停止任务",
+                level=LEVEL_ERROR,
+                phase=PHASE_IDLE,
+                invalid_streak=invalid_streak,
+                limit=limit,
+            )
+            self._finish_failed(
+                run,
+                f"连续 {invalid_streak} 轮没有产生有效测量（最近一轮："
+                f"{iteration.detail or iteration.quality}）；已停止任务，"
+                "参数保持现状，请检查执行层与目标信号",
+            )
+            return self.status(run_id)
+
+        # 收敛早停：连续 patience 轮没有**有意义**的改进即正常结束
         if run.request.patience > 0 and run.no_improvement >= run.request.patience:
             self._emit(
                 run,
-                f"连续 {no_improvement} 轮无改进，触发收敛早停",
+                f"连续 {no_improvement} 轮无有意义改进"
+                f"（阈值 {run.request.stall_fraction:.1%}），触发收敛早停",
                 phase=PHASE_IDLE, counter=no_improvement, patience=run.request.patience,
             )
             self._finish_completed(
                 run,
                 f"连续 {run.no_improvement} 轮无显著改进，收敛早停"
-                f"（共 {len(run.iterations)} 轮）",
+                f"（共 {len(run.iterations)} 轮，其中有效 {valid_rounds} 轮）",
             )
             return self.status(run_id)
 
@@ -1283,17 +1423,35 @@ class TuningService:
                 return self.status(run_id)
             self._to(run, TuningState.RUNNING, f"第 {iteration.iteration + 1} 轮完成")
         self._persist_state(run)
-        self._propose_next(run)
+        if chain:
+            self._propose_next(run)
         return self.status(run_id)
 
-    def _guard_reason(self, run: _Run, iteration: TuningIteration) -> str | None:
+    def _guard_reason(
+        self, run: _Run, proposal: TuningProposal, iteration: TuningIteration
+    ) -> str | None:
         """这一轮算不算"束流异常"？返回原因文本，None 表示正常。
 
-        三条判据（改造报告 §5.2）：目标读不到 / 低于绝对阈值 / 相对启动前基线
-        下降过多。相对判据在拿不到基线时不参与判断——**不拿猜测的数字当安全边界**。
-        总开关 ``loss_protection=False`` 时直接跳过（SIM/演示用）。
+        判据分三层（改造报告 §5.2 + 批次 3 的 D2/D3 修正）：
+
+        1. **硬丢失**：目标读不到，或目标 ≤ 绝对阈值，或相对基线下降超过
+           ``loss_relative_hard``（配了才用）→ 计异常，连续 ``loss_strikes`` 次触发保护；
+        2. **软告警**：下降超过 ``loss_relative`` 但没到硬阈值 → **只警告**。
+           优化器本来就会主动去试更差的点，一次 60% 的下探是预期内的采样，
+           不该被当成束流丢失把整轮退回去（旧实现就是这么干的）；
+        3. **乐观采样**：实测值与模型预测（``predicted ± std``）吻合的下探同样只警告——
+           模型说"这里会低"，测出来真的低，属于正常探索。
+
+        两个刻意的例外：
+        * ``write_rejected``（写入被拒）**不计**束流异常：那是执行层拒绝了这次写入，
+          设备根本没动，与束流无关；它由"连续无效轮次"守卫处理；
+        * ``loss_protection=False`` 时整段跳过（SIM/演示）。
         """
+        run.last_soft_warning = ""
         if not run.request.loss_protection:
+            return None
+        # 写入被拒：设备没动，谈不上束流丢失
+        if iteration.quality == "write_rejected":
             return None
         if iteration.objective is None:
             return f"本轮没有有效目标读数（{iteration.detail or '原因未记录'}）"
@@ -1301,14 +1459,73 @@ class TuningService:
         if absolute is not None and iteration.objective <= absolute:
             return f"目标 {iteration.objective:g} 已低于绝对阈值 {absolute:g}"
         baseline = run.baseline_objective
-        if baseline is not None and baseline > 0:
-            floor = baseline * (1.0 - run.request.loss_relative)
-            if iteration.objective < floor:
-                return (
-                    f"目标比启动前基线 {baseline:g} 下降超过 "
-                    f"{run.request.loss_relative:.0%}（本轮 {iteration.objective:g}）"
-                )
-        return None
+        if baseline is None or baseline <= 0:
+            return None
+
+        drop = (baseline - iteration.objective) / baseline
+        soft = float(run.request.loss_relative or 0.0)
+        hard = run.request.loss_relative_hard
+        hard_floor = baseline * (1.0 - float(hard)) if hard is not None else None
+        deep_loss = hard_floor is not None and iteration.objective < hard_floor
+        over_soft = drop > soft if soft > 0 else False
+        if not over_soft and not deep_loss:
+            return None
+        if hard_floor is not None and not deep_loss:
+            # 软硬阈值之间的区间：允许，但要留痕
+            run.last_soft_warning = (
+                f"目标较基线下降 {drop:.0%}（软阈值 {soft:.0%}，硬阈值 {hard:.0%}）："
+                "判断为探索下探，仅告警、不计异常、不回退"
+            )
+            return None
+        if hard_floor is None and over_soft and self._expects_the_dip(
+            run, proposal, iteration, baseline, soft
+        ):
+            run.last_soft_warning = (
+                f"目标较基线下降 {drop:.0%}，但落在模型预测 "
+                f"{proposal.predicted:.3f} ± {proposal.std:.3f} 内："
+                "判断为预期内的探索下探，仅告警"
+            )
+            return None
+        if hard_floor is not None:
+            return (
+                f"目标比启动前基线 {baseline:g} 下降超过 {float(hard):.0%}"
+                f"（本轮 {iteration.objective:g}，低于硬阈值 {hard_floor:g}）"
+            )
+        return (
+            f"目标比启动前基线 {baseline:g} 下降超过 "
+            f"{soft:.0%}（本轮 {iteration.objective:g}）"
+        )
+
+    @staticmethod
+    def _expects_the_dip(
+        run: _Run,
+        proposal: TuningProposal,
+        iteration: TuningIteration,
+        baseline: float,
+        soft: float,
+        *,
+        sigmas: float = 3.0,
+    ) -> bool:
+        """模型是否**在事先就预期了**这次下探（用于把探索下探与束流丢失分开）。
+
+        三个条件缺一不可，否则"宽容"会退化成"没有保护"：
+
+        1. 模型**在本轮结果之前**已有观测（``run.prior_observations > 0``）：首轮的先验
+           预测没有任何信息量，它"预测"出任何值都不构成"预期内的下探"；
+        2. 模型自己就认为这里会低于软阈值（``predicted < baseline*(1-soft)``）：
+           只有"模型说会低、测出来真的低"才叫探索；
+        3. 预测的不确定度相对基线不大（``std <= 25% 基线``）：不确定度极大时
+           任何实测值都落在 3σ 里，等于无条件放行。
+        """
+        if run.prior_observations <= 0:
+            return False
+        if proposal.std <= 0 or iteration.objective is None:
+            return False
+        if proposal.predicted >= baseline * (1.0 - soft):
+            return False
+        if proposal.std > 0.25 * abs(baseline):
+            return False
+        return abs(iteration.objective - proposal.predicted) <= sigmas * proposal.std
 
     def _write_and_settle(
         self, run: _Run, targets: dict[str, float]
@@ -1441,7 +1658,7 @@ class TuningService:
                     "请先确认设备状态再处置"
                 )
 
-        targets = self._finalize_targets(run, action)
+        targets, sources = self._finalize_targets(run, action)
         groups = set(run.locked_groups)
         owner = f"finalize-{run.run_id}"
         try:
@@ -1464,7 +1681,11 @@ class TuningService:
                 else f"{FINALIZE_LABELS[action]}未完成"
             ),
             applied=applied,
-            detail="；".join(problems),
+            # 逐路的写入依据一起返回：现场要能核对"这个值是复现最优轮，还是快照兜底"
+            detail="；".join(
+                [*(f"{signal} ← {source}" for signal, source in sorted(sources.items())),
+                 *problems]
+            ),
             at=_now(),
         )
         self._store.set_finalize(run.run_id, result)
@@ -1482,35 +1703,90 @@ class TuningService:
             phase=PHASE_IDLE,
             action=action,
             applied=applied,
+            sources=sources,
             detail="；".join(problems) or None,
         )
         return result
 
-    def _finalize_targets(self, run: _Run, action: str) -> dict[str, float]:
-        """算出这次动作每路要写到的值；缺依据时明确拒绝，不猜。"""
+    def _finalize_targets(
+        self, run: _Run, action: str
+    ) -> tuple[dict[str, float], dict[str, str]]:
+        """算出这次动作每路要写到的值与**来源**；缺依据时明确拒绝，不猜。
+
+        返回值第二项是"每路的依据"（``复现最优轮`` / ``启动前快照`` /
+        ``起始值`` / ``安全值`` / ``映射下限``），会写进处置记录与事件日志——
+        现场复盘时要能回答"这一路的值是从哪来的"。
+        """
         if action == ACTION_APPLY_BEST:
             if not run.best_values:
                 raise TuningError("这次任务还没有可用的最优轮，无法应用最优参数")
-            return {signal: float(value) for signal, value in run.best_values.items()}
+            targets: dict[str, float] = {}
+            sources: dict[str, str] = {}
+            last_readback: dict[str, float] = {}
+            for item in run.iterations:
+                for signal, value in (item.readback or {}).items():
+                    last_readback[signal] = float(value)
+            missing: list[str] = []
+            for variable in run.request.enabled_variables():
+                signal = variable.signal
+                if signal in run.best_values:
+                    targets[signal] = float(run.best_values[signal])
+                    sources[signal] = "复现最优轮"
+                elif signal in run.snapshot:
+                    # 最优轮那一轮没读到这一路：用启动前快照兜底，并如实标注来源。
+                    # 旧实现直接判"没有目标值"，于是**先写成功的几路已经动过了**，
+                    # 再报"未完成"——现场看到的是一次半途而废的处置。
+                    targets[signal] = float(run.snapshot[signal])
+                    sources[signal] = "启动前快照（最优轮缺该路回读）"
+                elif signal in last_readback:
+                    targets[signal] = float(last_readback[signal])
+                    sources[signal] = "最后一轮回读（最优轮与快照都缺）"
+                else:
+                    missing.append(signal)
+            if missing:
+                raise TuningError(
+                    "最优轮、启动前快照与历史回读里都没有这些参数的值，"
+                    f"无法安全地应用最优参数：{'、'.join(missing)}"
+                )
+            return targets, sources
         if action == ACTION_RESTORE_INITIAL:
             if not run.snapshot:
                 raise TuningError(
                     "这次任务没有启动前快照（可能是旧版本任务），无法恢复初始参数"
                 )
-            return {signal: float(value) for signal, value in run.snapshot.items()}
+            return (
+                {signal: float(value) for signal, value in run.snapshot.items()},
+                {signal: "启动前快照" for signal in run.snapshot},
+            )
         if action == ACTION_START_VALUES:
-            return {
+            targets = {
                 variable.signal: variable.resolved_start()
                 for variable in run.request.enabled_variables()
             }
-        # 安全值：每路退到映射里配置的下限；没有下限按 0（与"全部关断"同一口径）
-        targets: dict[str, float] = {}
+            return targets, {signal: "起始值" for signal in targets}
+        # 安全值：**优先用映射里的 safe_value**；没有就退到下限并如实标注；
+        # 两者都没有时拒绝执行——静默按 0 下发是"看起来做了保护动作"。
+        targets = {}
+        sources = {}
+        missing = []
         for variable in run.request.enabled_variables():
             entry = self._entry(variable.signal)
-            targets[variable.signal] = (
-                float(entry.min_value) if entry.min_value is not None else 0.0
+            safe = getattr(entry, "safe_value", None)
+            if safe is not None:
+                targets[variable.signal] = float(safe)
+                sources[variable.signal] = "安全值"
+            elif entry.min_value is not None:
+                targets[variable.signal] = float(entry.min_value)
+                sources[variable.signal] = "映射下限（未配置安全值）"
+            else:
+                missing.append(variable.signal)
+        if missing:
+            raise TuningError(
+                "以下参数既没有配置安全值、也没有配置下限，无法确定要退到哪里："
+                + "、".join(missing)
+                + "。请在 PV 映射里为它们配置 safe_value 或 min_value。"
             )
-        return targets
+        return targets, sources
 
     def _apply(self, run: _Run, proposal: TuningProposal) -> tuple[TuningIteration, bool]:
         """执行一轮：写**本轮激活的**参数 → 等稳定 → 读回 → 采目标。
@@ -1748,9 +2024,12 @@ class TuningService:
             self._to(run, TuningState.RUNNING, "继续调束")
         self._emit(run, "任务已继续", phase=PHASE_IDLE)
         self._persist_state(run)
+        if run.request.mode == MODE_AUTO:
+            # 全自动：继续执行必须回到**驱动线程**里跑循环。
+            # 在 HTTP 线程上直接执行一轮会把请求挂住整个任务时长（而且循环会一直跑下去）。
+            self._spawn_auto_driver(run)
+            return self.status(run_id)
         if run.pending is not None:
-            if run.request.mode == MODE_AUTO:
-                return self._execute_pending(run.run_id, require_awaiting=False)
             with self._lock:
                 self._to(
                     run, TuningState.AWAITING_CONFIRMATION, "候选已生成，等待人工确认"

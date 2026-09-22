@@ -121,11 +121,20 @@ class TuningLayoutTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
-        self._read_patch = mock.patch.object(
-            instrument_api, "request_read", lambda *a, **k: None
-        )
-        self._read_patch.start()
-        self.addCleanup(self._read_patch.stop)
+        # 页面 show() 会尝试认领在跑的任务、并（若在跑）轮询进度：单测里全部换成桩，
+        # 既不连本机服务，也不让用例结果取决于现场是否有任务在跑。
+        def _never(*_args, **_kwargs):
+            return None
+
+        self._patches = [
+            mock.patch.object(instrument_api, "request_read", _never),
+            mock.patch.object(instrument_api, "request_tuning_runs", _never),
+            mock.patch.object(instrument_api, "request_tuning_progress", _never),
+            mock.patch.object(instrument_api, "request_tuning_events", _never),
+        ]
+        for patcher in self._patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def make_page(self, count: int = 2, records: int = 24) -> TuningPage:
         page = TuningPage()

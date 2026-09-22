@@ -269,8 +269,15 @@ class TuningRunRequest(BaseModel):
 
     # 优化引擎（见上 ENGINE_*）；gp 保留自研回退
     engine: str = ENGINE_GP
-    # 收敛早停：连续多少轮没有产生新的历史最优即正常结束；0 = 不启用
+    # 收敛早停：连续多少轮没有产生**有意义**的改进即正常结束；0 = 不启用
     patience: int = 0
+    # "有意义"的判据：目标提升不到这个比例（相对当前历史最优）就不算改进。
+    # 0 = 任何刷新都算改进（与旧行为一致）。噪声大时调大，避免早停计数被毛刺清零。
+    stall_fraction: float = 0.0
+    # 连续多少轮"无效"（写入被拒 / 目标读不到 / 未稳定且无目标）就停止：
+    # 无效轮次既没有信息也不该无限占用设备与机时，但它是**执行问题**而不是束流丢失，
+    # 所以单独计数、单独收尾，不混进束流保护的连续异常计数。
+    max_invalid_rounds: int = 3
     # 应用层联锁规则：每轮写设备前巡检，越界即停止本轮并终止任务
     interlocks: list[TuningInterlock] = []
 
@@ -279,8 +286,15 @@ class TuningRunRequest(BaseModel):
     # 所以取不到快照会直接拒绝启动（宁可不开，也不要开了之后退不回来）。
     # 绝对阈值：目标值 ≤ 它就判"束流接近零"；None = 不做绝对判据
     loss_absolute: float | None = None
-    # 相对损失阈值：低于启动前基线的这个比例即判异常（0.5 = 掉到基线一半以下）
+    # 相对损失**软**阈值：低于启动前基线的这个比例即视为异常
+    # （0.5 = 掉到基线一半以下）
     loss_relative: float = 0.5
+    # 相对损失**硬**阈值：只有掉得更深才算"束流丢失"。None = 不启用硬阈值，
+    # 行为与旧版一致（按 loss_relative 直接判丢失）。
+    # 为什么要分层：优化器本来就会主动探索更差的点，一次 60% 的下探是**预期内**的
+    # 采样，不该被当成束流丢失把整轮退回去；把软阈值设在 0.5、硬阈值设在 0.8，
+    # 中间的区间就变成"仅告警、不中止、不计异常"，真正的丢失（掉到 20% 以下）照样触发。
+    loss_relative_hard: float | None = None
     # 连续几次异常才触发保护：单点毛刺不该把刚调好的参数全退回去
     loss_strikes: int = 2
     # 触发后是否自动回退到启动前快照；False = 只标记异常并停下等人工处理
@@ -293,7 +307,8 @@ class TuningRunRequest(BaseModel):
     reset_before_start: bool = False
 
     @field_validator("settle_tol", "noise", "loss_absolute", "loss_relative",
-                     "joint_frac", "hold_s", mode="before")
+                     "loss_relative_hard", "joint_frac", "hold_s", "stall_fraction",
+                     mode="before")
     @classmethod
     def _coerce_number(cls, value: object) -> object:
         if value is None or isinstance(value, bool):

@@ -185,6 +185,14 @@ class TuningPage(QWidget):
         # 断线检测：连续失败次数 + 最后一次成功取数的时间（本地时钟）
         self._link_failures = 0
         self._last_success_monotonic: float | None = None
+        # 回读刷新节流（运行中每 2s 一次）与保护状态（服务端回传的结论）
+        self._last_readback_at = 0.0
+        self._last_seen_latest_seq = 0
+        self._protection_reasons: list[str] = []
+        self._adopt_attempted = False
+        # 老路径增量拉取的重拉守卫（见 _fetch_iterations）
+        self._stale_iteration_fetches = 0
+        self._iteration_fetch_baseline = 0
         self._analysis: dict | None = None  # 结束后从 /analysis 拉的 Optuna 分析结果
         self._analysis_items: list[object] = []
         self._dashboard_url = DASHBOARD_URL
@@ -414,8 +422,9 @@ class TuningPage(QWidget):
         self.stall_fraction_form_spin.setSuffix(" %")
         self.stall_fraction_form_spin.setDecimals(1)
         self.stall_fraction_form_spin.setToolTip(
-            "过程建议里「近 10 轮目标提升不足 X%」的 X。"
-            "噪声大时调大（避免误报），要更早报警时调小。"
+            "两个用途：①过程建议里「近 10 轮目标提升不足 X%」的 X；"
+            "②收敛早停的「有意义改进」门槛——提升不到 X% 不算改进，"
+            "不会把连续无改进的计数清零（噪声大时调大，免得毛刺一直重置早停计数）。"
         )
         self.stall_fraction_form_spin.valueChanged.connect(lambda _v: self._refresh_advice())
         sample_form.add("停滞阈值", mark_compact(self.stall_fraction_form_spin), key="stall")
@@ -501,6 +510,25 @@ class TuningPage(QWidget):
             "连续异常次数", mark_compact(self.loss_strikes_spin), key="loss_strikes"
         )
 
+        # 硬性丢失阈值：只在这个深度以下才算"束流丢失"。0 = 不启用（行为与旧版一致）。
+        # 它的意义是给优化器的探索下探留出允许区间：软阈值（相对损失）与硬阈值之间
+        # 只告警、不计数、不回退，避免一次预期内的下探把整轮参数退回去。
+        self.loss_hard_spin = QDoubleSpinBox()
+        self.loss_hard_spin.setRange(0.0, 95.0)
+        self.loss_hard_spin.setSingleStep(5.0)
+        self.loss_hard_spin.setValue(0.0)
+        self.loss_hard_spin.setSuffix(" %")
+        self.loss_hard_spin.setSpecialValueText("不启用")
+        self.loss_hard_spin.setToolTip(
+            "掉到基线以下多少才算「真的丢了束流」。设成 80% 时：\n"
+            "· 下降超过「相对损失阈值」但没到 80% → 只告警（判断为探索下探，不计异常、不回退）\n"
+            "· 下降超过 80% → 算丢失，连续命中「连续异常次数」就触发保护\n"
+            "留空（不启用）时按旧的单阈值行为处理"
+        )
+        guard_form.add(
+            "硬性丢失阈值", mark_compact(self.loss_hard_spin), key="loss_hard"
+        )
+
         self.auto_recover_check = QCheckBox("触发保护时自动退回启动前参数")
         self.auto_recover_check.setChecked(True)
         self.auto_recover_check.setToolTip(
@@ -513,9 +541,22 @@ class TuningPage(QWidget):
         self.reset_before_start_check.setChecked(False)
         self.reset_before_start_check.setToolTip(
             "勾选后，开始调束会先把参与变量经执行层写到“起始值”列（默认为范围中值）再寻优，"
-            "保证每次起点一致；不勾选则从设备当前值（可能是上次最优）开始。"
+            "保证每次起点一致；不勾选则从设备当前值（可能是上次最优）开始。\n"
+            "注意：启动前快照始终在复位**之前**记录，所以「恢复启动前参数」退回到的是"
+            "任务真正开始前的位置，而不是复位点。"
         )
         guard_form.add_full(self.reset_before_start_check)
+
+        self.max_invalid_spin = QSpinBox()
+        self.max_invalid_spin.setRange(1, 20)
+        self.max_invalid_spin.setValue(3)
+        self.max_invalid_spin.setToolTip(
+            "连续这么多轮没有产生有效测量（写入被拒 / 目标读不到）就停止任务。"
+            "它与束流保护分开计数：写入被拒是执行问题，不是束流丢失。"
+        )
+        guard_form.add(
+            "连续无效轮次上限", mark_compact(self.max_invalid_spin), key="max_invalid"
+        )
 
         self.finalize_pref = QComboBox()
         self.finalize_pref.addItem("不预设", "")
@@ -529,7 +570,7 @@ class TuningPage(QWidget):
         # 总开关联动子控件
         self._loss_protection_widgets = [
             self.loss_absolute_check, self.loss_absolute_spin,
-            self.loss_relative_spin, self.loss_strikes_spin,
+            self.loss_relative_spin, self.loss_hard_spin, self.loss_strikes_spin,
             self.auto_recover_check,
         ]
 
@@ -644,7 +685,8 @@ class TuningPage(QWidget):
         ):
             widget.toggled.connect(lambda _on: self._refresh_guard_summary())
         for widget in (
-            self.loss_absolute_spin, self.loss_relative_spin, self.loss_strikes_spin,
+            self.loss_absolute_spin, self.loss_relative_spin, self.loss_hard_spin,
+            self.loss_strikes_spin,
         ):
             widget.valueChanged.connect(lambda _value: self._refresh_guard_summary())
         self.loss_absolute_check.toggled.connect(
@@ -1543,6 +1585,8 @@ class TuningPage(QWidget):
             parts.append(f"绝对阈值 {self.loss_absolute_spin.value():g}")
         if self.loss_relative_spin.value() > 0:
             parts.append(f"相对损失 {self.loss_relative_spin.value():g}%")
+        if self.loss_hard_spin.value() > 0:
+            parts.append(f"硬性丢失 {self.loss_hard_spin.value():g}%（其间仅告警）")
         parts.append(f"连续 {self.loss_strikes_spin.value()} 次触发")
         parts.append("自动回退" if self.auto_recover_check.isChecked() else "仅告警")
         section.set_summary(" · ".join(parts))
@@ -1582,7 +1626,11 @@ class TuningPage(QWidget):
                 self.loss_absolute_spin.value() if self.loss_absolute_check.isChecked() else None
             ),
             "loss_relative": self.loss_relative_spin.value(),
+            "loss_relative_hard": (
+                self.loss_hard_spin.value() if self.loss_hard_spin.value() > 0 else None
+            ),
             "loss_strikes": self.loss_strikes_spin.value(),
+            "max_invalid_rounds": self.max_invalid_spin.value(),
             "auto_recover": self.auto_recover_check.isChecked(),
             "loss_protection": self.loss_protection_check.isChecked(),
             "reset_before_start": self.reset_before_start_check.isChecked(),
@@ -1674,6 +1722,7 @@ class TuningPage(QWidget):
             ("max_iterations", self.iterations_spin),
             ("samples_per_point", self.samples_spin),
             ("loss_strikes", self.loss_strikes_spin),
+            ("max_invalid_rounds", self.max_invalid_spin),
             ("seed", self.seed_spin),
             ("n_startup_trials", self.startup_spin),
             ("patience", self.patience_spin),
@@ -1693,6 +1742,9 @@ class TuningPage(QWidget):
         self.loss_absolute_check.setChecked(absolute is not None)
         if absolute is not None:
             self.loss_absolute_spin.setValue(float(absolute))
+        hard = config.get("loss_relative_hard")
+        # 0 = 不启用（specialValueText 显示"不启用"）
+        self.loss_hard_spin.setValue(0.0 if hard is None else float(hard))
         if config.get("auto_recover") is not None:
             self.auto_recover_check.setChecked(bool(config["auto_recover"]))
         if config.get("loss_protection") is not None:
@@ -1798,6 +1850,8 @@ class TuningPage(QWidget):
         self._last_seq = 0
         self._link_failures = 0
         self._last_success_monotonic = None
+        self._stale_iteration_fetches = 0
+        self._iteration_fetch_baseline = 0
         if hasattr(self, "link_note"):
             self.link_note.setVisible(False)
         if hasattr(self, "event_log_view"):
@@ -1852,7 +1906,14 @@ class TuningPage(QWidget):
                     else None
                 ),
                 "loss_relative": self.loss_relative_spin.value() / 100.0,
+                # 0 = 不启用硬阈值（服务端按旧的单阈值行为处理）
+                "loss_relative_hard": (
+                    self.loss_hard_spin.value() / 100.0
+                    if self.loss_hard_spin.value() > 0
+                    else None
+                ),
                 "loss_strikes": self.loss_strikes_spin.value(),
+                "max_invalid_rounds": self.max_invalid_spin.value(),
                 "loss_protection": self.loss_protection_check.isChecked(),
                 "stall_fraction": self.stall_fraction_form_spin.value() / 100.0,
                 "auto_recover": self.auto_recover_check.isChecked(),
@@ -2118,6 +2179,7 @@ class TuningPage(QWidget):
             return
         self._note_link_ok()
         body = payload.get("payload") or {}
+        self._last_seen_latest_seq = int(body.get("latest_seq") or 0)
         self._apply_status(body.get("status") or {})
         new_records = list(body.get("iterations") or [])
         if new_records:
@@ -2209,6 +2271,47 @@ class TuningPage(QWidget):
             f"{level:<5s} {phase:<8s} {where:<6s} {event.get('message', '')}"
         )
 
+    def _seconds_per_round(self) -> float:
+        """每轮耗时估计：**优先用实测中位耗时**，拿不到才退回静态公式。
+
+        静态公式（稳定超时 + 保持时间）把"超时上限"当成了"必然耗时"，
+        通常高估好几倍；跑起来之后没有任何理由继续用猜的。
+        """
+        measured = sorted(
+            float(item["duration_ms"]) / 1000.0
+            for item in self._iterations
+            if isinstance(item.get("duration_ms"), (int, float))
+            and float(item["duration_ms"]) > 0
+        )
+        if measured:
+            middle = len(measured) // 2
+            if len(measured) % 2:
+                return measured[middle]
+            return (measured[middle - 1] + measured[middle]) / 2.0
+        return (
+            self.settle_spin.value() + self.hold_spin.value()
+            + max(0, self.samples_spin.value() - 1) * 0.05
+        )
+
+    def _maybe_refresh_readbacks(self) -> None:
+        """运行中定时刷新变量回读（默认 2s）：结果页的"当前"列必须反映设备此刻位置。
+
+        旧实现只在载入映射/切目标时读一次，于是"当前"列停在启动前的值，
+        看起来像设备根本没动。
+        """
+        import time as _time
+
+        now = _time.monotonic()
+        if now - self._last_readback_at < 2.0:
+            return
+        self._last_readback_at = now
+        self._refresh_readbacks()
+
+    def _maybe_fetch_events(self) -> None:
+        """事件拉取的兜底：只在本地游标落后于服务端时再拉一次。"""
+        if self._last_seq < self._last_seen_latest_seq:
+            self._fetch_events()
+
     def _note_link_loss(self, reason: str) -> None:
         """轮询失败要说出来：断线时界面不能继续装作数据是实时的。"""
         self._link_failures += 1
@@ -2268,18 +2371,20 @@ class TuningPage(QWidget):
         self._snapshot_note = str(status.get("snapshot_note") or "")
         completed = int(status.get("completed_iterations") or 0)
         remaining = max(0, int(status.get("max_iterations") or 0) - completed)
-        remaining_s = remaining * (
-            self.settle_spin.value() + self.hold_spin.value()
-            + max(0, self.samples_spin.value() - 1) * 0.05
-        )
         self.eta_card.value_label.setText(
             "已结束" if self._state in TERMINAL_STATES
-            else self._format_duration(remaining_s).removeprefix("约 ")
+            else self._format_duration(remaining * self._seconds_per_round()).removeprefix("约 ")
         )
         self._last_completed = max(self._last_completed, completed)
         self.iteration_label.setText(
             f"已完成 {completed} / {status.get('max_iterations', 0)} 轮{self._stage_suffix(status)}"
         )
+        # 保护是否真的有效：服务端算好的结论直接展示，不让操作员从阈值反推
+        protection = status.get("protection_reasons")
+        if protection:
+            self._protection_reasons = [str(item) for item in protection]
+        if self._state not in TERMINAL_STATES:
+            self._maybe_refresh_readbacks()
         text = STATE_TEXT.get(self._state, self._state)
         message = status.get("message") or ""
         if message:
@@ -2437,7 +2542,13 @@ class TuningPage(QWidget):
         self.snapshot_label.setVisible(True)
 
     def _fetch_iterations(self) -> None:
-        """增量拉取：只有服务端 completed_iterations 比本地多才请求，防并发。"""
+        """增量拉取（老路径的兜底）：只在服务端轮数比本地多时请求，防并发。
+
+        这里加了一道"重拉守卫"：如果服务端的 ``completed_iterations`` 比实际能取回的
+        轮次记录多（例如服务重启后内存丢了、spool 里少几条），``local < completed``
+        会永远成立——旧实现会每 700ms 全量重拉一次，白刷一整天。连续几次拉不到新数据
+        就停下来，并把原因写进结果摘要，而不是继续无声地请求。
+        """
         if not self._run_id:
             return
         if getattr(self, "_iterations_in_flight", False):
@@ -2446,7 +2557,10 @@ class TuningPage(QWidget):
         local = len(self._iterations)
         if local >= completed:
             return
+        if getattr(self, "_stale_iteration_fetches", 0) >= 3:
+            return
         self._iterations_in_flight = True
+        self._iteration_fetch_baseline = local
         thread = instrument_api.request_tuning_iterations(self._run_id)
         thread.completed.connect(self._on_iterations)
 
@@ -2458,6 +2572,15 @@ class TuningPage(QWidget):
             (payload.get("payload") or {}).get("iterations") or []
         )
         self._last_completed = len(self._iterations)
+        if len(self._iterations) <= getattr(self, "_iteration_fetch_baseline", 0):
+            self._stale_iteration_fetches = getattr(self, "_stale_iteration_fetches", 0) + 1
+            if self._stale_iteration_fetches == 3:
+                self._set_response_note(
+                    "轮次记录与服务端的计数对不上（服务端报的轮数多于可取回的记录）："
+                    "已停止重复拉取，界面显示的是实际拿到的轮次"
+                )
+        else:
+            self._stale_iteration_fetches = 0
         self._refresh_iteration_views()
 
     def _fill_recent_iterations(self) -> None:
@@ -3571,12 +3694,59 @@ class TuningPage(QWidget):
             button.setEnabled(False)
 
     # ------------------------------------------------------------------
+    # 认领在跑的任务（客户端重启后仍能看到并停止它）
+    # ------------------------------------------------------------------
+    def _adopt_active_run(self) -> None:
+        """查一次任务列表；发现非终态任务就接管（含启动轮询与停止入口）。
+
+        不接管会怎样：客户端重启后 `_run_id` 为空，界面显示"尚未开始"，
+        而设备正被一个看不见的任务写着——既没有进度也没有停止按钮。
+        """
+        if self._run_id is not None or self._adopt_attempted:
+            return
+        if not hasattr(instrument_api, "request_tuning_runs"):
+            return
+        self._adopt_attempted = True
+        try:
+            thread = instrument_api.request_tuning_runs()
+            thread.completed.connect(self._on_runs_listed)
+        except Exception:  # noqa: BLE001 —— 认领失败不该影响页面本身
+            return
+
+    def _on_runs_listed(self, payload: dict) -> None:
+        if not payload.get("ok"):
+            return
+        runs = list((payload.get("payload") or {}).get("runs") or [])
+        active = next(
+            (run for run in runs if str(run.get("state")) not in TERMINAL_STATES),
+            None,
+        )
+        if active is None:
+            return
+        self._run_id = str(active.get("run_id"))
+        self._state = str(active.get("state") or "running")
+        self.tabs.setTabEnabled(1, True)
+        self.tabs.setTabEnabled(2, True)
+        self.tabs.setCurrentIndex(1)
+        self.tuning_pause_button.setEnabled(True)
+        self.tuning_stop_button.setEnabled(True)
+        self.tuning_state.setText(
+            f"{STATE_TEXT.get(self._state, self._state)} · 由其它会话启动，本界面已接管"
+        )
+        self.start_button.setEnabled(False)
+        # 立刻补齐一次状态、轮次与事件，界面不会停在"尚未开始"
+        self._poll()
+        self._timer.start()
+
+    # ------------------------------------------------------------------
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
         self._apply_read_only()
         if self.is_operation_active():
             self._poll()
             self._timer.start()
+        else:
+            self._adopt_active_run()
 
     def hideEvent(self, event) -> None:  # noqa: N802
         super().hideEvent(event)
