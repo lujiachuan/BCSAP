@@ -63,7 +63,11 @@ ALLOWED_TRANSITIONS: dict[TuningState, frozenset[TuningState]] = {
     TuningState.FAILED: frozenset({TuningState.RECOVERY_REQUIRED}),
     TuningState.COMPLETED: frozenset(),
     TuningState.ABORTED: frozenset(),
-    TuningState.RECOVERY_REQUIRED: frozenset(),
+    # 「需人工确认」不是死路：操作员现场确认设备状态后，允许**带着新的实际回读**
+    # 重新回到 RUNNING 继续调（服务端会先重读全部变量建立新的地面真值，
+    # 并把这次确认与重读结果写进事件流；设备组被占用时拒绝继续）。
+    # 只有显式的 acknowledge(resume=True) 会走这条边——不会自动发生。
+    TuningState.RECOVERY_REQUIRED: frozenset({TuningState.RUNNING}),
 }
 
 

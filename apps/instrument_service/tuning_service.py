@@ -122,6 +122,10 @@ def build_optimizer(
 # 单次毛刺，不需要按设备稳定时间去等。
 TARGET_SAMPLE_INTERVAL_S = 0.05
 
+# 写入报错后、准备重试同一个目标值之前的退避时间（秒）。
+# 命令行网关的瞬时超时多来自"起进程 + 建 CA 连接"这一步慢，隔一下再试比立刻重试有效。
+WRITE_RETRY_BACKOFF_S = 0.3
+
 # 启动前快照的读取重试：冷启动时 CA 的**第一次**访问要建连，可能失败一次。
 # 这与扫谱的连接探测是同一个道理——把一次握手失败当成"读不到"，会让任务在
 # 冷启动时白拒一次（实测踩到过：紧接着手工读同一路是好的）。
@@ -1448,6 +1452,122 @@ class TuningService:
             self._propose_next(run)
         return self.status(run_id)
 
+    def _write_with_confirmation(
+        self,
+        run: _Run,
+        entry,
+        signal: str,
+        target: float,
+        *,
+        iteration: int | None = None,
+        tol: float | None = None,
+    ) -> tuple[str, float | None, str, float, int]:
+        """写一路，并在**写入报错时用回读判断"能不能安全重试"**。
+
+        返回 ``(status, actual, detail, seconds, ramp_steps)``，status 取值：
+
+        * ``"ok"``：写入被接受，或写入报错但回读已经在容差内（响应丢了、值其实写进去了）；
+        * ``"rejected"``：写入没成功，但**确认设备仍停在原值**——状态是清楚的，
+          这一路按"写入被拒"处理，任务可以继续（由连续无效轮次守卫兜底）；
+        * ``"unknown"``：回读既不是原值也不是目标，或根本读不到——**设备状态未知**，
+          必须停下并保留设备锁交人工确认（旧行为）。
+
+        为什么值得这么做：命令行网关每次操作都要起一个进程 + 建 CA 连接，
+        68 轮下来上千次调用，偶尔一次连接慢就会撞上 3 秒超时。旧实现把这种
+        **瞬时超时**直接升级成"设备状态未知、任务终止"，现场表现为"跑了一小时
+        突然停了，参数还锁着"。有回读判据之后，绝大多数瞬时抖动可以在原地消化掉，
+        而真正的不确定（值变了但不知道变成什么）仍然坚决停下来。
+        """
+        attempts = max(1, int(getattr(run.request, "write_retries", 0) or 0) + 1)
+        tolerance = tol if tol is not None else (entry.settle_tol or 0.0)
+        last_reason = "写入未成功"
+        spent = 0.0
+        for attempt in range(attempts):
+            started = time.monotonic()
+            result = self._signals.write(
+                SignalWriteRequest(signal=signal, value=float(target), ramp=True)
+            )
+            elapsed = time.monotonic() - started
+            spent += elapsed
+            if result.accepted:
+                return (
+                    "ok",
+                    float(result.applied) if result.applied is not None else float(target),
+                    "",
+                    spent,
+                    len(result.ramp_steps or []),
+                )
+
+            last_reason = str(result.reason or "写入未成功")
+            steps = len(result.ramp_steps or [])
+            previous = result.previous
+            actual = self._signals.readback(entry)
+            if actual is not None and tolerance > 0 and abs(actual - float(target)) <= tolerance:
+                self._emit(
+                    run,
+                    f"{entry.label} 写入报错但回读已在目标容差内（{float(actual):g}）："
+                    "判定为响应丢失、实际已生效，按成功处理",
+                    level=LEVEL_WARN,
+                    phase=PHASE_WRITING,
+                    iteration=iteration,
+                    signal=signal,
+                    target=float(target),
+                    readback=float(actual),
+                    write_error=last_reason,
+                )
+                return "ok", float(actual), last_reason, spent, steps
+            if actual is None:
+                self._emit(
+                    run,
+                    f"{entry.label} 写入报错且回读读不到：设备状态未知，不再重试",
+                    level=LEVEL_ERROR,
+                    phase=PHASE_WRITING,
+                    iteration=iteration,
+                    signal=signal,
+                    write_error=last_reason,
+                )
+                return "unknown", None, last_reason, spent, steps
+            unchanged = previous is not None and abs(float(actual) - float(previous)) <= max(
+                tolerance, 1e-9
+            )
+            if not unchanged:
+                self._emit(
+                    run,
+                    f"{entry.label} 写入报错，且回读既不是原值({previous})也不是目标"
+                    f"（当前 {float(actual):g}）：设备状态未知，不再重试",
+                    level=LEVEL_ERROR,
+                    phase=PHASE_WRITING,
+                    iteration=iteration,
+                    signal=signal,
+                    write_error=last_reason,
+                    readback=float(actual),
+                )
+                return "unknown", float(actual), last_reason, spent, steps
+            if attempt + 1 < attempts:
+                self._emit(
+                    run,
+                    f"{entry.label} 写入报错（{last_reason}），但回读仍为原值 "
+                    f"{float(actual):g}：设备未动，重试 {attempt + 1}/{attempts - 1}",
+                    level=LEVEL_WARN,
+                    phase=PHASE_WRITING,
+                    iteration=iteration,
+                    signal=signal,
+                    write_error=last_reason,
+                    attempt=attempt + 1,
+                )
+                self._sleep(WRITE_RETRY_BACKOFF_S)
+        self._emit(
+            run,
+            f"{entry.label} 重试 {attempts - 1} 次仍未成功（{last_reason}），"
+            "设备确认停在原位：本轮按写入未生效处理",
+            level=LEVEL_WARN,
+            phase=PHASE_WRITING,
+            iteration=iteration,
+            signal=signal,
+            write_error=last_reason,
+        )
+        return "rejected", float(target), last_reason, spent, steps
+
     def _guard_reason(
         self, run: _Run, proposal: TuningProposal, iteration: TuningIteration
     ) -> str | None:
@@ -1566,16 +1686,15 @@ class TuningService:
                 problems.append(f"{signal} 没有目标值")
                 continue
             entry = self._entry(signal)
-            result = self._signals.write(
-                SignalWriteRequest(signal=signal, value=float(want), ramp=True)
+            # 保护性写入同样走"回读确认 + 有限重试"：回退/收尾是最不能半途而废的动作，
+            # 一次瞬时超时就把"退不回去"报到人工面前，代价比多试两次高得多。
+            (
+                status, actual_value, write_error, _spent, ramp_steps,
+            ) = self._write_with_confirmation(
+                run, entry, signal, float(want), tol=run.request.settle_tol
             )
-            if not result.accepted:
-                problems.append(f"{entry.label} 写入被拒：{result.reason}")
-                self._emit(
-                    run, f"保护性写入被拒：{entry.label}（{result.reason}）",
-                    level=LEVEL_ERROR, phase=PHASE_WRITING, signal=signal,
-                    target=float(want), reason=result.reason,
-                )
+            if status != "ok":
+                problems.append(f"{entry.label} 写入未生效：{write_error}")
                 continue
             settled, actual = self._signals.wait_settled(
                 entry,
@@ -1592,8 +1711,9 @@ class TuningService:
             self._emit(
                 run,
                 (
-                    f"保护性写入 {entry.label} = {float(want):g}，回读 "
-                    f"{applied.get(signal, float('nan')):g}"
+                    f"保护性写入 {entry.label} = {float(want):g}"
+                    + (f"（斜坡 {ramp_steps} 步）" if ramp_steps > 1 else "")
+                    + f"，回读 {applied.get(signal, float('nan')):g}"
                     if settled
                     else f"保护性写入 {entry.label} 后未进入容差（当前 {actual}）"
                 ),
@@ -1851,23 +1971,37 @@ class TuningService:
                     )
                 continue
             target_value = proposal.values[variable.signal]
-            write_started = time.monotonic()
-            result = self._signals.write(
-                SignalWriteRequest(signal=variable.signal, value=target_value, ramp=True)
+            (
+                status, actual_value, write_error, write_elapsed, ramp_steps,
+            ) = self._write_with_confirmation(
+                run,
+                entry,
+                variable.signal,
+                float(target_value),
+                iteration=proposal.iteration,
+                tol=request.settle_tol,
             )
-            write_elapsed = time.monotonic() - write_started
             write_s += write_elapsed
-            steps = len(result.ramp_steps or [])
-            if not result.accepted:
+            if status != "ok":
+                unknown = status == "unknown"
+                detail = (
+                    f"{entry.label} 写入未生效（{write_error}）"
+                    + (
+                        "，且设备状态未知"
+                        if unknown
+                        else "，已回读确认设备停在原位"
+                    )
+                )
                 self._emit(
                     run,
-                    f"{entry.label} 写入被拒：{result.reason}",
-                    level=LEVEL_ERROR,
+                    detail,
+                    level=LEVEL_ERROR if unknown else LEVEL_WARN,
                     phase=PHASE_WRITING,
                     iteration=proposal.iteration,
                     signal=variable.signal,
                     target=float(target_value),
-                    reason=result.reason,
+                    reason=write_error,
+                    device_state_unknown=unknown,
                 )
                 return (
                     TuningIteration(
@@ -1878,7 +2012,7 @@ class TuningService:
                         target=None,
                         objective=None,
                         quality="write_rejected",
-                        detail=f"{entry.label} 写入被拒：{result.reason}",
+                        detail=detail,
                         at=_now(),
                         stage=proposal.stage,
                         proposed_at=proposed_at,
@@ -1889,30 +2023,26 @@ class TuningService:
                         settle_s=round(settle_s, 3),
                         measure_s=round(measure_s, 3),
                     ),
-                    result.device_state_unknown,
+                    unknown,
                 )
             applied[variable.signal] = float(
-                result.applied if result.applied is not None else target_value
+                actual_value if actual_value is not None else target_value
             )
             self._emit(
                 run,
                 f"写入 {entry.label} = {applied[variable.signal]:g} {entry.unit}"
                 + (
-                    f"（斜坡 {steps} 步，耗时 {write_elapsed:.2f}s）"
-                    if steps > 1
+                    f"（斜坡 {ramp_steps} 步，耗时 {write_elapsed:.2f}s）"
+                    if ramp_steps > 1
                     else f"（单步写入，耗时 {write_elapsed:.2f}s）"
                 )
-                + (
-                    f"（执行层实际下发 {float(result.applied):g}）"
-                    if result.applied is not None
-                    and abs(float(result.applied) - float(target_value)) > 1e-9
-                    else ""
-                ),
+                + (f"，{write_error}" if write_error else ""),
                 phase=PHASE_WRITING,
                 iteration=proposal.iteration,
                 signal=variable.signal,
                 target=float(target_value),
                 applied=applied[variable.signal],
+                write_s=round(write_elapsed, 3),
             )
             settle_started = time.monotonic()
             settled, actual = self._signals.wait_settled(
@@ -2174,19 +2304,103 @@ class TuningService:
         )
         self._persist_state(run)
 
-    def acknowledge_recovery(self, run_id: str, note: str = "") -> TuningRunStatus:
-        """人工确认设备状态后释放恢复锁。"""
+    def acknowledge_recovery(
+        self, run_id: str, note: str = "", *, resume: bool = False
+    ) -> TuningRunStatus:
+        """人工确认设备状态：释放恢复锁；``resume=True`` 时**带着新的实际回读继续调束**。
+
+        为什么要有 ``resume``：旧实现只释放设备锁，任务停在终态——现场表现为
+        "跑了一小时突然停了，确认完发现不会继续，只能重开一轮"。
+        继续的前提是**先把地面真值重新建立起来**，所以顺序是：
+
+        1. 重新申请设备组（结束后锁已交还，别人可能正在用；占用则拒绝继续）；
+        2. 逐路重读参与变量（带重试）——任一路读不到就**拒绝继续**并保持"需人工确认"，
+           不知道设备在哪就继续调，等于拿旧认知写新设备；
+        3. 用新回读更新"保持值"起点、清零异常计数与停止标记；
+           **启动前快照不动**——它是回退锚点，不能被现场值覆盖；
+        4. 回到 RUNNING，按模式继续：auto 交回驱动线程；confirm 重新提候选等确认。
+
+        被打断的那一轮**没有记录**（写入未确认就不落库），事件流里保留了它的候选值，
+        事后能对上账。
+        """
         run = self._require(run_id)
+        groups = set(run.locked_groups)
+        owner = run.run_id
         with self._lock:
             if run.state != TuningState.RECOVERY_REQUIRED:
                 raise TuningError(f"任务不处于恢复待确认状态：{run.state}")
-            self._locks.release(owner=run.run_id)
-            suffix = f"（已人工确认：{note}）" if note else "（已人工确认）"
-            run.message = run.message + suffix
+            if resume and run.stopped:
+                raise TuningError("任务已收到过停止请求，不能继续；请按「确认并停止」处理")
+        if not resume:
+            with self._lock:
+                self._locks.release(owner=owner)
+                suffix = f"（已人工确认：{note}）" if note else "（已人工确认）"
+                run.message = run.message + suffix
+            self._emit(
+                run, f"操作员已确认设备状态{suffix}，设备锁已释放（任务保持终止）",
+                note=note or None,
+            )
+            self._persist_state(run)
+            return self.status(run_id)
+
+        # ---- 继续：先建立新的地面真值，再恢复运行 ----
+        try:
+            self._locks.acquire(groups, owner=owner)
+        except DeviceBusy as exc:
+            raise TuningError(f"设备组当前不可用，无法继续调束：{exc}") from exc
+        fresh: dict[str, float] = {}
+        missing: list[str] = []
+        for variable in run.request.enabled_variables():
+            entry = self._entry(variable.signal)
+            value = self._read_with_retry(lambda e=entry: self._signals.readback(e))
+            if value is None:
+                missing.append(entry.label)
+                continue
+            fresh[variable.signal] = float(value)
+        if missing:
+            self._locks.release(owner=owner)
+            raise TuningError(
+                "以下参数仍然读不到实际回读，无法确认设备状态，不能继续："
+                + "、".join(missing)
+                + "。请先排除读取故障，再重新确认。"
+            )
+        baseline_now = self._read_with_retry(
+            lambda: self._signals.read_value(run.request.target_signal)
+        )
+        with self._lock:
+            run.held_values.update(fresh)
+            run.anomalies = 0
+            run.invalid_streak = 0
+            run.stopped = False
+            run.finished_at = None
+            run.phase = PHASE_IDLE
+            self._to(run, TuningState.RUNNING, "操作员确认设备状态后继续调束")
         self._emit(
-            run, f"操作员已确认设备状态{suffix}，设备锁已释放", note=note or None,
+            run,
+            "操作员确认设备状态（"
+            + (note or "无备注")
+            + "）→ 已重读全部参与变量建立新起点："
+            + "、".join(f"{signal}={value:g}" for signal, value in sorted(fresh.items()))
+            + (
+                f"；当前目标 {float(baseline_now):g}"
+                if baseline_now is not None
+                else "；当前目标读不到"
+            )
+            + "。启动前快照保持不变（仍是回退锚点）；被中断的那一轮没有记录，"
+            "将从当前实际位置重新提候选。",
+            level=LEVEL_WARN,
+            phase=PHASE_IDLE,
+            note=note or None,
+            snapshot=fresh,
+            target_now=None if baseline_now is None else float(baseline_now),
         )
         self._persist_state(run)
+        if run.request.mode == MODE_AUTO:
+            self._spawn_auto_driver(run)
+            return self.status(run_id)
+        with self._lock:
+            run.pending = None  # 被中断的候选不复活：从当前实际位置重新提
+        self._propose_next(run)
         return self.status(run_id)
 
     # ------------------------------------------------------------------

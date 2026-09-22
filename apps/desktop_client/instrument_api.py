@@ -344,11 +344,23 @@ def request_tuning_resume(run_id: str, base_url: str | None = None):
     )
 
 
-def request_tuning_acknowledge(run_id: str, note: str = "", base_url: str | None = None):
-    suffix = f"?note={urllib.parse.quote(note)}" if note else ""
+def request_tuning_acknowledge(
+    run_id: str, note: str = "", *, resume: bool = False, base_url: str | None = None
+):
+    """确认设备状态。
+
+    ``resume=True``：由服务端逐路重读参与变量建立新的地面真值后**继续调束**
+    （读不到就拒绝继续）；默认只释放设备锁、任务保持终止。
+    """
+    params = []
+    if note:
+        params.append(f"note={urllib.parse.quote(note)}")
+    if resume:
+        params.append("resume=true")
+    suffix = f"?{'&'.join(params)}" if params else ""
     return _post(
         f"{TUNING_RUNS_PATH}/{run_id}/acknowledge{suffix}", {}, base_url,
-        timeout=SCAN_START_TIMEOUT_S,
+        timeout=TUNING_APPLY_TIMEOUT_S,
     )
 
 

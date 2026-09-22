@@ -220,6 +220,98 @@ class TuningClientFixTests(unittest.TestCase):
 
         self.assertEqual(stub.call_count, 1)
 
+    # ---------------------------------------------------------- 写入中断与继续
+    def test_recovery_state_offers_both_resume_and_stop(self) -> None:
+        """写入中断后必须给出两个出口：继续（重读现场）或确认并停止。"""
+        page = self.make_page(run_id="run-1")
+
+        page._apply_status({"state": "recovery_required", "message": "写入中断"})
+
+        self.assertFalse(page.acknowledge_button.isHidden())
+        self.assertFalse(page.acknowledge_stop_button.isHidden())
+        self.assertIn("继续", page.acknowledge_button.text())
+        self.assertIn("停止", page.acknowledge_stop_button.text())
+
+    def test_recovery_explanation_is_shown_without_a_rollback_record(self) -> None:
+        """没有回退记录（写入中断）时也要说清"为什么停、下一步点哪里"。"""
+        page = self.make_page(run_id="run-1")
+
+        page._apply_status(
+            {"state": "recovery_required", "message": "写入中断，设备状态未知"}
+        )
+
+        text = page.recovery_label.text()
+        self.assertIn("设备实际状态未知", text)
+        self.assertIn("确认设备状态并继续", text)
+        self.assertIn("确认并停止", text)
+        self.assertEqual(page.recovery_label.property("state"), "error")
+
+    def test_resume_acknowledge_sends_resume_flag_and_restarts_polling(self) -> None:
+        page = self.make_page(run_id="run-1")
+        captured: dict = {}
+
+        def fake_ack(run_id, note="", *, resume=False, base_url=None):  # noqa: ANN001
+            captured.update({"run_id": run_id, "note": note, "resume": resume})
+            return _FakeThread()
+
+        with mock.patch.object(instrument_api, "request_tuning_acknowledge", fake_ack):
+            page._acknowledge(resume=True)
+
+        self.assertTrue(captured["resume"])
+        self.assertEqual(captured["run_id"], "run-1")
+
+        with mock.patch.object(page, "_poll") as poll:
+            page._on_acknowledged(
+                {"ok": True, "payload": {"state": "running", "completed_iterations": 3}}
+            )
+        poll.assert_called_once()
+        self.assertTrue(page._timer.isActive())
+        page._timer.stop()
+
+    def test_stop_acknowledge_does_not_send_resume(self) -> None:
+        page = self.make_page(run_id="run-1")
+        captured: dict = {}
+
+        def fake_ack(run_id, note="", *, resume=False, base_url=None):  # noqa: ANN001
+            captured.update({"resume": resume})
+            return _FakeThread()
+
+        with mock.patch.object(instrument_api, "request_tuning_acknowledge", fake_ack):
+            page._acknowledge(resume=False)
+
+        self.assertFalse(captured["resume"])
+
+    def test_failed_acknowledge_is_reported_not_faked(self) -> None:
+        """服务端拒绝继续（例如仍有回读读不到）时不能假装已经继续了。"""
+        page = self.make_page(run_id="run-1")
+        with mock.patch.object(page, "_poll") as poll:
+            page._on_acknowledged({"ok": False, "message": "以下参数仍然读不到实际回读"})
+
+        self.assertIn("确认未生效", page.recovery_label.text())
+        self.assertIn("仍然读不到实际回读", page.recovery_label.text())
+        self.assertEqual(page.recovery_label.property("state"), "warn")
+        poll.assert_not_called()
+
+    def test_write_retries_is_sent_and_round_trips(self) -> None:
+        page = self.make_page()
+        page._rows[0]["check"].setCheckState(Qt.CheckState.Checked)
+        page.write_retries_spin.setValue(4)
+        captured: dict = {}
+
+        def fake_start(request: dict, base_url=None):  # noqa: ANN001
+            captured.update(request)
+            return _FakeThread()
+
+        with mock.patch.object(instrument_api, "request_tuning_start", fake_start):
+            page.start_tuning()
+
+        self.assertEqual(captured["write_retries"], 4)
+        payload = page.tuning_config_payload()
+        self.assertEqual(payload["write_retries"], 4)
+        page.write_retries_spin.setValue(0)
+        page._apply_tuning_config(payload)
+        self.assertEqual(page.write_retries_spin.value(), 4)
+
 
 if __name__ == "__main__":
     unittest.main()

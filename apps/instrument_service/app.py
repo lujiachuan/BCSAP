@@ -481,12 +481,21 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
     @app.post(
         "/control/v1/tuning/runs/{run_id}/acknowledge", response_model=TuningRunStatus
     )
-    def post_tuning_acknowledge(run_id: str, note: str = "") -> TuningRunStatus:
-        """人工确认设备状态后释放恢复锁（与扫谱同义）。"""
+    def post_tuning_acknowledge(
+        run_id: str, note: str = "", resume: bool = False
+    ) -> TuningRunStatus:
+        """人工确认设备状态。
+
+        ``resume=false``（默认）：只释放设备锁，任务保持终止；
+        ``resume=true``：先逐路重读参与变量建立新的地面真值（读不到就拒绝继续），
+        再回到 RUNNING 继续调束——被打断的那一轮没有记录，将从当前实际位置重新提候选。
+        """
         try:
-            return state.tuning.acknowledge_recovery(run_id, note)
+            return state.tuning.acknowledge_recovery(run_id, note, resume=resume)
         except TuningError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            detail = str(exc)
+            code = 409 if "设备组当前不可用" in detail else 400
+            raise HTTPException(status_code=code, detail=detail) from exc
 
     @app.post(
         "/control/v1/tuning/runs/{run_id}/finalize",

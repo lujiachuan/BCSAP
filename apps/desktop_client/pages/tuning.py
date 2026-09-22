@@ -558,6 +558,21 @@ class TuningPage(QWidget):
             "连续无效轮次上限", mark_compact(self.max_invalid_spin), key="max_invalid"
         )
 
+        # 写入重试（默认 2 次）：只在**回读确认设备仍停在原值**时才重试同一个目标，
+        # 因此不会把"可能已经写进去了"的一步重复下发；回读读不到或值变了仍按状态未知停下。
+        self.write_retries_spin = QSpinBox()
+        self.write_retries_spin.setRange(0, 5)
+        self.write_retries_spin.setValue(2)
+        self.write_retries_spin.setToolTip(
+            "写入报错（例如 EPICS 命令超时）后最多再试几次。\n"
+            "每次都会先回读确认：设备仍停在原值才重试（重写同一值是幂等的）；"
+            "若回读已在目标值内，按成功处理；若读不到或值变了，一律按「设备状态未知」停下。\n"
+            "0 = 不重试（一次超时就停下等人工确认）"
+        )
+        guard_form.add(
+            "写入重试次数", mark_compact(self.write_retries_spin), key="write_retries"
+        )
+
         self.finalize_pref = QComboBox()
         self.finalize_pref.addItem("不预设", "")
         for action, label in FINALIZE_LABELS.items():
@@ -829,9 +844,21 @@ class TuningPage(QWidget):
         row.setSpacing(10)
         self.tuning_state = QLabel("尚未开始")
         self.iteration_label = QLabel("已完成 0 轮", objectName="mutedText")
-        self.acknowledge_button = QPushButton("确认设备状态")
+        self.acknowledge_button = QPushButton("确认设备状态并继续")
+        self.acknowledge_button.setToolTip(
+            "先由执行服务重读各路实际回读（建立新的起点），再从当前实际位置继续调束；"
+            "任何一路读不到都会拒绝继续。被打断的那一轮没有记录，会重新提候选。"
+        )
         self.acknowledge_button.setVisible(False)
-        self.acknowledge_button.clicked.connect(self._acknowledge)
+        self.acknowledge_button.clicked.connect(lambda: self._acknowledge(resume=True))
+        self.acknowledge_stop_button = QPushButton("确认并停止")
+        self.acknowledge_stop_button.setToolTip(
+            "确认设备状态、释放设备锁，任务保持终止（不再继续调束）"
+        )
+        self.acknowledge_stop_button.setVisible(False)
+        self.acknowledge_stop_button.clicked.connect(
+            lambda: self._acknowledge(resume=False)
+        )
         self.tuning_pause_button = QPushButton("暂停")
         self.tuning_pause_button.setEnabled(False)
         self.tuning_pause_button.setToolTip("不在写设备时暂停任务，参数保持现状")
@@ -851,6 +878,7 @@ class TuningPage(QWidget):
         row.addWidget(self.link_note)
         row.addStretch()
         row.addWidget(self.acknowledge_button)
+        row.addWidget(self.acknowledge_stop_button)
         row.addWidget(self.tuning_pause_button)
         row.addWidget(self.tuning_resume_button)
         row.addWidget(self.tuning_stop_button)
@@ -1636,6 +1664,7 @@ class TuningPage(QWidget):
             ),
             "loss_strikes": self.loss_strikes_spin.value(),
             "max_invalid_rounds": self.max_invalid_spin.value(),
+            "write_retries": self.write_retries_spin.value(),
             "auto_recover": self.auto_recover_check.isChecked(),
             "loss_protection": self.loss_protection_check.isChecked(),
             "reset_before_start": self.reset_before_start_check.isChecked(),
@@ -1728,6 +1757,7 @@ class TuningPage(QWidget):
             ("samples_per_point", self.samples_spin),
             ("loss_strikes", self.loss_strikes_spin),
             ("max_invalid_rounds", self.max_invalid_spin),
+            ("write_retries", self.write_retries_spin),
             ("seed", self.seed_spin),
             ("n_startup_trials", self.startup_spin),
             ("patience", self.patience_spin),
@@ -1919,6 +1949,7 @@ class TuningPage(QWidget):
                 ),
                 "loss_strikes": self.loss_strikes_spin.value(),
                 "max_invalid_rounds": self.max_invalid_spin.value(),
+                "write_retries": self.write_retries_spin.value(),
                 "loss_protection": self.loss_protection_check.isChecked(),
                 "stall_fraction": self.stall_fraction_form_spin.value() / 100.0,
                 "auto_recover": self.auto_recover_check.isChecked(),
@@ -2038,13 +2069,49 @@ class TuningPage(QWidget):
         self.tuning_stop_button.setEnabled(False)
         instrument_api.request_tuning_stop(self._run_id)
 
-    def _acknowledge(self) -> None:
+    def _acknowledge(self, resume: bool = True) -> None:
+        """操作员确认设备状态：``resume=True`` 让服务端重读现场后继续调束。"""
         if not self._run_id:
             return
+        self.acknowledge_button.setEnabled(False)
+        self.acknowledge_stop_button.setEnabled(False)
         thread = instrument_api.request_tuning_acknowledge(
-            self._run_id, note="操作员在界面确认"
+            self._run_id, note="操作员在界面确认", resume=resume
         )
-        thread.completed.connect(lambda _p: self.acknowledge_button.setVisible(False))
+        thread.completed.connect(self._on_acknowledged)
+
+    def _on_acknowledged(self, payload: dict) -> None:
+        self.acknowledge_button.setEnabled(True)
+        self.acknowledge_stop_button.setEnabled(True)
+        if not payload.get("ok"):
+            # 读不到回读 / 设备组被占用都会走到这里：原样转述，绝不假装继续了
+            self._set_recovery_note(
+                "⚠ 确认未生效："
+                + str(payload.get("message") or "原因未返回")
+                + "；任务仍处于「需人工确认设备状态」，请处理后重试。",
+                "warn",
+            )
+            return
+        status = payload.get("payload") or {}
+        self._apply_status(status)
+        if str(status.get("state")) not in TERMINAL_STATES:
+            # 已经回到运行/待确认：恢复轮询，界面立刻接上
+            self._set_recovery_note(
+                "✅ 已确认设备状态：执行服务重读各路回读后从当前位置继续调束", "good"
+            )
+            self._poll()
+            self._timer.start()
+        else:
+            self.acknowledge_button.setVisible(False)
+            self.acknowledge_stop_button.setVisible(False)
+
+    def _set_recovery_note(self, text: str, state: str) -> None:
+        """把人工介入的结论写到监控页那条提示上（页面没有 toast 通道）。"""
+        self.recovery_label.setText(text)
+        self.recovery_label.setProperty("state", state)
+        self.recovery_label.style().unpolish(self.recovery_label)
+        self.recovery_label.style().polish(self.recovery_label)
+        self.recovery_label.setVisible(True)
 
     # ------------------------------------------------------------------
     # 结束后的设备处置
@@ -2446,7 +2513,12 @@ class TuningPage(QWidget):
         self.tuning_resume_button.setVisible(self._state == "paused")
 
         if self._state == "recovery_required":
+            # 两个出口都摆出来：继续（重读现场后接着调）/ 确认并停止
             self.acknowledge_button.setVisible(True)
+            self.acknowledge_stop_button.setVisible(True)
+        else:
+            self.acknowledge_button.setVisible(False)
+            self.acknowledge_stop_button.setVisible(False)
 
         if self._state in TERMINAL_STATES:
             self._timer.stop()
@@ -2510,6 +2582,22 @@ class TuningPage(QWidget):
         """
         recovery = self._recovery
         if not recovery:
+            # 没有回退记录、但停在"需人工确认"：这是**写入中断**（例如 EPICS 命令超时）。
+            # 界面必须把"为什么停、现在设备在哪不确定、下一步点哪里"说清楚，
+            # 否则现场只会看到一句"需人工确认设备状态"然后干等。
+            if self._state == "recovery_required":
+                self.recovery_label.setText(
+                    "⚠ 写入中断，设备实际状态未知，任务已暂停等人工确认："
+                    + (self.tuning_state.text() or "")
+                    + "。请先在设备侧确认这一路参数的实际位置，然后选"
+                    "「确认设备状态并继续」（执行服务会逐路重读、建立新起点后继续调束）"
+                    "或「确认并停止」（释放设备锁、任务结束）。"
+                )
+                self.recovery_label.setProperty("state", "error")
+                self.recovery_label.style().unpolish(self.recovery_label)
+                self.recovery_label.style().polish(self.recovery_label)
+                self.recovery_label.setVisible(True)
+                return
             self.recovery_label.setVisible(False)
             return
         restored = recovery.get("restored") or {}

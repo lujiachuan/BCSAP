@@ -39,6 +39,7 @@ _NUMERIC_FIELDS: dict[str, str] = {
     "loss_relative_hard": "硬性丢失阈值",
     "loss_strikes": "连续异常次数",
     "max_invalid_rounds": "连续无效轮次上限",
+    "write_retries": "写入重试次数",
     "stall_fraction": "停滞阈值",
     "seed": "随机种子",
     "n_startup_trials": "随机探索轮次",
