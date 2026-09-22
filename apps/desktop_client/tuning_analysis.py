@@ -198,28 +198,68 @@ def log_lines(
     *,
     target_signal: str = "",
     advice_lines: Sequence[str] = (),
+    timestamps: bool = False,
 ) -> list[str]:
     """调束日志：一轮一行（阶段 → 建议 → 下发 → 回读 → 目标）。
 
     文案照原 demo 的日志区（"建议 → 写入 → 回读 → 目标电流"）：事后复盘时，
     这四列必须都能看到，只有建议值看不出设备到底动了多少。
+
+    ``timestamps=True`` 时每行前缀 ``[HH:MM:SS.mmm]``（本地时区，来自轮次记录的
+    ``at``），并在能拿到时补上本轮耗时与采样离散度——"这一轮为什么花了 40 秒"
+    没有时间戳就只能靠猜。时间戳缺失时如实写 ``--:--:--.---``，不编造。
     """
     lines: list[str] = []
     for record in iterations:
         objective = _objective(record)
+        prefix = f"[{format_local_time(record.get('at'))}] " if timestamps else ""
         lines.append(
-            f"[第 {int(record.get('iteration', 0)) + 1} 轮·{stage_of(record)}] "
+            prefix
+            + f"[第 {int(record.get('iteration', 0)) + 1} 轮·{stage_of(record)}] "
             f"建议 {_pairs(record.get('proposed') or {})} → "
             f"下发 {_pairs(record.get('applied') or {})} → "
             f"回读 {_pairs(record.get('readback') or {})} → "
             f"{target_signal or '目标'} "
             + ("--" if objective is None else f"{objective:.4f}")
+            + _timing_note(record)
             + _quality_note(record)
         )
     if advice_lines:
         lines.append("")
         lines.extend(f"[建议] {text}" for text in advice_lines)
     return lines
+
+
+def format_local_time(raw: object) -> str:
+    """ISO(UTC) → 本地 ``HH:MM:SS.mmm``；解析不了就返回占位符。"""
+    text = str(raw or "")
+    if not text:
+        return "--:--:--.---"
+    try:
+        from datetime import datetime
+
+        moment = datetime.fromisoformat(text)
+        if moment.tzinfo is not None:
+            moment = moment.astimezone()
+        return moment.strftime("%H:%M:%S.") + f"{moment.microsecond // 1000:03d}"
+    except (TypeError, ValueError):
+        return "--:--:--.---"
+
+
+def _timing_note(record: Mapping) -> str:
+    """本轮耗时与采样离散度（拿不到就什么都不写，不假装有数据）。"""
+    parts: list[str] = []
+    duration = record.get("duration_ms")
+    if isinstance(duration, (int, float)) and duration > 0:
+        parts.append(f"耗时 {float(duration) / 1000:.2f}s")
+    spread = record.get("sample_spread")
+    count = record.get("sample_count")
+    if isinstance(spread, (int, float)) and spread > 0:
+        parts.append(
+            f"σ {float(spread):.3f}"
+            + (f"（{int(count)} 次采样）" if isinstance(count, (int, float)) and count else "")
+        )
+    return f"（{'，'.join(parts)}）" if parts else ""
 
 
 def _quality_note(record: Mapping) -> str:

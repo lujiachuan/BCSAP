@@ -281,6 +281,25 @@ def request_tuning_iterations(run_id: str, base_url: str | None = None):
     return _get(f"{TUNING_RUNS_PATH}/{run_id}/iterations", base_url)
 
 
+def request_tuning_events(run_id: str, since: int = 0, base_url: str | None = None):
+    """过程事件增量拉取：``since`` = 本地已收到的最大 seq。
+
+    只有拉事件才能看到"逐路写入有没有被拒、等稳定花了多久、采样读到几个值"——
+    轮次接口给的是结果，日志要的是过程。
+    """
+    return _get(f"{TUNING_RUNS_PATH}/{run_id}/events?since={int(since)}", base_url)
+
+
+def request_tuning_progress(
+    run_id: str, after_iteration: int = -1, base_url: str | None = None
+):
+    """状态 + 新增轮次 + 事件序号一次取回（避免两次请求的响应互相乱序）。"""
+    return _get(
+        f"{TUNING_RUNS_PATH}/{run_id}/progress?after_iteration={int(after_iteration)}",
+        base_url,
+    )
+
+
 def request_tuning_analysis(run_id: str, base_url: str | None = None):
     """结束后分析：history / importance / slice / trials（从持久化 Optuna study 取）。"""
     return _get(f"{TUNING_RUNS_PATH}/{run_id}/analysis", base_url)

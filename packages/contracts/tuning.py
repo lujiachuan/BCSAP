@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, ConfigDict, field_validator
 
 # 调束模式。
@@ -74,6 +76,37 @@ FINALIZE_ACTIONS: tuple[str, ...] = (
     ACTION_START_VALUES,
     ACTION_SAFE_VALUES,
 )
+
+# 运行阶段（`TuningRunStatus.phase`）：界面据此显示"设备此刻正在做什么"。
+# 与状态机 state 的分工：state 回答"这个任务还能不能继续"（几个稳定状态），
+# phase 回答"这一轮走到哪一步了"（秒级变化）。把两者混成一个字段的后果是
+# 操作员在"写入设备"和"等待确认"里看到同一个字样，分不清该不该动手。
+PHASE_PROPOSING = "proposing"
+PHASE_PRECHECKING = "prechecking"
+PHASE_WRITING = "writing"
+PHASE_SETTLING = "settling"
+PHASE_HOLDING = "holding"
+PHASE_MEASURING = "measuring"
+PHASE_RECORDING = "recording"
+PHASE_WAITING_CONFIRMATION = "waiting_confirmation"
+PHASE_IDLE = "idle_between_iterations"
+PHASE_LABELS: dict[str, str] = {
+    PHASE_PROPOSING: "生成候选",
+    PHASE_PRECHECKING: "执行前校验",
+    PHASE_WRITING: "写入设备",
+    PHASE_SETTLING: "等待回读稳定",
+    PHASE_HOLDING: "保持",
+    PHASE_MEASURING: "测量目标",
+    PHASE_RECORDING: "记录本轮",
+    PHASE_WAITING_CONFIRMATION: "等待人工确认",
+    PHASE_IDLE: "轮次之间",
+}
+
+# 事件级别（过程日志按级别过滤；error 必须能在界面上一眼看到）
+LEVEL_INFO = "info"
+LEVEL_WARN = "warn"
+LEVEL_ERROR = "error"
+EVENT_LEVELS: tuple[str, ...] = (LEVEL_INFO, LEVEL_WARN, LEVEL_ERROR)
 
 
 class TuningVariable(BaseModel):
@@ -291,7 +324,14 @@ class TuningProposal(BaseModel):
 
 
 class TuningIteration(BaseModel):
-    """一轮的完整记录：建议 → 实际下发 → 实际回读 → 目标测量。"""
+    """一轮的完整记录：建议 → 实际下发 → 实际回读 → 目标测量。
+
+    ``at`` 是**这一轮记录写入时**的时间戳（轮末）。四段时间戳是分批加上的：
+    ``proposed_at`` / ``applied_at`` / ``settled_at`` / ``measured_at``——
+    只有轮末一个时间戳时，"这轮为什么花了 40 秒"是答不出来的（是写入慢、
+    稳定慢，还是采样慢），现场复盘只能靠猜。老记录这些字段为空，界面按
+    "未记录"呈现，不编造。
+    """
 
     model_config = ConfigDict(strict=True)
 
@@ -309,6 +349,58 @@ class TuningIteration(BaseModel):
     # 事后复盘（导出日志、看响应曲线）就分不清哪几轮是逐参数、哪几轮是联合微调。
     # 老记录没有这个字段：按 None 读，不猜。
     stage: str | None = None
+
+    # ---- 分批时间戳与耗时（新增，全部可选）----
+    proposed_at: str | None = None
+    applied_at: str | None = None
+    settled_at: str | None = None
+    measured_at: str | None = None
+    # 本轮从"提出候选"到"测完目标"的墙钟耗时（毫秒）
+    duration_ms: int | None = None
+    # 目标重复采样：次数、标准差与原始样本。
+    # 只给中位数不给离散度，无法判断一次"提升"是真提升还是噪声。
+    sample_count: int = 0
+    sample_spread: float | None = None
+    samples: list[float] = []
+    # 本轮卡在哪一步（``write_rejected`` / ``unsettled`` / ``read_failed``）；
+    # None = 没有卡住。它比 quality 更具体：quality 说"这轮不可信"，
+    # failure_step 说"不可信是因为回读没到位"。
+    failure_step: str | None = None
+
+
+class TuningEvent(BaseModel):
+    """一条带毫秒时间戳的过程事件（过程日志的最小单位）。
+
+    为什么要有独立的事件流：轮次记录是**结果**，事件流是**过程**——逐路写入是否
+    被拒、等稳定花了多久、采样读到几个值、保护为什么触发、回退每路退到哪，
+    这些在轮次记录里都被压成了一行 ``quality``。现场最常问的"当时到底发生了什么"
+    只能由事件流回答。
+    """
+
+    model_config = ConfigDict(strict=True)
+
+    run_id: str
+    # 每个 run 内单调递增，从 1 开始；客户端按它增量拉取（since=seq）
+    seq: int
+    at: str
+    level: str = LEVEL_INFO
+    phase: str = ""
+    # 属于第几轮（0 起）；与某轮无关的事件（启动、暂停、处置）为 None
+    iteration: int | None = None
+    message: str
+    # 结构化附加信息（写入值、耗时、被拒原因等），界面按需展示
+    data: dict[str, Any] = {}
+
+
+class TuningEventsResponse(BaseModel):
+    """增量事件响应。"""
+
+    model_config = ConfigDict(strict=True)
+
+    run_id: str
+    events: list[TuningEvent]
+    # 服务端当前最大 seq：客户端下次带 since=latest_seq 继续拉
+    latest_seq: int
 
 
 class TuningFinalizeRequest(BaseModel):
@@ -382,6 +474,23 @@ class TuningRunStatus(BaseModel):
     # 结束后最近一次处置动作的结果（关掉界面再打开还能看到做过什么）
     finalize: TuningFinalizeResult | None = None
 
+    # ---- 实时进度与保护状态（新增）----
+    # 状态版本号：每次持久化 +1。客户端用它判断"这份状态比上次新"，
+    # 而不是靠时间戳比较（现场机器与服务端时钟可能有偏差）。
+    revision: int = 0
+    # 当前阶段（见 PHASE_*）：state 说"能不能继续"，phase 说"此刻在做什么"
+    phase: str = ""
+    # 最近一轮的目标测量与历史最优轮次
+    latest_objective: float | None = None
+    best_iteration: int | None = None
+    # 是否已提交过暂停 / 停止请求（写入中的那一轮会先收尾）
+    pause_requested: bool = False
+    stop_requested: bool = False
+    # 束流丢失保护**是否真的有效**：自动模式启动校验、以及界面"保护已生效"的提示
+    # 都依据它。只检查"配置了阈值"不够——基线读不到时相对判据根本不成立。
+    protection_ready: bool = False
+    protection_reasons: list[str] = []
+
 
 class TuningIterationsResponse(BaseModel):
     """已完成的轮次。"""
@@ -391,3 +500,20 @@ class TuningIterationsResponse(BaseModel):
     run_id: str
     iterations: list[TuningIteration]
     max_iterations: int
+
+
+class TuningProgressResponse(BaseModel):
+    """状态 + 新增轮次 + 事件序号：一次轮询拿齐，避免两次响应互相乱序。
+
+    旧路径分开拉 status 与 iterations 时，"状态说已完成 5 轮、轮次列表还是 4 轮"
+    这种撕裂会短暂出现；放进同一个响应里就只有一个时间点。客户端再把
+    ``latest_seq`` 交给 ``/events?since=`` 补齐过程细节。
+    """
+
+    model_config = ConfigDict(strict=True)
+
+    run_id: str
+    status: TuningRunStatus
+    # 只回传 ``after_iteration`` 之后的轮次（默认全量，便于客户端补齐）
+    iterations: list[TuningIteration]
+    latest_seq: int

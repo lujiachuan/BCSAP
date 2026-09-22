@@ -143,6 +143,20 @@ STATE_TEXT = {
     "recovery_required": "需人工确认设备状态",
 }
 
+# 阶段名 → 界面文案（与执行服务 packages/contracts/tuning.PHASE_LABELS 对齐；
+# 客户端自己写一遍中文名，不 import 服务端实现）
+PHASE_TEXT = {
+    "proposing": "生成候选",
+    "prechecking": "执行前校验",
+    "writing": "写入设备",
+    "settling": "等待稳定",
+    "holding": "保持",
+    "measuring": "测量目标",
+    "recording": "记录本轮",
+    "waiting_confirmation": "等待确认",
+    "idle_between_iterations": "轮次之间",
+}
+
 
 class TuningPage(QWidget):
     """自动调束页（建议 → 人工确认）。"""
@@ -165,6 +179,12 @@ class TuningPage(QWidget):
         self._state = "idle"
         self._pending: dict | None = None
         self._iterations: list[dict] = []
+        # 过程事件流（第二批）：``_events`` 是已收到的事件，``_last_seq`` 是增量游标
+        self._events: list[dict] = []
+        self._last_seq = 0
+        # 断线检测：连续失败次数 + 最后一次成功取数的时间（本地时钟）
+        self._link_failures = 0
+        self._last_success_monotonic: float | None = None
         self._analysis: dict | None = None  # 结束后从 /analysis 拉的 Optuna 分析结果
         self._analysis_items: list[object] = []
         self._dashboard_url = DASHBOARD_URL
@@ -783,6 +803,10 @@ class TuningPage(QWidget):
         self.tuning_stop_button.clicked.connect(self.stop_tuning)
         row.addWidget(self.tuning_state)
         row.addWidget(self.iteration_label)
+        # 断线提示：连不上执行服务时必须说出来，不能让界面继续装作"数据是实时的"
+        self.link_note = QLabel("", objectName="mutedText")
+        self.link_note.setVisible(False)
+        row.addWidget(self.link_note)
         row.addStretch()
         row.addWidget(self.acknowledge_button)
         row.addWidget(self.tuning_pause_button)
@@ -854,8 +878,21 @@ class TuningPage(QWidget):
         log_tool = QHBoxLayout()
         log_tool.setContentsMargins(0, 0, 0, 0)
         log_tool.setSpacing(4)
+        log_tool.addWidget(QLabel("级别", objectName="mutedText"))
+        self.log_level_combo = QComboBox()
+        for key, label in (("all", "全部"), ("warn", "警告以上"), ("error", "仅错误")):
+            self.log_level_combo.addItem(label, key)
+        mark_compact(self.log_level_combo)
+        self.log_level_combo.setMinimumWidth(96)
+        self.log_level_combo.currentIndexChanged.connect(
+            lambda _index: self._render_event_log()
+        )
+        log_tool.addWidget(self.log_level_combo)
         self.log_follow_check = QCheckBox("跟随最新")
         self.log_follow_check.setChecked(True)
+        self.log_follow_check.toggled.connect(
+            lambda _on: self._render_event_log()
+        )
         log_tool.addWidget(self.log_follow_check)
         log_tool.addStretch()
         self.log_export_button = QPushButton("导出日志", objectName="plotToolButton")
@@ -1756,6 +1793,13 @@ class TuningPage(QWidget):
         self._last_completed = 0
         self._iterations_in_flight = False
         self._log_lines_written = 0
+        # 新一轮：事件游标与断线计数都要归零，否则会把上一次任务的事件混进新日志
+        self._events = []
+        self._last_seq = 0
+        self._link_failures = 0
+        self._last_success_monotonic = None
+        if hasattr(self, "link_note"):
+            self.link_note.setVisible(False)
         if hasattr(self, "event_log_view"):
             self.event_log_view.clear()
         self._algorithm = ""
@@ -2030,23 +2074,183 @@ class TuningPage(QWidget):
     # 轮询
     # ------------------------------------------------------------------
     def _poll(self) -> None:
+        """一次轮询取三样东西：状态 + 新增轮次 + 新增事件。
+
+        用 ``/progress`` 而不是分开拉 status/iterations：两个响应各有各的时间点，
+        "状态说 5 轮、列表还是 4 轮"这种撕裂会短暂出现在界面上。事件用 ``since``
+        增量拉，避免每 700ms 重传整份过程日志。
+        """
         if not self._run_id:
             self._timer.stop()
             return
         if self._status_in_flight:
             return
         self._status_in_flight = True
-        thread = instrument_api.request_tuning_status(self._run_id)
-        thread.completed.connect(self._on_status)
+        last_iteration = -1
+        if self._iterations:
+            try:
+                last_iteration = int(self._iterations[-1].get("iteration", -1))
+            except (TypeError, ValueError):
+                last_iteration = -1
+        try:
+            thread = instrument_api.request_tuning_progress(
+                self._run_id, after_iteration=last_iteration
+            )
+            thread.completed.connect(self._on_progress)
+        except AttributeError:  # 老客户端/被替换过的模块：退回旧的两段式轮询
+            thread = instrument_api.request_tuning_status(self._run_id)
+            thread.completed.connect(self._on_status)
+        self._fetch_events()
+
+    def _fetch_events(self) -> None:
+        if not self._run_id or not hasattr(instrument_api, "request_tuning_events"):
+            return
+        try:
+            thread = instrument_api.request_tuning_events(self._run_id, since=self._last_seq)
+            thread.completed.connect(self._on_events)
+        except Exception:  # noqa: BLE001 —— 事件拉取失败不该让轮询停摆
+            return
+
+    def _on_progress(self, payload: dict) -> None:
+        self._status_in_flight = False
+        if not payload.get("ok"):
+            self._note_link_loss(payload.get("message") or "请求失败")
+            return
+        self._note_link_ok()
+        body = payload.get("payload") or {}
+        self._apply_status(body.get("status") or {})
+        new_records = list(body.get("iterations") or [])
+        if new_records:
+            # 增量合并：只有比本地更新的轮次才追加，避免覆盖已渲染的曲线
+            known = {int(item.get("iteration", -1)) for item in self._iterations}
+            self._iterations.extend(
+                item for item in new_records
+                if int(item.get("iteration", -1)) not in known
+            )
+            self._iterations.sort(key=lambda item: int(item.get("iteration", 0)))
+            self._last_completed = len(self._iterations)
+            self._refresh_iteration_views()
 
     def _on_status(self, payload: dict) -> None:
         self._status_in_flight = False
         if not payload.get("ok"):
+            self._note_link_loss(payload.get("message") or "请求失败")
             return
+        self._note_link_ok()
         self._apply_status(payload.get("payload") or {})
         # 运行中也必须增量拉轮次；旧逻辑只在结束/人工确认后拉，
         # 因此“本轮测量 / 历史最优”会看起来到结束才刷新。
         self._fetch_iterations()
+
+    def _on_events(self, payload: dict) -> None:
+        if not payload.get("ok"):
+            return
+        body = payload.get("payload") or {}
+        incoming = list(body.get("events") or [])
+        if incoming:
+            known = {int(event.get("seq", -1)) for event in self._events}
+            self._events.extend(
+                event for event in incoming if int(event.get("seq", -1)) not in known
+            )
+            self._events.sort(key=lambda event: int(event.get("seq", 0)))
+            self._render_event_log()
+        latest = body.get("latest_seq")
+        if latest is not None:
+            self._last_seq = max(self._last_seq, int(latest))
+
+    def _render_event_log(self) -> None:
+        """把服务端事件渲染进过程日志面板（级别过滤 + 跟随最新）。
+
+        面板是"过程"的窗口：一行一个事件，带毫秒时间戳、级别、阶段与轮次。
+        级别过滤只影响显示，不影响已收下的事件（导出仍然是全量）。
+        老执行服务没有事件流时退回"按轮次渲染"（轮末时间戳），并在首行说明。
+        """
+        view = getattr(self, "event_log_view", None)
+        if view is None:
+            return
+        if not self._events:
+            self._fill_process_log()
+            return
+        threshold = self._log_level_filter()
+        lines = [
+            self._format_event_line(event)
+            for event in self._events
+            if self._level_rank(str(event.get("level") or "info")) >= threshold
+        ]
+        if not lines:
+            lines = ["（当前过滤条件下没有事件：把级别放宽到「全部」）"]
+        text = "\n".join(lines)
+        if text != view.toPlainText():
+            view.setPlainText(text)
+        self._log_lines_written = -1
+        if getattr(self, "log_follow_check", None) is not None and self.log_follow_check.isChecked():
+            scrollbar = view.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+
+    def _log_level_filter(self) -> int:
+        combo = getattr(self, "log_level_combo", None)
+        if combo is None:
+            return 0
+        data = combo.currentData()
+        return {"all": 0, "warn": 1, "error": 2}.get(str(data), 0)
+
+    @staticmethod
+    def _level_rank(level: str) -> int:
+        return {"info": 0, "warn": 1, "error": 2}.get(level.lower(), 0)
+
+    def _format_event_line(self, event: dict) -> str:
+        """事件行：``[时间] 级别 阶段 轮次 内容``（列宽固定，方便竖直扫读）。"""
+        level = str(event.get("level") or "info").upper()
+        phase = PHASE_TEXT.get(str(event.get("phase") or ""), str(event.get("phase") or ""))
+        iteration = event.get("iteration")
+        where = f"第 {int(iteration) + 1} 轮" if isinstance(iteration, int) else "－"
+        return (
+            f"[{tuning_analysis.format_local_time(event.get('at'))}] "
+            f"{level:<5s} {phase:<8s} {where:<6s} {event.get('message', '')}"
+        )
+
+    def _note_link_loss(self, reason: str) -> None:
+        """轮询失败要说出来：断线时界面不能继续装作数据是实时的。"""
+        self._link_failures += 1
+        if self._link_failures < 2:
+            return
+        note = getattr(self, "link_note", None)
+        if note is None:
+            return
+        last = self._last_success_monotonic
+        stamp = "--:--:--"
+        if last is not None:
+            from datetime import datetime
+
+            stamp = datetime.fromtimestamp(last).strftime("%H:%M:%S")
+        note.setText(f"⚠ 与执行服务失去连接（{reason}）；最后可信数据 {stamp}")
+        note.setProperty("state", "warn")
+        note.style().unpolish(note)
+        note.style().polish(note)
+        note.setVisible(True)
+
+    def _note_link_ok(self) -> None:
+        import time as _time
+
+        self._link_failures = 0
+        self._last_success_monotonic = _time.time()
+        note = getattr(self, "link_note", None)
+        if note is not None and not note.isHidden():
+            note.setVisible(False)
+
+    def _refresh_iteration_views(self) -> None:
+        """轮次变化后统一刷新所有派生视图（曲线 / 表 / 日志 / 结果摘要）。"""
+        self._redraw()
+        self._fill_changes()
+        self._refresh_plot_choices()
+        self._refresh_advice()
+        self._fill_log()
+        self._fill_recent_iterations()
+        self._update_result_summary()
+        self._fill_process_log()
+        self._refresh_result_analysis_choices()
+        self._render_result_analysis()
+        self._fill_analysis_trials()
 
     def _apply_status(self, status: dict) -> None:
         self._state = str(status.get("state", "idle"))
@@ -2254,17 +2458,7 @@ class TuningPage(QWidget):
             (payload.get("payload") or {}).get("iterations") or []
         )
         self._last_completed = len(self._iterations)
-        self._redraw()
-        self._fill_changes()
-        self._refresh_plot_choices()
-        self._refresh_advice()
-        self._fill_log()
-        self._fill_recent_iterations()
-        self._update_result_summary()
-        self._fill_process_log()
-        self._refresh_result_analysis_choices()
-        self._render_result_analysis()
-        self._fill_analysis_trials()
+        self._refresh_iteration_views()
 
     def _fill_recent_iterations(self) -> None:
         """用最近 5 轮表格补足曲线的精确读数。"""
@@ -2849,7 +3043,7 @@ class TuningPage(QWidget):
         if not pair or len(bounds) <= max(i, j):
             return
         arr = np.asarray(pair["mean" if is_mean else "std"], dtype=float)
-        dialog = QtWidgets.QDialog(self)
+        dialog = QDialog(self)
         dialog.setWindowTitle(
             f"响应面 · {self._row_label(params[j])} × {self._row_label(params[i])}"
         )
@@ -3191,7 +3385,7 @@ class TuningPage(QWidget):
         return lines
 
     def _fill_log(self) -> None:
-        """把轮次记录与建议渲染成日志文本（原 demo 的调束日志区）。"""
+        """把轮次记录与建议渲染成日志文本（带毫秒时间戳、耗时与采样离散度）。"""
         lines = tuning_analysis.summary_lines(
             self._iterations,
             target_signal=str(self.target.currentData() or ""),
@@ -3201,6 +3395,7 @@ class TuningPage(QWidget):
             self._iterations,
             target_signal=str(self.target.currentData() or ""),
             advice_lines=self._current_advice(),
+            timestamps=True,
         )
         if not self._iterations:
             lines.append("（还没有轮次记录）")
@@ -3247,9 +3442,14 @@ class TuningPage(QWidget):
                 "seed": self._seed,
                 "baseline_objective": self._baseline,
                 "iterations": len(self._iterations),
+                "events": len(self._events),
             }
         ]
         records += [dict(record) for record in self._iterations]
+        # 过程事件全量导出：只导轮次记录的话，"为什么这轮慢/为什么被拒"复盘不了
+        records += [
+            {"event": "trace", **event} for event in self._events
+        ]
         records += [{"event": "advice", "text": text} for text in advice]
         records.append(
             {

@@ -92,6 +92,8 @@ def block_network() -> None:
         "request_tuning_catalog",
         "request_tuning_status",
         "request_tuning_iterations",
+        "request_tuning_progress",
+        "request_tuning_events",
         "request_magnet_retract",
         "request_pv_health",
     ):

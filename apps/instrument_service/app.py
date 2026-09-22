@@ -25,9 +25,11 @@ from packages.contracts.scan import (
 )
 from packages.contracts.tuning import (
     TuningCatalog,
+    TuningEventsResponse,
     TuningFinalizeRequest,
     TuningFinalizeResult,
     TuningIterationsResponse,
+    TuningProgressResponse,
     TuningRunRequest,
     TuningRunStatus,
 )
@@ -405,6 +407,36 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
                 detail="无可用 study 数据（未用 Optuna 引擎或未跑过）",
             )
         return result
+
+    @app.get(
+        "/control/v1/tuning/runs/{run_id}/events",
+        response_model=TuningEventsResponse,
+    )
+    def get_tuning_events(
+        run_id: str, since: int = 0, limit: int = 2000
+    ) -> TuningEventsResponse:
+        """过程事件流（增量）：``since`` = 客户端已收到的最大 seq。
+
+        过程日志的数据源：逐路写入、等稳定耗时、逐次采样、质量判定、保护触发与
+        回退都在这里。轮次接口只给"结果"，回答不了"当时发生了什么"。
+        """
+        try:
+            return state.tuning.events(run_id, since=since, limit=limit)
+        except TuningError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get(
+        "/control/v1/tuning/runs/{run_id}/progress",
+        response_model=TuningProgressResponse,
+    )
+    def get_tuning_progress(
+        run_id: str, after_iteration: int = -1
+    ) -> TuningProgressResponse:
+        """状态 + 新增轮次 + 事件序号：一次轮询拿齐，避免两次响应互相乱序。"""
+        try:
+            return state.tuning.progress(run_id, after_iteration=after_iteration)
+        except TuningError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post(
         "/control/v1/tuning/runs/{run_id}/approve", response_model=TuningRunStatus
