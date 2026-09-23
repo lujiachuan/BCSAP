@@ -21,8 +21,6 @@ v1 的参数配置页右栏是"一行一个字段"的竖排表单：20 个字段
 
 from __future__ import annotations
 
-from collections.abc import Callable
-
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QPainter, QPen
 from PySide6.QtWidgets import (
@@ -169,7 +167,9 @@ class FoldSection(QFrame):
     ) -> None:
         super().__init__(parent, objectName="foldSection")
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(10, 6, 10, 8)
+        # 上下留白各收 1~2px：调束页右栏的高度是硬约束（内容装不下时 Qt 会把控件
+        # 压重叠而不是滚动），三张卡各让出几个像素，正好补平缺口。
+        outer.setContentsMargins(10, 5, 10, 6)
         outer.setSpacing(4)
 
         header = QHBoxLayout()
@@ -236,7 +236,7 @@ class StatusStrip(QFrame):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent, objectName="statusStrip")
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setContentsMargins(12, 6, 12, 6)
         layout.setSpacing(10)
         self.note_area = QVBoxLayout()
         self.note_area.setContentsMargins(0, 0, 0, 0)

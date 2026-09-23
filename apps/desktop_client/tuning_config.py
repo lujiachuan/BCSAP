@@ -112,6 +112,12 @@ def sanitize(raw: object, *, strategies: tuple[str, ...] = (),
                 notes.append(f"{signal} 的 {key} 不是数字（{item.get(key)!r}），按映射默认范围处理")
                 continue
             entry[key] = value
+        if item.get("settle_tol") is not None:
+            value = _as_float(item.get("settle_tol"))
+            if value is None:
+                notes.append(f"{signal} 的回读容差不是数字（{item.get('settle_tol')!r}），按自动处理")
+            elif value > 0:
+                entry["settle_tol"] = value
         variables.append(entry)
     if variables:
         config["variables"] = variables
@@ -160,6 +166,9 @@ def sanitize(raw: object, *, strategies: tuple[str, ...] = (),
 
     if "auto_recover" in raw:
         config["auto_recover"] = bool(raw.get("auto_recover"))
+
+    if "loss_protection" in raw:
+        config["loss_protection"] = bool(raw.get("loss_protection"))
 
     if "reset_before_start" in raw:
         config["reset_before_start"] = bool(raw.get("reset_before_start"))

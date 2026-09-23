@@ -63,11 +63,16 @@ def open_study(storage_url: str, run_id: str) -> optuna.Study | None:
                 merged.add_trial(t)
     if not merged.trials:
         return None
+    # 这是临时内存 study，不会写回持久化库；用属性保留分析范围，避免把逐参数
+    # trial 的合并结果错误标成联合阶段。
+    merged.set_user_attr("_analysis_scope", "mixed")
     return merged
 
 
 def _is_joint(study: optuna.Study) -> bool:
     """这个 Study 是不是联合阶段（或旧版单 Study）——用于标注分析范围。"""
+    if study.user_attrs.get("_analysis_scope") == "mixed":
+        return False
     return "__sample__" not in study.study_name or study.study_name.endswith("__sample__joint")
 
 
@@ -169,15 +174,22 @@ def surface_data(study: optuna.Study) -> dict[str, Any]:
     样本太少或拟合失败时 available=False 并说明原因。
     """
     completed = _completed_trials(study)
-    if len(completed) < 5:
-        return {"available": False, "reason": f"有效轮次 {len(completed)} 个，少于 5，不足以拟合响应面"}
     param_names = sorted({k for t in completed for k in t.params})
     if len(param_names) < 2:
         return {"available": False, "reason": "参数少于 2 个"}
+    min_samples = max(12, 3 * len(param_names))
+    if len(completed) < min_samples:
+        return {
+            "available": False,
+            "reason": (
+                f"有效轮次 {len(completed)} 个，少于 {min_samples}；"
+                f"{len(param_names)} 维响应面不足以可靠拟合"
+            ),
+        }
 
     import numpy as np
     from sklearn.gaussian_process import GaussianProcessRegressor
-    from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel
+    from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
 
     # 采样点取实际回读；缺回读的 trial 不参与拟合（宁可少几个点，也不要错配的 x）
     samples = [
@@ -185,10 +197,13 @@ def surface_data(study: optuna.Study) -> dict[str, Any]:
         for t in completed
     ]
     samples = [(x, y) for x, y in samples if all(v is not None for v in x)]
-    if len(samples) < 5:
+    if len(samples) < min_samples:
         return {
             "available": False,
-            "reason": f"带回读的采样点只有 {len(samples)} 个，少于 5，不足以拟合响应面",
+            "reason": (
+                f"带回读的采样点只有 {len(samples)} 个，少于 {min_samples}，"
+                "不足以可靠拟合响应面"
+            ),
         }
     X = np.asarray([x for x, _y in samples], dtype=float)
     y = np.asarray([_y for _x, _y in samples], dtype=float)
@@ -218,7 +233,7 @@ def surface_data(study: optuna.Study) -> dict[str, Any]:
         (float(best.get(nm, (lo[k] + hi[k]) / 2.0)) - lo[k]) / span[k]
         for k, nm in enumerate(param_names)
     ])
-    grid = 25
+    grid = 48
     g = np.linspace(0.0, 1.0, grid)
     ii, jj = np.meshgrid(g, g, indexing="ij")
     flat_i = ii.ravel()
@@ -248,6 +263,7 @@ def surface_data(study: optuna.Study) -> dict[str, Any]:
         "point_values": y.tolist(),
         "pairs": pairs,
         "grid": grid,
+        "note": "其余参数固定在当前最优点；颜色范围仅覆盖本次已采样子空间。",
     }
 
 

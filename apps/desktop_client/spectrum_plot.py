@@ -17,7 +17,7 @@ from collections.abc import Callable, Sequence
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QHBoxLayout, QPushButton, QVBoxLayout, QWidget
 
 from apps.desktop_client import plot_style
@@ -224,6 +224,8 @@ class SpectrumPlot(QWidget):
             self._trial_best_curve.setData([], [])
         if self._trial_error_item is not None:
             self._trial_error_item.setVisible(False)
+        for line in self._reference_lines.values():
+            line.setVisible(False)
         self._clear_trial_annotations()
         self._reset_axis_bounds()
 

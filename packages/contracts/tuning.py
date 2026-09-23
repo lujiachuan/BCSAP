@@ -121,8 +121,12 @@ class TuningVariable(BaseModel):
     enabled: bool = True
     # 自定义起始值：开始前复位、结束后"回到起始值"都用它；None = 取范围中值
     start: float | None = None
+    # 本参数的回读容差（绝对量，与映射里 settle_tol 同语义）：回读与设定之差
+    # ≤ 该值即认为到位。None = 用请求级 settle_tol，再没有则用映射里该设定
+    # 条目的 settle_tol。不同设备各自配：电压 ±5 V、气体 ±2 sccm 这类按量纲给。
+    settle_tol: float | None = None
 
-    @field_validator("low", "high", "start", mode="before")
+    @field_validator("low", "high", "start", "settle_tol", mode="before")
     @classmethod
     def _coerce_number(cls, value: object) -> object:
         if value is None or isinstance(value, bool):

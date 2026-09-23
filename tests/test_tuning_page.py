@@ -141,7 +141,8 @@ class TuningPageCatalogTests(unittest.TestCase):
             for index in range(page.parameter_table.columnCount())
         ]
         self.assertEqual(
-            headers, ["启用", "设备参数", "下限", "上限", "起始值", "当前回读"]
+            headers,
+            ["启用", "设备参数", "下限", "上限", "起始值", "回读容差", "当前回读"],
         )
         self.assertNotIn("PV", headers)
 
@@ -149,11 +150,9 @@ class TuningPageCatalogTests(unittest.TestCase):
         self.assertEqual(cell.text(), "magnet.m1.current_setpoint")
         self.assertIn("业务信号：magnet.m1.current_setpoint", cell.toolTip())
         self.assertIn("PV：PV:magnet.m1.current_setpoint", cell.toolTip())
-        # 下限/上限/起始值/回读列都在各自位置上
-        self.assertIsNotNone(page.parameter_table.cellWidget(0, 2))
-        self.assertIsNotNone(page.parameter_table.cellWidget(0, 3))
-        self.assertIsNotNone(page.parameter_table.cellWidget(0, 4))
-        self.assertIsNotNone(page.parameter_table.cellWidget(0, 5))
+        # 下限/上限/起始值/回读容差/回读列都在各自位置上
+        for column in (2, 3, 4, 5, 6):
+            self.assertIsNotNone(page.parameter_table.cellWidget(0, column))
         # 左栏下方的范围标尺：每个变量一行（设备边界/设定区间/起始值/当前回读）
         self.assertTrue(hasattr(page, "range_rows"))
         self.assertEqual(page.range_rows.count(), 3)  # 名称 + 标尺 + 数值文本
@@ -202,14 +201,16 @@ class TuningPageCatalogTests(unittest.TestCase):
         self.assertIn("已自动勾选", page.variable_hint.text())
 
     def test_hint_explains_exclusions_and_linked_groups(self) -> None:
+        """提示行必须回答"为什么只列出这几个参数"：白名单外的量要点名数量与原因。"""
         page = self.make_page(marked_mapping(), CATALOG)
 
         hint = page.variable_hint.text()
 
         self.assertIn("未列入", hint)
-        self.assertIn("保护类设定", hint)
+        self.assertIn("变化速率/保护类设定", hint)
+        self.assertIn("不是束流测量", hint, "两条排除原因都要点名")
         self.assertIn("联动组", hint)
-        self.assertIn("同一个优化维度", hint)
+        self.assertIn("单路下发", hint)
         self.assertNotIn("回退过滤", hint, "服务端给了标记就不该提示回退")
 
     def test_missing_catalog_still_filters_and_skips_autoselect(self) -> None:

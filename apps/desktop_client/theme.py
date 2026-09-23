@@ -280,6 +280,13 @@ QTabBar::tab:hover { color: $textBase; }
 QTabBar::tab:selected { background: $tabSelectedBg; color: $accent; font-weight: 600; }
 QTabBar::tab:focus { border: 1px solid $focusRing; border-bottom: none; }
 QTabBar::tab:disabled { color: $disabledText; background: $disabledBg; }
+/* 面板内的次级页签（调束页右栏的「过程日志 / 轮次明细 / 本轮候选」等）：配色沿用
+   主页面签，但必须去掉 150px 最小宽度——主页面签只有 3 个、横跨整个窗口，150px 才
+   撑得住；面板内一栏只有 400 多像素，沿用 150px 时 3 个页签就宽 540px，页签栏会
+   溢出成左右滚动箭头，把后面的页签藏起来（实测：442px 栏放 540px 页签）。
+   objectName 由创建方设成 innerTabBar（见 TuningPage）。 */
+QTabBar#innerTabBar::tab { min-width: 0px; min-height: 26px; padding: 3px 10px;
+                           margin-right: 2px; }
 
 QProgressBar { min-height: 7px; max-height: 7px; border: none; border-radius: 4px;
                background: $progressTrack; text-align: center; }

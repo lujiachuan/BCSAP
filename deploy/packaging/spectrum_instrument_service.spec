@@ -8,16 +8,21 @@
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_all
 
 ROOT = Path(SPECPATH).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+# sklearn gaussian_process 含 C 扩展/数据文件，仅 collect_submodules 会漏掉该子包，
+# 打包后 surface 分析 import 失败、响应面矩阵不出现；collect_all 一次收齐。
+sklearn_datas, sklearn_bins, sklearn_hidden = collect_all("sklearn")
 
 hiddenimports = (
     collect_submodules("apps.instrument_service")
     + collect_submodules("packages")
     + collect_submodules("alembic")
     + collect_submodules("optuna_dashboard")
+    + collect_submodules("sklearn")
+    + sklearn_hidden
 )
 # Optuna RDB storage 运行时要用 alembic 迁移脚本目录（非 .py 数据文件），
 # PyInstaller 默认只收字节码，必须显式把数据目录打进去，否则 create_study 报
@@ -30,12 +35,13 @@ datas = (
     collect_data_files("optuna", include_py_files=True)
     + collect_data_files("alembic")
     + collect_data_files("optuna_dashboard")
+    + sklearn_datas
 )
 
 a = Analysis(
     [str(ROOT / "apps" / "instrument_service" / "main.py")],
     pathex=[str(ROOT)],
-    binaries=[],
+    binaries=sklearn_bins,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

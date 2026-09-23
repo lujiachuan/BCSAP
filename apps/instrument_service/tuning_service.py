@@ -1668,6 +1668,55 @@ class TuningService:
             return False
         return abs(iteration.objective - proposal.predicted) <= sigmas * proposal.std
 
+    def _wait_all_settled(
+        self,
+        run: _Run,
+        specs: list[tuple],
+        *,
+        iteration: int | None = None,
+        timeout: float = 20.0,
+    ) -> dict[str, tuple[bool, float | None, float]]:
+        """并行等所有信号回读进入各自容差；返回 signal → (是否稳定, 最后回读, 耗时)。
+
+        一轮轮询同时读所有未到位信号，到位即摘除；每路按自己的容差与同一超时判定。
+        与逐路 ``wait_settled`` 的区别：稳定等待耗时为 **max(各路到位时间)**，
+        而不是各路之和——多参数同时写、同时等，正是"同时写入"省时间的核心。
+        容差为 None 的路（无稳定判据）读一次当前值即视为已稳定
+        （与 ``wait_settled`` 对 ``tolerance is None`` 的行为一致）。
+        """
+        pending: list[dict] = []
+        results: dict[str, tuple[bool, float | None, float]] = {}
+        for variable, entry, target, tol in specs:
+            tolerance = tol if tol is not None else (entry.settle_tol or None)
+            if tolerance is None:
+                results[variable.signal] = (
+                    True, self._signals.readback(entry), 0.0
+                )
+                continue
+            pending.append({
+                "signal": variable.signal,
+                "entry": entry,
+                "target": float(target),
+                "tol": float(tolerance),
+                "deadline": time.monotonic() + timeout,
+                "started": time.monotonic(),
+            })
+        while pending:
+            for item in list(pending):
+                last = self._signals.readback(item["entry"])
+                elapsed = time.monotonic() - item["started"]
+                if last is not None and abs(float(last) - item["target"]) <= item["tol"]:
+                    results[item["signal"]] = (True, float(last), elapsed)
+                    pending.remove(item)
+                elif time.monotonic() >= item["deadline"]:
+                    results[item["signal"]] = (
+                        False, None if last is None else float(last), elapsed
+                    )
+                    pending.remove(item)
+            if pending:
+                self._sleep(0.2)
+        return results
+
     def _write_and_settle(
         self, run: _Run, targets: dict[str, float]
     ) -> tuple[dict[str, float], list[str]]:
@@ -1688,10 +1737,14 @@ class TuningService:
             entry = self._entry(signal)
             # 保护性写入同样走"回读确认 + 有限重试"：回退/收尾是最不能半途而废的动作，
             # 一次瞬时超时就把"退不回去"报到人工面前，代价比多试两次高得多。
+            variable_tol = (
+                variable.settle_tol
+                if variable.settle_tol is not None else run.request.settle_tol
+            )
             (
                 status, actual_value, write_error, _spent, ramp_steps,
             ) = self._write_with_confirmation(
-                run, entry, signal, float(want), tol=run.request.settle_tol
+                run, entry, signal, float(want), tol=variable_tol
             )
             if status != "ok":
                 problems.append(f"{entry.label} 写入未生效：{write_error}")
@@ -1699,7 +1752,7 @@ class TuningService:
             settled, actual = self._signals.wait_settled(
                 entry,
                 float(want),
-                tol=run.request.settle_tol,
+                tol=variable_tol,
                 timeout=run.request.settle_timeout_s,
                 readback_signal=entry.readback_signal or None,
             )
@@ -1954,6 +2007,12 @@ class TuningService:
         settle_s = 0.0
         measure_s = 0.0
 
+        # 阶段 1：把本轮激活的变量全部写入（写请求是斜坡缓变、同步下发，
+        # 逐路连续执行但**不等稳定**）；稳定确认统一放到阶段 2 并行等待。
+        # 原来"写 A → 等 A 稳定 → 写 B → 等 B 稳定"，稳定耗时被逐路累加；
+        # 改成"写 A → 写 B → 同时等 A/B 稳定"后，稳定等待从 sum 变 max，
+        # 这就是同时写入省下来的时间。
+        write_targets: list[tuple] = []
         for variable in request.enabled_variables():
             entry = self._entry(variable.signal)
             if variable.signal not in active:
@@ -1971,6 +2030,11 @@ class TuningService:
                     )
                 continue
             target_value = proposal.values[variable.signal]
+            # 每参数回读容差：参数自己配了用参数值，否则回落请求级/映射默认
+            variable_tol = (
+                variable.settle_tol
+                if variable.settle_tol is not None else request.settle_tol
+            )
             (
                 status, actual_value, write_error, write_elapsed, ramp_steps,
             ) = self._write_with_confirmation(
@@ -1979,7 +2043,7 @@ class TuningService:
                 variable.signal,
                 float(target_value),
                 iteration=proposal.iteration,
-                tol=request.settle_tol,
+                tol=variable_tol,
             )
             write_s += write_elapsed
             if status != "ok":
@@ -2044,42 +2108,47 @@ class TuningService:
                 applied=applied[variable.signal],
                 write_s=round(write_elapsed, 3),
             )
+            write_targets.append((variable, entry, float(target_value), variable_tol))
+
+        # 阶段 2：统一并行等所有已写入变量回读进入各自容差。
+        # 每路有独立的到位判定，但轮询共享同一轮：稳定耗时 = max(各路到位时间)。
+        if write_targets:
             settle_started = time.monotonic()
-            settled, actual = self._signals.wait_settled(
-                entry,
-                target_value,
-                tol=request.settle_tol,
-                timeout=request.settle_timeout_s,
-                readback_signal=entry.readback_signal or None,
-            )
-            settle_elapsed = time.monotonic() - settle_started
-            settle_s += settle_elapsed
-            if actual is not None:
-                readback[variable.signal] = float(actual)
-            self._emit(
+            settled_results = self._wait_all_settled(
                 run,
-                (
-                    f"{entry.label} 回读到位 {float(actual):g} {entry.unit}"
-                    if settled and actual is not None
-                    else (
-                        f"{entry.label} 未在 {request.settle_timeout_s:g}s 内进入容差"
-                        f"（当前 {float(actual):g}）" if actual is not None
-                        else f"{entry.label} 回读读不到"
-                    )
-                )
-                + f"（等待 {settle_elapsed:.2f}s）",
-                level=LEVEL_INFO if settled else LEVEL_WARN,
-                phase=PHASE_SETTLING,
+                write_targets,
                 iteration=proposal.iteration,
-                signal=variable.signal,
-                settled=bool(settled),
-                readback=None if actual is None else float(actual),
-                seconds=round(settle_elapsed, 3),
+                timeout=request.settle_timeout_s,
             )
-            if not settled:
-                # 未稳定仍如实记录：实际回读才是设备真实位置。但质量要标出来，
-                # 否则事后会把「还没到位就测的目标值」当成可靠数据。
-                unsettled.append(entry.label)
+            settle_s = time.monotonic() - settle_started
+            for variable, entry, target_value, variable_tol in write_targets:
+                settled, actual, settle_elapsed = settled_results[variable.signal]
+                if actual is not None:
+                    readback[variable.signal] = float(actual)
+                self._emit(
+                    run,
+                    (
+                        f"{entry.label} 回读到位 {float(actual):g} {entry.unit}"
+                        if settled and actual is not None
+                        else (
+                            f"{entry.label} 未在 {request.settle_timeout_s:g}s 内进入容差"
+                            f"（当前 {float(actual):g}）" if actual is not None
+                            else f"{entry.label} 回读读不到"
+                        )
+                    )
+                    + f"（等待 {settle_elapsed:.2f}s）",
+                    level=LEVEL_INFO if settled else LEVEL_WARN,
+                    phase=PHASE_SETTLING,
+                    iteration=proposal.iteration,
+                    signal=variable.signal,
+                    settled=bool(settled),
+                    readback=None if actual is None else float(actual),
+                    seconds=round(settle_elapsed, 3),
+                )
+                if not settled:
+                    # 未稳定仍如实记录：实际回读才是设备真实位置。但质量要标出来，
+                    # 否则事后会把「还没到位就测的目标值」当成可靠数据。
+                    unsettled.append(entry.label)
 
         applied_at = _now()
         samples: list[float] = []

@@ -4,7 +4,10 @@
 开始按钮、结果页要滚近 1000px、过程页曲线被挤成一条缝。它们不会让功能失效，
 所以不会被普通功能测试发现，只有把"1320×820 下必须零滚动"钉成断言才守得住。
 
-尺寸取客户端默认窗口（1320×820）下的页签可用区：1116×699。
+尺寸取客户端默认窗口（1320×820）下的**页签可用区**：1226×699。为了让页签区正好是这个
+尺寸，页面本身要建成 1266×799（页面标题 + 页签栏 + 页边距占掉 40×100）。直接把页面设成
+1116×699 会让页签区只有 578px 高、比真实窗口矮 121px，于是"配置页零滚动"这条件在测试里
+成立、在现场却不成立——现场会变成控件被按扁重叠。
 """
 
 from __future__ import annotations
@@ -16,17 +19,26 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QComboBox, QScrollArea, QTabWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QScrollArea,
+    QTabWidget,
+    QWidget,
+)
 
 from apps.desktop_client import instrument_api
+from apps.desktop_client.components import CompactForm
 from apps.desktop_client.pages.tuning import TuningPage
 
 MAGNET = "magnet.m1.current_setpoint"
 FOCUS = "ion_optics.focus.voltage_setpoint"
 
-# 默认窗口 1320×820 下，调束页页签区的实测可用尺寸
-TAB_WIDTH = 1116
+# 默认窗口 1320×820 下的实测值（tools/ui_snapshot 的探针复核过）
+TAB_WIDTH = 1226
 TAB_HEIGHT = 699
+PAGE_WIDTH = 1266
+PAGE_HEIGHT = 799
 
 
 def _entry(signal: str, label: str, unit: str, group: str, **extra: object) -> dict:
@@ -138,13 +150,17 @@ class TuningLayoutTests(unittest.TestCase):
 
     def make_page(self, count: int = 2, records: int = 24) -> TuningPage:
         page = TuningPage()
-        page.resize(TAB_WIDTH, TAB_HEIGHT)
+        page.resize(PAGE_WIDTH, PAGE_HEIGHT)
         page.show()
         page._mapping = mapping(count)
         page._catalog = catalog()
         page._build_variable_rows()
         page._build_targets()
         page._update_variable_hint()
+        # 页脚备注与保护卡摘要也要按真实内容算：它们是常驻页脚，文案一长就把
+        # 表单区顶矮，而"装不下"在这套布局里表现为滚动条（甚至控件被压扁）。
+        page._update_run_plan()
+        page._refresh_guard_summary()
         page.tabs.setTabEnabled(1, True)
         page.tabs.setTabEnabled(2, True)
         values = {MAGNET: 180.0, FOCUS: 2100.0}
@@ -174,6 +190,9 @@ class TuningLayoutTests(unittest.TestCase):
             }
         )
         self.app.processEvents()
+        # 先核对页签区尺寸：几何常量一旦和真实窗口脱节，"零滚动"这类断言就会失真
+        content = page.tabs.currentWidget()
+        self.assertEqual((content.width(), content.height()), (TAB_WIDTH, TAB_HEIGHT))
         return page
 
     @staticmethod
@@ -199,10 +218,58 @@ class TuningLayoutTests(unittest.TestCase):
         self.assertEqual(page.parameter_table.rowCount(), 12)
         self.assertGreater(page.parameter_table.height(), 150)
 
-    def test_expanding_advanced_options_still_fits(self) -> None:
+    def test_configuration_tab_never_squeezes_controls_into_each_other(self) -> None:
+        """比"要不要滚动"更硬的一条：控件不许被压到重叠、也不许低于最小高度。
+
+        高度不够时 Qt **不会**滚动，而是把布局项压到最小高度以下——现场就是这个
+        后果：安全卡表单从 229px 被压到 163px，两行输入框重叠 3px，绝对阈值框只剩
+        15px 高（点都点不到）。"零滚动"这条断言当时是绿的，因为它只数滚动条。
+        """
+        page = self.make_page(count=12)
+        page.tabs.setCurrentIndex(0)
+        self.app.processEvents()
+        host = page.tabs.widget(0)
+
+        # 只量"表单整体"是否被压扁：Qt 内部（如 QSpinBox 里的 QLineEdit）本来就可能
+        # 比自己的 sizeHint 矮，逐控件比 minimumSizeHint 会全是噪声。
+        squeezed = [
+            f"{form.height()} < {form.minimumSizeHint().height()}"
+            for form in host.findChildren(CompactForm)
+            if form.isVisible() and form.minimumSizeHint().height() > form.height() + 1
+        ]
+        self.assertEqual(squeezed, [], "表单被压到最小高度以下（控件会重叠/点不到）")
+        self.assertEqual(self.overlapping_pairs(host), [], "同层控件重叠")
+
+    @staticmethod
+    def overlapping_pairs(widget) -> list[str]:
+        """同一父控件下可见兄弟控件的重叠对（重叠 > 2px 才算，忽略像素取整）。"""
+        out: list[str] = []
+        parents = {
+            child.parentWidget()
+            for child in widget.findChildren(QWidget)
+            if child.parentWidget() is not None
+        }
+        for parent in parents:
+            children = [
+                child for child in parent.children()
+                if isinstance(child, QWidget) and child.isVisible()
+                and not child.isWindow() and child.width() > 1 and child.height() > 1
+            ]
+            for index, first in enumerate(children):
+                for second in children[index + 1:]:
+                    shared = first.geometry().intersected(second.geometry())
+                    if shared.width() > 2 and shared.height() > 2:
+                        out.append(
+                            f"{type(first).__name__}({first.objectName() or '-'}) ∩ "
+                            f"{type(second).__name__}({second.objectName() or '-'}) "
+                            f"= {shared.width()}x{shared.height()}"
+                        )
+        return out
+
+    def test_all_options_visible_still_fits(self) -> None:
+        """高级项不再折叠（默认全展开），整页仍不溢出、低频项可见。"""
         page = self.make_page(count=4)
 
-        page.advanced_button.setChecked(True)
         self.app.processEvents()
 
         self.assertEqual(self.scrolls_needing_scroll(page.tabs.widget(0)), [])
@@ -231,6 +298,63 @@ class TuningLayoutTests(unittest.TestCase):
 
         self.assertEqual(self.scrolls_needing_scroll(page.tabs.widget(1)), [])
         self.assertGreaterEqual(page.tuning_plot.height(), 320)
+
+    def test_monitor_tab_keeps_log_rounds_and_candidates_in_one_tab_strip(self) -> None:
+        """过程日志 / 轮次明细 / 本轮候选在同一容器里用页签分开。
+
+        三者并排或上下堆叠都会把彼此压到只剩几行；收进页签后每块都拿到整列高度。
+        """
+        page = self.make_page(records=24)
+        page._pending = {
+            "iteration": 24,
+            "predicted": 12.9,
+            "std": 0.4,
+            "values": {MAGNET: 205.5},
+            "active_signals": [MAGNET],
+        }
+        page._apply_status(
+            {"state": "awaiting_confirmation", "mode": "confirm",
+             "completed_iterations": 24, "max_iterations": 40, "pending": page._pending}
+        )
+
+        tabs = page.monitor_detail_tabs
+        self.assertIsInstance(tabs, QTabWidget)
+        self.assertEqual(tabs.count(), 3)
+        self.assertEqual(tabs.tabText(0), "过程日志")
+        self.assertEqual(tabs.tabText(1), "轮次明细 (24)")
+        self.assertIn("●", tabs.tabText(2), "有待确认候选时标签必须自带信号")
+        # 三块内容都真的在这个页签容器里
+        self.assertTrue(tabs.widget(0).isAncestorOf(page.event_log_view))
+        self.assertTrue(tabs.widget(1).isAncestorOf(page.recent_table))
+        self.assertTrue(tabs.widget(2).isAncestorOf(page.proposal_table))
+        # 页签栏不许溢出（溢出 = 后面的页签被滚动箭头藏起来，等于不存在）
+        # 先切到这一页让布局真正算尺寸：没显示过的页，页签栏宽度还是默认值
+        page.tabs.setCurrentIndex(1)
+        self.app.processEvents()
+        bar = tabs.tabBar()
+        total = sum(bar.tabRect(i).width() for i in range(bar.count()))
+        self.assertLessEqual(total, bar.width())
+
+    def test_candidate_tab_badge_clears_when_nothing_is_pending(self) -> None:
+        page = self.make_page(records=4)
+        page._pending = None
+        page._apply_status(
+            {"state": "running", "mode": "confirm", "completed_iterations": 4,
+             "max_iterations": 40, "pending": None}
+        )
+
+        self.assertEqual(page.monitor_detail_tabs.tabText(2), "本轮候选")
+
+    def test_result_tab_tab_strip_fits_four_tabs(self) -> None:
+        """结果页右栏 4 个页签同样不许溢出（4×150px 的最小宽度放不进 470px 一栏）。"""
+        page = self.make_page(records=24)
+        page.tabs.setCurrentIndex(2)
+        self.app.processEvents()
+
+        bar = page.result_detail_tabs.tabBar()
+        total = sum(bar.tabRect(i).width() for i in range(bar.count()))
+        self.assertEqual(bar.count(), 4)
+        self.assertLessEqual(total, bar.width())
 
     def test_monitor_tab_shows_a_timestamped_process_log(self) -> None:
         page = self.make_page(records=5)
@@ -271,8 +395,50 @@ class TuningLayoutTests(unittest.TestCase):
 
         self.assertEqual(self.scrolls_needing_scroll(page.tabs.widget(2)), [])
         self.assertIsInstance(page.result_detail_tabs, QTabWidget)
-        self.assertEqual(page.result_detail_tabs.count(), 3)
+        self.assertEqual(page.result_detail_tabs.count(), 4)
+        self.assertEqual(page.result_detail_tabs.tabText(0), "结论摘要")
         self.assertGreaterEqual(page.analysis_plot.height(), 240)
+
+    def test_result_surface_view_renders_with_the_blue_green_palette(self) -> None:
+        """结果页走的是 Matplotlib 画布：预测均值必须是同一支蓝绿色图（viridis）。
+
+        页面上有过两套响应面渲染（Matplotlib 画布 / pyqtgraph 兼容路径），色图一旦
+        分叉，同一个"预测均值"在两条路径下颜色不一样——看图的人只会看错。
+        """
+        page = self.make_page(records=24)
+        params = [MAGNET, FOCUS]
+        page._analysis = {
+            "importance": {"values": {MAGNET: 0.7, FOCUS: 0.3}},
+            "slice": {},
+            "n_complete": 24,
+            "history": {"points": []},
+            "surface": {
+                "available": True,
+                "params": params,
+                "bounds": [[100.0, 260.0], [1800.0, 2600.0]],
+                "pairs": {
+                    "0_1": {
+                        "mean": [[1.0, 2.0], [3.0, 4.0]],
+                        "std": [[0.1, 0.2], [0.3, 0.4]],
+                    }
+                },
+                "points": [[120.0, 1900.0]],
+                "best": [206.0, 2274.0],
+                "note": "",
+            },
+        }
+        page._refresh_result_analysis_choices()
+        page._set_analysis_choice("surface")
+        self.app.processEvents()
+
+        names = {
+            image.get_cmap().name
+            for axis in page.analysis_canvas.figure.axes
+            for image in axis.images
+        }
+        self.assertIn("viridis", names)
+        self.assertIn("magma", names)
+        self.assertIn("共用同一色标", page.analysis_note.text())
 
     def test_result_analysis_switches_between_views(self) -> None:
         page = self.make_page(records=24)

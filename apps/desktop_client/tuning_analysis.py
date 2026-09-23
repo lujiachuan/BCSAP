@@ -34,6 +34,31 @@ MANY_VARIABLES = 6
 
 STAGE_TEXT = {"sequential": "逐参数优化", "joint": "联合微调"}
 
+# 轮次质量（服务端的 ``quality``）→ 现场看得懂的短标签。
+# 把 ``write_rejected`` / ``unsettled`` 这类内部标识原样摆到表里，操作员得先背一份
+# 对照表才看得懂；含义不变，只换成中文短词，认不出的取值照样原样显示（不编解释）。
+QUALITY_TEXT = {
+    "ok": "可信",
+    "unsettled": "未稳定",
+    "write_rejected": "写入被拒",
+    "read_failed": "回读失败",
+}
+
+
+def quality_text(record: Mapping) -> str:
+    """这一轮的质量短标签（缺字段 → ``--``）。"""
+    raw = str(record.get("quality") or "")
+    if not raw:
+        return "--"
+    return QUALITY_TEXT.get(raw, raw)
+
+
+def seconds_text(value: object) -> str:
+    """分段耗时的 CSV 文本：拿不到就留空，不写 0（0 会被误读成"不耗时"）。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return ""
+    return f"{float(value):.3f}"
+
 
 def _objective(record: Mapping) -> float | None:
     value = record.get("objective")

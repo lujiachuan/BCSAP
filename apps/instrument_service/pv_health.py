@@ -43,8 +43,9 @@ def create_simulated_gateway(config: PvMappingConfig | None = None) -> Simulated
     同时按映射里的 ``readback_signal`` 建立「设定 → 回读」耦合，让模拟设备
     表现得像一个真的会跟随的电源，而不是一张扁平键值表。
 
-    无硬件联调时，把 4 个 DW 调优参数的 SIM 起点拉到离最优工作点（195/2500/2500/5100）
-    稍偏但仍有可观束流的位置，这样寻优一开始就能看到 fc1 上升曲线。
+    无硬件联调时，把 4 个 DW 调优参数的 SIM 起点拉到离最优工作点
+    （60/1850/950/3700，见 simulated.py）约 1~1.5σ 的位置，束流约为峰值的
+    55%，寻优一开始就能看到 fc1 明显上升，且起点远离量程边界。
     """
     target = config or pv_mapping.default_config()
     coupling = {
@@ -53,12 +54,13 @@ def create_simulated_gateway(config: PvMappingConfig | None = None) -> Simulated
         if entry.readback_signal
     }
     seeds = pv_mapping.simulated_seed_values(target)
-    # SIM 起点：略偏离最优，便于观察寻优收敛
+    # SIM 起点：偏离最优约 1~1.5σ（束流 ≈ 峰值 55%），
+    # 寻优一开始就能看到 fc1 上升曲线
     _sim_start = {
-        "hv_array.dw01.voltage_setpoint": 80.0,
-        "hv_array.dw02.voltage_setpoint": 1200.0,
-        "hv_array.dw03.voltage_setpoint": 1300.0,
-        "hv_array.dw04.voltage_setpoint": 2400.0,
+        "hv_array.dw01.voltage_setpoint": 130.0,
+        "hv_array.dw02.voltage_setpoint": 900.0,
+        "hv_array.dw03.voltage_setpoint": 1450.0,
+        "hv_array.dw04.voltage_setpoint": 2700.0,
     }
     for sig, val in _sim_start.items():
         if sig in seeds:

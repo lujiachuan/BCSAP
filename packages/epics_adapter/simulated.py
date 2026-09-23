@@ -8,25 +8,26 @@ from uuid import UUID
 from .base import Reading
 
 # 束流最优工作点（SIM 物理模型）：
-# 注：195/2500/2500/5100 是各参数的量程上限，不是最优；
-# 把最优放在量程中部，让 Optuna 在 [0, 上限] 内真的能找到峰。
-# DW1 skim: 0-200V，最优 100V
-# DW2 引出1: 0-2500V，最优 1500V
-# DW3 引出2: 0-2500V，最优 1500V
-# DW4 通道4: 0-5100V，最优 3000V
+# 最优**刻意不在量程正中**，且各维偏移方向、幅度都不同——响应面矩阵上
+# 峰不在画面中心，模拟调束看起来更像真实装置（原来 4 个最优全放正中，
+# 图上所有采样和峰值都挤在中间）。
+# DW1 skim: 0-200V，最优 60V（偏下）
+# DW2 引出1: 0-2500V，最优 1850V（偏上）
+# DW3 引出2: 0-2500V，最优 950V（偏下）
+# DW4 通道4: 0-5100V，最优 3700V（偏上）
 _BEST = {
-    "hv_array.dw01.voltage_setpoint": 100.0,
-    "hv_array.dw02.voltage_setpoint": 1500.0,
-    "hv_array.dw03.voltage_setpoint": 1500.0,
-    "hv_array.dw04.voltage_setpoint": 3000.0,
+    "hv_array.dw01.voltage_setpoint": 60.0,
+    "hv_array.dw02.voltage_setpoint": 1850.0,
+    "hv_array.dw03.voltage_setpoint": 950.0,
+    "hv_array.dw04.voltage_setpoint": 3700.0,
 }
-# σ 取量程约 40%：4 个高斯相乘时顶部曲率是各维之和，
-# σ 太窄会出现"顶点 12、旁边点就 4"的尖峰；放宽后峰附近平缓回落。
+# σ 差异化：各维敏感度不同（有的陡有的缓），响应面才有脊有谷，
+# 而不是每个方向都是对称的缓高斯。取量程约 22%~51%。
 _SIGMA = {
-    "hv_array.dw01.voltage_setpoint": 75.0,      # 量程 200V
-    "hv_array.dw02.voltage_setpoint": 1000.0,    # 量程 2500V
-    "hv_array.dw03.voltage_setpoint": 1000.0,    # 量程 2500V
-    "hv_array.dw04.voltage_setpoint": 2000.0,    # 量程 5100V
+    "hv_array.dw01.voltage_setpoint": 45.0,      # 量程 200V，陡
+    "hv_array.dw02.voltage_setpoint": 650.0,     # 量程 2500V，较陡
+    "hv_array.dw03.voltage_setpoint": 1200.0,    # 量程 2500V，缓
+    "hv_array.dw04.voltage_setpoint": 2600.0,    # 量程 5100V，缓
 }
 _PEAK_BEAM = 12.0  # nA，最优点束流
 

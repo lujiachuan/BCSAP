@@ -18,7 +18,6 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from apps.desktop_client import instrument_api, tuning_analysis
@@ -283,6 +282,53 @@ class TuningProcessLogTests(unittest.TestCase):
 
         text = page.log_view.toPlainText()
         self.assertRegex(text, r"\[\d{2}:\d{2}:\d{2}\.\d{3}\] \[第 1 轮")
+
+    def test_csv_export_keeps_suggestions_and_readbacks_in_separate_columns(self) -> None:
+        """轮次明细导出成 CSV（Excel 复盘用）：建议值与回读值分开两列，不做取舍。"""
+        page = self.make_page()
+        record = iteration(0, {MAGNET: 180.0}, 8.5)
+        record["readback"] = {MAGNET: 178.5}
+        record["write_s"] = 3.1
+        record["settle_s"] = 0.5
+        record["measure_s"] = 0.04
+        record["failure_step"] = None
+        page._iterations = [record]
+        target = Path(self._directory.name) / "rounds.csv"
+        with mock.patch(
+            "apps.desktop_client.pages.tuning.QFileDialog.getSaveFileName",
+            staticmethod(lambda *a, **k: (str(target), "")),
+        ):
+            page.export_iterations()
+
+        text = target.read_text(encoding="utf-8-sig")
+        header, row = text.splitlines()[:2]
+        self.assertIn("轮次,阶段,目标值,质量", header)
+        self.assertIn("写入耗时(s)", header)
+        self.assertIn("建议 磁铁1 电流设定", header)
+        self.assertIn("回读 磁铁1 电流设定", header)
+        self.assertIn("3.100", row, "分段耗时按秒写进 CSV")
+        self.assertIn("8.5", row)
+
+    def test_round_table_shows_chinese_quality_labels(self) -> None:
+        """``write_rejected`` 这类内部标识对操作员没有意义，表里要写中文短词。"""
+        page = self.make_page()
+        record = iteration(0, {MAGNET: 180.0}, None)
+        record["quality"] = "write_rejected"
+        record["detail"] = "越界"
+        page._on_iterations({"ok": True, "payload": {"iterations": [record]}})
+
+        item = page.recent_table.item(0, 3)
+        self.assertEqual(item.text(), "写入被拒")
+        self.assertEqual(item.toolTip(), "越界")
+        self.assertEqual(page.monitor_detail_tabs.tabText(1), "轮次明细 (1)")
+
+    def test_no_round_export_warns_instead_of_writing_an_empty_file(self) -> None:
+        page = self.make_page()
+        page._iterations = []
+
+        page.export_iterations()
+
+        self.assertIn("没有轮次记录", page.recent_note.text())
 
 
 class LogLineTests(unittest.TestCase):
