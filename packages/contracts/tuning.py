@@ -45,15 +45,20 @@ ENGINE_LABELS: dict[str, str] = {
     ENGINE_GRID: "Grid（Optuna）",
 }
 
-# 优化策略（改造报告 §5.2「两阶段优化策略」）
-#   joint                 — 所有勾选变量一起做贝叶斯优化（第一版行为）
-#   sequential_then_joint — 先逐个变量单独优化（其余保持不动），再在最优点附近联合微调
+# 优化策略：单阶段 = 所有选中变量一起优化；分阶段 = 每阶段一组变量联合优化。
+STRATEGY_SINGLE = "single"
+STRATEGY_STAGED = "staged"
+# 兼容旧配置/API；新客户端不再生成这两个值。
 STRATEGY_JOINT = "joint"
 STRATEGY_SEQUENTIAL = "sequential_then_joint"
-SUPPORTED_STRATEGIES: tuple[str, ...] = (STRATEGY_JOINT, STRATEGY_SEQUENTIAL)
+SUPPORTED_STRATEGIES: tuple[str, ...] = (
+    STRATEGY_SINGLE, STRATEGY_STAGED, STRATEGY_JOINT, STRATEGY_SEQUENTIAL
+)
 STRATEGY_LABELS: dict[str, str] = {
-    STRATEGY_JOINT: "全部联合优化",
-    STRATEGY_SEQUENTIAL: "逐参数 → 联合微调",
+    STRATEGY_SINGLE: "单阶段调优",
+    STRATEGY_STAGED: "分阶段调优",
+    STRATEGY_JOINT: "单阶段调优（旧配置）",
+    STRATEGY_SEQUENTIAL: "旧版逐参数策略",
 }
 
 # 阶段名（状态接口回传给界面显示"现在在哪个阶段、正在调哪个参数"）
@@ -241,6 +246,27 @@ class TuningInterlock(BaseModel):
     threshold: float = 0.0
 
 
+class TuningStage(BaseModel):
+    """一个阶段内共同优化的一组变量；不同阶段允许重复使用同一变量。"""
+
+    model_config = ConfigDict(strict=True)
+
+    name: str
+    signals: list[str]
+    iterations: int = 10
+    range_mode: str = "full"  # full：设备搜索范围；local：围绕前阶段最优缩小
+    range_fraction: float = 0.2
+
+    @field_validator("range_fraction", mode="before")
+    @classmethod
+    def _coerce_fraction(cls, value: object) -> object:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return float(value)
+        return value
+
+
 class TuningRunRequest(BaseModel):
     """一次调束任务的参数。"""
 
@@ -251,9 +277,11 @@ class TuningRunRequest(BaseModel):
     mode: str = MODE_CONFIRM
     max_iterations: int = 20
 
-    # ---- 两阶段策略（改造报告 §5.2）----
-    # joint = 全部联合；sequential_then_joint = 先逐参数、再联合微调
-    strategy: str = STRATEGY_JOINT
+    # ---- 优化策略 ----
+    # single = 所有选中参数一次联合优化；staged = 按配置逐阶段联合优化
+    strategy: str = STRATEGY_SINGLE
+    stages: list["TuningStage"] = []
+    # 旧版配置兼容字段；仅旧 sequential_then_joint 请求使用
     # 阶段 1 每个变量用多少轮（原 demo 的"每变量调用次数"）
     calls_per_variable: int = 3
     # 阶段 2 的联合范围 = 该参数**原范围** × 这个比例（围绕阶段 1 的最优点居中）
@@ -338,8 +366,7 @@ class TuningProposal(BaseModel):
 
     iteration: int
     values: dict[str, float]
-    # 本轮**真正会被写**的参数（两阶段策略下阶段 1 只调一个变量，
-    # 其余保持不动——界面要能说清"这轮到底动什么"）
+    # 本轮真正会被写的参数；分阶段时只包含本阶段的参数组。
     active_signals: list[str] = []
     stage: str = ""
     predicted: float
@@ -369,10 +396,7 @@ class TuningIteration(BaseModel):
     quality: str
     detail: str | None = None
     at: str
-    # 这一轮属于哪个阶段（``sequential`` / ``joint``）。两阶段策略下"第 3 轮"
-    # 并不足以说明当时在做什么，而阶段信息只存在于运行内存里——不记进每一轮，
-    # 事后复盘（导出日志、看响应曲线）就分不清哪几轮是逐参数、哪几轮是联合微调。
-    # 老记录没有这个字段：按 None 读，不猜。
+    # 这一轮所属阶段的显示名称，便于事后复盘；旧记录没有时按 None 读。
     stage: str | None = None
 
     # ---- 分批时间戳与耗时（新增，全部可选）----
@@ -474,12 +498,17 @@ class TuningRunStatus(BaseModel):
     target_signal: str
     max_iterations: int
     completed_iterations: int
-    # 优化策略与当前所处阶段（"现在在逐参数还是在联合微调、正在调哪个参数"）
+    # 优化策略、当前阶段与阶段内有效进度
     strategy: str = ""
     stage: str = ""
     stage_variable: str = ""
     stage_index: int = 0
     stage_total: int = 0
+    stage_name: str = ""
+    stage_names: list[str] = []
+    stage_signals: list[str] = []
+    stage_rounds: int = 0
+    stage_budget: int = 0
     best_objective: float | None = None
     best_values: dict[str, float] = {}
     pending: TuningProposal | None = None

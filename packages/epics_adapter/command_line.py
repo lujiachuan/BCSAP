@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import locale
+import math
 import os
 import shutil
 import subprocess
@@ -10,11 +12,19 @@ import sys
 from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import RLock
+from threading import BoundedSemaphore, RLock
 from time import monotonic
 from uuid import UUID
 
 from .base import Reading
+
+
+# 所有网关实例共用同一进程预算，避免单路读与快照补探同时耗尽系统句柄。
+_COMMAND_SLOTS = BoundedSemaphore(8)
+
+
+class EpicsCommandNotStarted(ConnectionError):
+    """命令尚未启动，确认没有向 IOC 下发写入。"""
 
 
 class CommandLineEpicsGateway:
@@ -25,6 +35,7 @@ class CommandLineEpicsGateway:
     MAX_SNAPSHOT_COMMANDS = 32
     SNAPSHOT_CACHE_S = 0.25
     OFFLINE_RETRY_S = 10.0
+    INVALID_VALUE_RETRY_S = 60.0
 
     def __init__(
         self,
@@ -35,6 +46,7 @@ class CommandLineEpicsGateway:
         caput_path: str | None = None,
         timeout: float = 3.0,
         batch_timeout: float = 20.0,
+        ca_wait: float = 1.0,
         runner=subprocess.run,
         clock=monotonic,
     ) -> None:
@@ -44,6 +56,8 @@ class CommandLineEpicsGateway:
         self._caput = caput_path or _find_epics_command("caput")
         self._timeout = timeout
         self._batch_timeout = batch_timeout
+        # 与 caget 当前默认值一致；现场验证后才能调整，避免误判慢连接为离线。
+        self._ca_wait = ca_wait
         self._runner = runner
         self._clock = clock
         self._snapshot_lock = RLock()
@@ -59,11 +73,15 @@ class CommandLineEpicsGateway:
 
     def read(self, signal: str) -> Reading:
         pv = self._pv(signal)
-        output, _detail = self._run([self._caget, "-t", "-n", pv])
+        output, _detail = self._run(
+            [self._caget, "-w", f"{self._ca_wait:g}", "-t", "-n", pv]
+        )
         try:
             value = float(output.splitlines()[-1].strip())
         except (IndexError, ValueError) as exc:
             raise ConnectionError(f"caget 返回了无法识别的值（{pv}）：{output}") from exc
+        if not math.isfinite(value):
+            raise ConnectionError(f"caget 返回了非有限数值（{pv}）：{output}")
         return self._reading(signal, value)
 
     def write(self, signal: str, value: float, command_id: UUID) -> Reading:
@@ -132,7 +150,11 @@ class CommandLineEpicsGateway:
                 detail = None
             elif signal in active or signal in retry:
                 detail = details.get(signal) or "caget 未返回该 PV"
-                self._offline_until[signal] = finished + self.OFFLINE_RETRY_S
+                retry_s = (
+                    self.INVALID_VALUE_RETRY_S
+                    if detail.startswith("PV 返回非数值") else self.OFFLINE_RETRY_S
+                )
+                self._offline_until[signal] = finished + retry_s
                 self._offline_details[signal] = detail
             else:
                 detail = self._offline_details.get(signal) or "PV 暂时离线，等待重试"
@@ -165,19 +187,28 @@ class CommandLineEpicsGateway:
             group = pending.popleft()
             try:
                 output, error = self._run(
-                    [self._caget, "-n", *(self._pv(signal) for signal in group)],
+                    [
+                        self._caget, "-w", f"{self._ca_wait:g}", "-n",
+                        *(self._pv(signal) for signal in group),
+                    ],
                     allow_nonzero=True,
                     timeout=min(self._timeout, remaining),
                 )
             except ConnectionError as exc:
                 output, error = "", str(exc)
             command_count += 1
-            found = self._parse_batch(output)
+            found, invalid = self._parse_batch(output)
             values.update(found)
             for signal in group:
                 if self._pv(signal) in found:
                     details.pop(signal, None)
-            missing = [signal for signal in group if self._pv(signal) not in found]
+            for signal in group:
+                if self._pv(signal) in invalid:
+                    details[signal] = f"PV 返回非数值：{invalid[self._pv(signal)]}"
+            missing = [
+                signal for signal in group
+                if self._pv(signal) not in found and self._pv(signal) not in invalid
+            ]
             if not missing:
                 continue
             detail = error or "caget 未返回该 PV"
@@ -217,22 +248,38 @@ class CommandLineEpicsGateway:
     ) -> tuple[str, str | None]:
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         encoding = locale.getpreferredencoding(False) or "utf-8"
+        limit = self._timeout if timeout is None else timeout
+        started = self._clock()
+        if not _COMMAND_SLOTS.acquire(timeout=max(0.0, limit)):
+            raise EpicsCommandNotStarted("EPICS 命令并发已满，本次命令未启动")
         try:
-            completed = self._runner(
-                args,
-                capture_output=True,
-                text=True,
-                encoding=encoding,
-                errors="replace",
-                timeout=self._timeout if timeout is None else timeout,
-                creationflags=flags,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise ConnectionError(
-                f"EPICS 命令执行超时（{float(exc.timeout):g} 秒）"
-            ) from exc
-        except OSError as exc:
-            raise ConnectionError(f"EPICS 命令执行失败：{exc}") from exc
+            remaining = limit - (self._clock() - started)
+            if remaining <= 0:
+                raise EpicsCommandNotStarted("等待 EPICS 命令空位超时，本次命令未启动")
+            try:
+                completed = self._runner(
+                    args,
+                    capture_output=True,
+                    text=True,
+                    encoding=encoding,
+                    errors="replace",
+                    timeout=remaining,
+                    creationflags=flags,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise ConnectionError(
+                    f"EPICS 命令执行超时（{float(exc.timeout):g} 秒）"
+                ) from exc
+            except OSError as exc:
+                # 仅把可确认发生在进程创建/装载阶段的错误判为「未下发」。
+                # 其它 OSError 可能发生在已启动进程的通信阶段，写入结果仍须视为未知。
+                if isinstance(exc, (FileNotFoundError, PermissionError)) or exc.errno in {
+                    errno.EAGAIN, errno.ENOMEM,
+                } or getattr(exc, "winerror", None) in {8, 1450}:
+                    raise EpicsCommandNotStarted(f"EPICS 命令未能启动：{exc}") from exc
+                raise ConnectionError(f"EPICS 命令执行状态未知：{exc}") from exc
+        finally:
+            _COMMAND_SLOTS.release()
         detail = (completed.stderr or completed.stdout or "未知错误").strip()
         if completed.returncode != 0 and not allow_nonzero:
             raise ConnectionError(f"EPICS 命令返回 {completed.returncode}：{detail}")
@@ -244,17 +291,27 @@ class CommandLineEpicsGateway:
         )
 
     @staticmethod
-    def _parse_batch(output: str) -> dict[str, float]:
+    def _parse_batch(output: str) -> tuple[dict[str, float], dict[str, str]]:
         values: dict[str, float] = {}
+        invalid: dict[str, str] = {}
         for line in output.splitlines():
             parts = line.strip().split(None, 1)
             if len(parts) != 2:
                 continue
-            try:
-                values[parts[0]] = float(parts[1].split()[0])
-            except ValueError:
+            tokens = parts[1].split()
+            if len(tokens) != 1:
+                invalid[parts[0]] = parts[1]
                 continue
-        return values
+            try:
+                value = float(tokens[0])
+            except ValueError:
+                invalid[parts[0]] = parts[1]
+                continue
+            if math.isfinite(value):
+                values[parts[0]] = value
+            else:
+                invalid[parts[0]] = parts[1]
+        return values, invalid
 
     def _reading(
         self,

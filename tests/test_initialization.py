@@ -40,6 +40,8 @@ class InitializationApiTests(unittest.TestCase):
         self.assertEqual(payload.status, "ready")
         self.assertEqual(payload.summary.connected, payload.summary.total)
         self.assertEqual(payload.summary.required_failed, 0)
+        self.assertIsNotNone(payload.total_latency_ms)
+        self.assertTrue(all(item.latency_ms is None for item in payload.items))
 
     def test_pv_health_items_are_exposed_as_details(self) -> None:
         details = _collect_pv_details(

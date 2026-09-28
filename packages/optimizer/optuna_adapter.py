@@ -113,7 +113,9 @@ class OptunaAsker:
 
     @property
     def n_observed(self) -> int:
-        return len(self._study.trials)
+        # ``ask()`` 会先留下 RUNNING trial；它不是本轮之前模型已见过的观测。
+        # 只数带 objective 的完成 trial，首轮不会被误判为已有历史。
+        return sum(trial.value is not None for trial in self._study.trials)
 
     @property
     def study(self) -> optuna.Study:

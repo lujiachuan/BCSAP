@@ -308,9 +308,12 @@ def request_tuning_progress(
     )
 
 
-def request_tuning_analysis(run_id: str, base_url: str | None = None):
+def request_tuning_analysis(
+    run_id: str, base_url: str | None = None, *, stage_index: int | None = None
+):
     """结束后分析：history / importance / slice / trials（从持久化 Optuna study 取）。"""
-    return _get(f"{TUNING_RUNS_PATH}/{run_id}/analysis", base_url)
+    suffix = "" if stage_index is None else f"?stage_index={int(stage_index)}"
+    return _get(f"{TUNING_RUNS_PATH}/{run_id}/analysis{suffix}", base_url)
 
 
 def request_tuning_approve(run_id: str, base_url: str | None = None):

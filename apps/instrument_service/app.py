@@ -394,13 +394,13 @@ def create_app(runtime: InstrumentRuntime | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/control/v1/tuning/runs/{run_id}/analysis")
-    def get_tuning_analysis(run_id: str):
+    def get_tuning_analysis(run_id: str, stage_index: int | None = None):
         """结束后分析：爬山图数据 / 参数重要性 / 一维切片 / trial 表。
 
         数据从持久化 Optuna study 取，前端用 pyqtgraph 画图。
         """
         storage_url = state.tuning.optuna_storage_url
-        result = tuning_analysis_service.analyze(storage_url, run_id)
+        result = tuning_analysis_service.analyze(storage_url, run_id, stage_index)
         if result is None:
             raise HTTPException(
                 status_code=404,

@@ -20,6 +20,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from apps.desktop_client import instrument_api
+from apps.desktop_client.pages import tuning
 from apps.desktop_client.pages.tuning import TuningPage
 from tests.test_tuning_layout import MAGNET, catalog, iteration, mapping
 
@@ -58,6 +59,21 @@ class TuningClientFixTests(unittest.TestCase):
             ),
             mock.patch.object(
                 instrument_api, "request_tuning_events", lambda *a, **k: _FakeThread()
+            ),
+            # 页面构造时还会发起恢复项/目录/能力请求与映射线程：这些回调在
+            # processEvents 期间到达会用现场数据覆盖测试桩（自动载入上次配置
+            # 会把 guard 卡阈值重置），让断言随现场漂移。一律换成假线程。
+            mock.patch.object(
+                instrument_api, "request_recovery_items", lambda *a, **k: _FakeThread()
+            ),
+            mock.patch.object(
+                instrument_api, "request_tuning_catalog", lambda *a, **k: _FakeThread()
+            ),
+            mock.patch.object(
+                instrument_api, "request_tuning_capabilities", lambda *a, **k: _FakeThread()
+            ),
+            mock.patch.object(
+                tuning, "PvMappingRequestThread", lambda *a, **k: _FakeThread()
             ),
         ]
         for patcher in self._network_patches:

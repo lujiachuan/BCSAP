@@ -49,7 +49,14 @@ class ScientificAnalysisCanvas(FigureCanvasQTAgg):
     def __init__(self, parent=None) -> None:
         # Windows 现场机通常自带微软雅黑；不依赖 LaTeX 或额外字体包，中文导出也可读。
         if _HAS_SCIENCEPLOTS:
-            style.use(["science", "no-latex"])
+            try:
+                style.use(["science", "no-latex"])
+            except (OSError, ValueError, FileNotFoundError) as _exc:
+                # 打包环境里 scienceplots 的 .mplstyle 数据文件可能没被收进
+                # datas（import 成功但样式文件缺失，style.use 抛 OSError）。
+                # 静默降级到下方手工 rcParams——字体/刻度/边框已全覆盖，
+                # 观感与 science 样式一致，不影响出图。
+                pass
         rcParams.update(
             {
                 # SciencePlots 默认 serif 会把中文落到缺字字体；强制无衬线后，
@@ -65,6 +72,17 @@ class ScientificAnalysisCanvas(FigureCanvasQTAgg):
                 "axes.unicode_minus": False,
                 "pdf.fonttype": 42,
                 "svg.fonttype": "none",
+                # 以下与 SciencePlots「science」样式对齐：细边框、刻度朝外、
+                # 无框图例，保证样式文件缺失时降级观感不变。
+                "axes.linewidth": 0.8,
+                "xtick.direction": "out",
+                "ytick.direction": "out",
+                "xtick.major.size": 3.5,
+                "ytick.major.size": 3.5,
+                "xtick.major.width": 0.6,
+                "ytick.major.width": 0.6,
+                "lines.linewidth": 1.0,
+                "legend.frameon": False,
             }
         )
         # 默认 6.4×4.0：正好装进结果页左面板视口（整页不滚动）；
@@ -72,7 +90,9 @@ class ScientificAnalysisCanvas(FigureCanvasQTAgg):
         self.figure = Figure(figsize=(6.4, 4.0), facecolor="white")
         super().__init__(self.figure)
         self.setParent(parent)
-        self.setMinimumHeight(280)
+        # 结果页还要容纳摘要与设备处置栏；230px 能保留单图的可读坐标，
+        # 同时不把默认 1320×820 窗口的页签区顶出可用高度。
+        self.setMinimumHeight(230)
         self._interactive_axes = []
         self._scroll_area = None
         self._base_canvas_size = (640, 400)

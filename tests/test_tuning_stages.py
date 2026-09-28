@@ -1,8 +1,9 @@
-"""两阶段优化策略：逐参数 → 联合微调。
+"""分阶段优化策略：每阶段一组参数联合优化。
 
-断言围绕三件事：阶段 1 **只动一个变量**（其余真的不被写）、
-阶段 2 **在最优点附近收窄**（不是把整段量程再搜一遍）、
-以及阶段切换时**已有观测不丢**（换维度的优化器要接续，否则每阶段都在重新瞎猜）。
+断言围绕三件事：阶段 1 **只动本阶段声明的变量**（其余真的不被写）、
+阶段 2 声明 ``range_mode="local"`` 时**在上一阶段最优点附近收窄**（不是把整段量程再搜一遍）、
+以及阶段切换时**维度随阶段重建**（换维度的优化器不投影旧观测，避免把
+不同固定条件下的采样混成一个模型）。
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from packages.contracts import (
     PvMappingConfig,
     TuningIteration,
     TuningRunRequest,
+    TuningStage,
     TuningVariable,
 )
 from tests.test_tuning_service import MAGNET, MAGNET_RB, TARGET, entry
@@ -101,38 +103,44 @@ class StageStrategyTests(unittest.TestCase):
             run_id
         ).iterations[-1].model_dump()
 
-    def test_joint_strategy_is_a_single_stage_over_every_variable(self) -> None:
+    def test_default_strategy_is_a_single_stage_over_every_variable(self) -> None:
         run_id = self.service.start(two_variable_request()).run_id
         run = self.service._require(run_id)
 
-        self.assertEqual(run.stage, "joint")
+        self.assertEqual(run.stage, "stage_01")
+        self.assertEqual(run.stage_name, "单阶段")
         self.assertEqual(sorted(run.active_signals), sorted([MAGNET, FOCUS]))
         status = self.service.status(run_id)
-        self.assertEqual(status.strategy, "joint")
-        self.assertEqual(status.stage, "joint")
+        self.assertEqual(status.strategy, "single")
+        self.assertEqual(status.stage_name, "单阶段")
 
-    def test_sequential_strategy_tunes_one_variable_at_a_time(self) -> None:
+    def test_staged_strategy_tunes_one_variable_at_a_time(self) -> None:
         run_id = self.service.start(
             two_variable_request(
-                strategy="sequential_then_joint", calls_per_variable=2, max_iterations=8
+                strategy="staged",
+                stages=[
+                    TuningStage(name="磁铁阶段", signals=[MAGNET], iterations=2),
+                    TuningStage(name="聚焦阶段", signals=[FOCUS], iterations=2),
+                ],
+                max_iterations=8,
             )
         ).run_id
 
         seen: list[tuple[str, list[str], str]] = []
-        for _ in range(6):
+        for _ in range(4):
             run = self.service._require(run_id)
             status = self.service._status_of(run)
-            seen.append((run.stage, list(run.active_signals), status.stage_variable))
+            seen.append((run.stage_name, list(run.active_signals), status.stage_variable))
             self.service.approve(run_id)
 
-        # 前 2 轮调磁铁、接着 2 轮调聚焦、之后进入联合
-        self.assertEqual([item[1] for item in seen[:4]],
-                         [[MAGNET], [MAGNET], [FOCUS], [FOCUS]])
-        self.assertEqual(seen[0][0], "sequential")
+        # 前 2 轮调磁铁、接着 2 轮调聚焦
+        self.assertEqual(
+            [item[1] for item in seen], [[MAGNET], [MAGNET], [FOCUS], [FOCUS]]
+        )
+        self.assertEqual(seen[0][0], "磁铁阶段")
         self.assertEqual(seen[0][2], MAGNET)
+        self.assertEqual(seen[3][0], "聚焦阶段")
         self.assertEqual(seen[3][2], FOCUS)
-        self.assertEqual(seen[4][0], "joint")
-        self.assertEqual(sorted(seen[4][1]), sorted([MAGNET, FOCUS]))
 
     def test_stage_one_does_not_write_the_held_variable(self) -> None:
         run_id = self.service.start(
@@ -160,29 +168,42 @@ class StageStrategyTests(unittest.TestCase):
         self.assertIn(FOCUS, iteration["readback"])
 
     def test_each_iteration_records_which_stage_it_belongs_to(self) -> None:
-        """每一轮都记下阶段：只写"第 3 轮"的话，事后（导出日志/响应曲线）
-        分不清那几轮是逐参数还是联合微调。（改造报告 §8.9 P2.4）"""
+        """每一轮都记下阶段名：只写"第 3 轮"的话，事后（导出日志/响应曲线）
+        分不清那几轮属于哪个阶段。（改造报告 §8.9 P2.4）"""
         run_id = self.service.start(
-            two_variable_request(strategy="sequential_then_joint", calls_per_variable=1,
-                                 max_iterations=6)
+            two_variable_request(
+                strategy="staged",
+                stages=[
+                    TuningStage(name="阶段 1", signals=[MAGNET], iterations=1),
+                    TuningStage(name="阶段 2", signals=[FOCUS], iterations=1),
+                ],
+                max_iterations=4,
+            )
         ).run_id
 
-        stages = [self.run_round(run_id)["stage"] for _ in range(3)]
+        stages = [self.run_round(run_id)["stage"] for _ in range(2)]
 
-        self.assertEqual(stages, ["sequential", "sequential", "joint"])
+        self.assertEqual(stages, ["阶段 1", "阶段 2"])
 
     def test_stage_two_bounds_are_narrowed_around_the_stage_one_best(self) -> None:
         run_id = self.service.start(
-            two_variable_request(strategy="sequential_then_joint", calls_per_variable=1,
-                                 joint_frac=0.2, max_iterations=6)
+            two_variable_request(
+                strategy="staged",
+                stages=[
+                    TuningStage(name="全量阶段", signals=[MAGNET, FOCUS], iterations=2),
+                    TuningStage(name="局部阶段", signals=[MAGNET, FOCUS], iterations=2,
+                                range_mode="local", range_fraction=0.2),
+                ],
+                max_iterations=6,
+            )
         ).run_id
-        for _ in range(2):  # 阶段 1 走完（2 个变量各 1 轮）
+        for _ in range(2):  # 阶段 1 走完（2 个有效轮次）
             self.service.approve(run_id)
         run = self.service._require(run_id)
 
         dimensions = {d.name: d for d in run.optimizer.dimensions}
 
-        self.assertEqual(run.stage, "joint")
+        self.assertEqual(run.stage_name, "局部阶段")
         # 每个变量都被收窄到原范围的 20%，且落在原范围之内
         for name, (low, high) in (
             (MAGNET, (100.0, 300.0)),
@@ -192,55 +213,86 @@ class StageStrategyTests(unittest.TestCase):
             self.assertLessEqual(dimension.span, (high - low) * 0.2 + 1e-9)
             self.assertGreaterEqual(dimension.low, low)
             self.assertLessEqual(dimension.high, high)
-            # 收窄区间必须包含该变量**自己**的最优点（联合微调围绕它做）
-            center = run.variable_best[name][0]
+            # 收窄区间必须包含上一阶段该变量**自己**的最优点（局部阶段围绕它做）
+            center = run.previous_stage_values[name]
             self.assertLessEqual(dimension.low, center)
             self.assertGreaterEqual(dimension.high, center)
 
     def test_stage_two_centers_on_each_variables_own_best_point(self) -> None:
         """报告要求围绕**各最优点**收窄，而不是围绕最后一轮停在哪。"""
         run_id = self.service.start(
-            two_variable_request(strategy="sequential_then_joint", calls_per_variable=3,
-                                 joint_frac=0.1, max_iterations=12)
+            two_variable_request(
+                strategy="staged",
+                stages=[
+                    TuningStage(name="全量阶段", signals=[MAGNET, FOCUS], iterations=3),
+                    TuningStage(name="局部阶段", signals=[MAGNET, FOCUS], iterations=3,
+                                range_mode="local", range_fraction=0.1),
+                ],
+                max_iterations=8,
+            )
         ).run_id
-        for _ in range(6):  # 2 个变量各 3 轮
+        for _ in range(3):  # 阶段 1 走完（3 个有效轮次）
             self.service.approve(run_id)
         run = self.service._require(run_id)
 
         for name in (MAGNET, FOCUS):
-            best_value, _objective = run.variable_best[name]
+            best_value = run.previous_stage_values[name]
             dimension = {d.name: d for d in run.optimizer.dimensions}[name]
             self.assertLessEqual(dimension.low, best_value)
             self.assertGreaterEqual(dimension.high, best_value)
 
-    def test_stage_two_keeps_the_observations_from_stage_one(self) -> None:
+    def test_stage_two_builds_a_fresh_optimizer(self) -> None:
+        """阶段切换重建优化器：维度/固定条件不同，旧观测不投影进新阶段。"""
         run_id = self.service.start(
-            two_variable_request(strategy="sequential_then_joint", calls_per_variable=2,
-                                 max_iterations=8)
+            two_variable_request(
+                strategy="staged",
+                stages=[
+                    TuningStage(name="阶段 1", signals=[MAGNET, FOCUS], iterations=2),
+                    TuningStage(name="阶段 2", signals=[MAGNET, FOCUS], iterations=2),
+                ],
+                max_iterations=6,
+            )
         ).run_id
-        for _ in range(4):
+        for _ in range(2):
             self.service.approve(run_id)
 
         run = self.service._require(run_id)
 
-        self.assertEqual(run.stage, "joint")
-        self.assertEqual(run.optimizer.n_observed, 4, "换阶段的优化器要接续已有观测")
+        self.assertEqual(run.stage_name, "阶段 2")
+        # 阶段切换重建优化器：阶段 1 的 2 个观测不会投影进来；此时唯一的观测
+        # 是"首轮以设备当前位置 seed"的那一个点（seed 后计入 n_observed）。
+        self.assertLessEqual(run.optimizer.n_observed, 1, "旧阶段观测不应投影进新阶段")
 
-    def test_sequential_without_room_for_stage_two_is_refused(self) -> None:
+    def test_stages_over_budget_are_refused(self) -> None:
         with self.assertRaises(TuningError) as caught:
             self.service.start(
-                two_variable_request(strategy="sequential_then_joint",
-                                     calls_per_variable=3, max_iterations=6)
+                two_variable_request(
+                    strategy="staged",
+                    stages=[
+                        TuningStage(name="阶段 1", signals=[MAGNET], iterations=3),
+                        TuningStage(name="阶段 2", signals=[FOCUS], iterations=3),
+                    ],
+                    max_iterations=4,
+                )
             )
 
-        self.assertIn("联合微调阶段没有轮次可用", str(caught.exception))
+        self.assertIn("超过最大尝试轮次", str(caught.exception))
 
     def test_invalid_strategy_parameters_are_rejected(self) -> None:
         cases = (
             {"strategy": "magic"},
-            {"calls_per_variable": 0},
-            {"joint_frac": 0.0},
-            {"joint_frac": 1.5},
+            {"strategy": "staged"},  # 无阶段配置
+            # 局部搜索比例越界
+            {"strategy": "staged", "stages": [
+                {"name": "x", "signals": [MAGNET], "iterations": 1, "range_fraction": 0.0}]},
+            {"strategy": "staged", "stages": [
+                {"name": "x", "signals": [MAGNET], "iterations": 1, "range_fraction": 1.5}]},
+            # 阶段内信号重复
+            {"strategy": "staged", "stages": [
+                {"name": "x", "signals": [MAGNET, MAGNET], "iterations": 1}]},
+            # 启用参数没有全部分配进阶段
+            {"strategy": "staged", "stages": [
+                {"name": "x", "signals": [MAGNET], "iterations": 1}]},
             {"hold_s": -1.0},
         )
         for overrides in cases:
@@ -258,18 +310,28 @@ class StageStrategyTests(unittest.TestCase):
 
     def test_status_reports_stage_position(self) -> None:
         run_id = self.service.start(
-            two_variable_request(strategy="sequential_then_joint", calls_per_variable=1,
-                                 max_iterations=6)
+            two_variable_request(
+                strategy="staged",
+                stages=[
+                    TuningStage(name="磁铁阶段", signals=[MAGNET], iterations=1),
+                    TuningStage(name="聚焦阶段", signals=[FOCUS], iterations=1),
+                ],
+                max_iterations=4,
+            )
         ).run_id
 
         first = self.service.status(run_id)
         self.service.approve(run_id)
         second = self.service.status(run_id)
 
-        self.assertEqual((first.stage, first.stage_index, first.stage_total),
-                         ("sequential", 1, 2))
-        self.assertEqual((second.stage, second.stage_index, second.stage_total),
-                         ("sequential", 2, 2))
+        self.assertEqual(
+            (first.stage_name, first.stage_index, first.stage_total),
+            ("磁铁阶段", 1, 2),
+        )
+        self.assertEqual(
+            (second.stage_name, second.stage_index, second.stage_total),
+            ("聚焦阶段", 2, 2),
+        )
         self.assertEqual(second.stage_variable, FOCUS)
 
     def test_snapshot_read_is_retried_before_refusing_to_start(self) -> None:

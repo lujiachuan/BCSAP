@@ -1137,6 +1137,8 @@ class _MagnetGroupPanel(QWidget):
             return
         result = payload.get("payload") or {}
         detail = result.get("message") or ""
+        if any(item.get("device_state_unknown") for item in result.get("results") or []):
+            self.page._load_startup_recoveries()
         if result.get("ok"):
             self._set_result(detail or "成组下发完成", "good")
             return
@@ -2067,7 +2069,7 @@ class ManualControlPage(QWidget):
         if items:
             groups = sorted({group for item in items for group in item.get("groups", [])})
             self.topbar.set_message(
-                f"发现 {len(items)} 个重启恢复项，设备组仍锁定：{'、'.join(groups)}。"
+                f"发现 {len(items)} 个待确认设备状态项，设备组仍锁定：{'、'.join(groups)}。"
                 "请先核对设备实际状态。",
                 "error",
             )
@@ -2076,7 +2078,7 @@ class ManualControlPage(QWidget):
         answer = QMessageBox.question(
             self,
             "确认设备状态",
-            "请确认已在现场核对所有重启遗留任务涉及的设备实际状态。\n"
+            "请确认已在现场核对所有待确认任务涉及的设备实际状态。\n"
             "确认后将释放这些设备组，允许新的手动、扫谱和调束操作。",
         )
         if answer != QMessageBox.StandardButton.Yes:
@@ -2091,7 +2093,8 @@ class ManualControlPage(QWidget):
             self.topbar.set_message(f"恢复确认失败：{payload.get('message', '')}", "error")
             return
         self.topbar.recovery_button.setVisible(False)
-        self.topbar.set_message("重启恢复项已确认，相关设备组已释放。", "good")
+        self.topbar.set_message("本次待确认设备状态已人工确认，正在核对剩余项目。", "good")
+        self._load_startup_recoveries()
 
     def _lock_read_only_controls(self) -> None:
         """把本页所有会写设备的控件压住，并在成组卡片上说明原因。"""
@@ -2295,6 +2298,13 @@ class ManualControlPage(QWidget):
     def _poll(self) -> None:
         if not self._mapping_loaded:
             return
+        signals = list(dict.fromkeys(
+            [str(entry.get("signal") or "") for entry in self._topbar_signals]
+            + [signal for row in self._rows for signal in row.spec.signals()]
+        ))
+        signals = [signal for signal in signals if signal]
+        if self._entries and not signals:
+            return
         if self._read_in_flight:
             # 正常情况下完成回调会清掉标记。若旧式“先启动、后绑定”丢过完成
             # 信号，线程早已结束而标记仍为 True；这里允许下一拍自恢复。
@@ -2302,7 +2312,9 @@ class ManualControlPage(QWidget):
                 return
             self._read_in_flight = False
         self._read_in_flight = True
-        self._reader = instrument_api.request_read(on_completed=self._on_snapshot)
+        self._reader = instrument_api.request_read(
+            signals=signals, on_completed=self._on_snapshot
+        )
 
     def _on_snapshot(self, payload: dict) -> None:
         self._read_in_flight = False
@@ -2380,12 +2392,15 @@ class ManualControlPage(QWidget):
                 message = f"{quantity} · {detail} · 但设备状态未知，请现场核对"
                 row.mark_rejected(f"{detail}；设备状态未知，请现场核对")
                 self.topbar.set_message(message, "error")
+                self._load_startup_recoveries()
                 return
             self.topbar.set_message(f"{quantity} · {detail}", "good")
         else:
             reason = f"被拒绝：{result.get('reason', '未知原因')}"
             row.mark_rejected(reason)
             self.topbar.set_message(f"{quantity} · {reason}", "error")
+            if result.get("device_state_unknown"):
+                self._load_startup_recoveries()
 
     # ------------------------------------------------------------------
     # 全部关断
@@ -2433,6 +2448,8 @@ class ManualControlPage(QWidget):
             self.topbar.set_message(f"全部关断未执行：{payload.get('message', '')}", "error")
             return
         result = payload.get("payload") or {}
+        if any(item.get("device_state_unknown") for item in result.get("results") or []):
+            self._load_startup_recoveries()
         state = "good" if result.get("ok") else "error"
         self.topbar.set_message(result.get("message") or "全部关断完成。", state)
 

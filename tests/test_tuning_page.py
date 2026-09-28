@@ -384,6 +384,7 @@ class TuningGuardDisplayTests(unittest.TestCase):
         page.loss_relative_spin.setValue(35.0)
         page.loss_strikes_spin.setValue(3)
         page.auto_recover_check.setChecked(False)
+        page.reset_before_start_check.setChecked(True)
         captured: dict = {}
 
         def fake_start(request: dict, base_url=None):  # noqa: ANN001
@@ -397,6 +398,7 @@ class TuningGuardDisplayTests(unittest.TestCase):
         self.assertAlmostEqual(captured["loss_relative"], 0.35)
         self.assertEqual(captured["loss_strikes"], 3)
         self.assertFalse(captured["auto_recover"])
+        self.assertTrue(captured["reset_before_start"])
 
     def test_absolute_threshold_is_omitted_when_not_enabled(self) -> None:
         page = self.make_page()
@@ -621,30 +623,36 @@ class TuningStrategyUiTests(unittest.TestCase):
         self._start_patch.start()
         return captured
 
-    def test_default_strategy_is_full_joint(self) -> None:
+    def test_default_strategy_is_single_stage(self) -> None:
         page = self.ready_page()
         captured = self.capture_start(page)
 
         page.start_tuning()
 
-        self.assertEqual(captured["strategy"], "joint")
-        self.assertEqual(captured["joint_frac"], 0.2)
-        self.assertEqual(captured["calls_per_variable"], 3)
+        self.assertEqual(captured["strategy"], "single")
+        self.assertEqual(captured["samples_per_point"], 3)
         self.assertEqual(captured["hold_s"], 0.0)
+        self.assertEqual(captured["stages"], [])
 
-    def test_sequential_strategy_and_its_parameters_are_sent(self) -> None:
+    def test_staged_strategy_and_its_parameters_are_sent(self) -> None:
         page = self.ready_page()
-        page.strategy.setCurrentIndex(1)  # 逐参数 → 联合微调
-        page.calls_spin.setValue(4)
-        page.joint_frac_spin.setValue(35.0)
+        page.strategy.setCurrentIndex(1)  # 分阶段调优
+        page._stage_specs = [
+            {
+                "name": "引出阶段",
+                "signals": ["magnet.m1.current_setpoint"],
+                "iterations": 4,
+            }
+        ]
+        page.samples_spin.setValue(4)
         page.hold_spin.setValue(2.5)
         captured = self.capture_start(page)
 
         page.start_tuning()
 
-        self.assertEqual(captured["strategy"], "sequential_then_joint")
-        self.assertEqual(captured["calls_per_variable"], 4)
-        self.assertAlmostEqual(captured["joint_frac"], 0.35)
+        self.assertEqual(captured["strategy"], "staged")
+        self.assertEqual(captured["stages"][0]["name"], "引出阶段")
+        self.assertEqual(captured["samples_per_point"], 4)
         self.assertEqual(captured["hold_s"], 2.5)
 
     def test_stage_position_is_shown_in_the_iteration_label(self) -> None:
@@ -655,20 +663,21 @@ class TuningStrategyUiTests(unittest.TestCase):
                 "state": "awaiting_confirmation",
                 "completed_iterations": 2,
                 "max_iterations": 9,
-                "strategy": "sequential_then_joint",
-                "stage": "sequential",
+                "strategy": "staged",
+                "stage_name": "阶段 1",
                 "stage_index": 1,
                 "stage_total": 3,
-                "stage_variable": "magnet.m1.current_setpoint",
+                "stage_rounds": 2,
+                "stage_budget": 4,
             }
         )
 
         text = page.iteration_label.text()
         self.assertIn("已完成 2 / 9 轮", text)
-        self.assertIn("逐参数 1/3", text)
-        self.assertIn("magnet.m1.current_setpoint", text)
+        self.assertIn("阶段 1 1/3", text)
+        self.assertIn("2/4", text)
 
-    def test_joint_stage_is_shown_too(self) -> None:
+    def test_single_stage_suffix_shows_single_stage(self) -> None:
         page = TuningPage()
 
         page._apply_status(
@@ -676,11 +685,11 @@ class TuningStrategyUiTests(unittest.TestCase):
                 "state": "awaiting_confirmation",
                 "completed_iterations": 6,
                 "max_iterations": 9,
-                "stage": "joint",
+                "strategy": "single",
             }
         )
 
-        self.assertIn("联合微调", page.iteration_label.text())
+        self.assertIn("单阶段", page.iteration_label.text())
 
     def test_proposal_scope_names_the_active_variable(self) -> None:
         page = TuningPage()

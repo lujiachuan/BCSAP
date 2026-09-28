@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -87,6 +88,21 @@ class ManualPollingLifecycleTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["on_completed"], self.page._on_snapshot)
         self.assertTrue(self.page._read_in_flight)
+
+    def test_poll_reads_only_displayed_signals(self) -> None:
+        calls = []
+        self.page._entries = [{"signal": "hidden.signal"}]
+        self.page._topbar_signals = [{"signal": "detector.fc1.beam_current"}]
+        self.page._rows = [SimpleNamespace(
+            spec=SimpleNamespace(signals=lambda: ["visible.setpoint", "visible.readback"])
+        )]
+
+        with mock.patch.object(instrument_api, "request_read", side_effect=lambda **kwargs: calls.append(kwargs)):
+            self.page._poll()
+
+        self.assertEqual(calls[0]["signals"], [
+            "detector.fc1.beam_current", "visible.setpoint", "visible.readback",
+        ])
 
 
 class _GroupPanelSignal:
@@ -1237,6 +1253,25 @@ class PageTests(unittest.TestCase):
         self.assertIn("整批未下发", self.page.status_label.text())
         self.assertTrue(self.page.all_off_button.isEnabled())
 
+    def test_all_off_unknown_state_refreshes_recovery_items(self) -> None:
+        with mock.patch.object(self.page, "_load_startup_recoveries") as refresh:
+            self.page._on_all_off_result({
+                "ok": True,
+                "payload": {
+                    "ok": False,
+                    "message": "设备状态未知，请人工确认",
+                    "results": [{"device_state_unknown": True}],
+                },
+            })
+
+        refresh.assert_called_once_with()
+
+    def test_recovery_acknowledgement_reloads_remaining_items(self) -> None:
+        with mock.patch.object(self.page, "_load_startup_recoveries") as refresh:
+            self.page._on_startup_recovery_acknowledged({"ok": True})
+
+        refresh.assert_called_once_with()
+
     def test_all_off_is_sent_as_one_atomic_batch(self) -> None:
         self.page._on_mapping({"ok": True, "config": {"entries": dw_entries()}})
         sent: dict = {}
@@ -2327,6 +2362,22 @@ class MagnetGroupPanelTests(unittest.TestCase):
         self.assertIn("magnet.m2.current_setpoint", text)
         self.assertIn("CA 写入超时", text)
         self.assertEqual(panel.result_label.property("state"), "error")
+
+    def test_batch_unknown_state_refreshes_recovery_items(self) -> None:
+        page = self.make_page()
+        panel = page.magnet_group_panel
+
+        with mock.patch.object(page, "_load_startup_recoveries") as refresh:
+            panel._on_done({
+                "ok": True,
+                "payload": {
+                    "ok": False,
+                    "message": "设备状态未知，请人工确认",
+                    "results": [{"device_state_unknown": True, "accepted": False}],
+                },
+            })
+
+        refresh.assert_called_once_with()
 
     def test_transport_failure_is_never_shown_as_success(self) -> None:
         page = self.make_page()

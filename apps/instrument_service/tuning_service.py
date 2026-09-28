@@ -46,9 +46,9 @@ from packages.contracts.tuning import (
     PHASE_SETTLING,
     PHASE_WAITING_CONFIRMATION,
     PHASE_WRITING,
-    STAGE_JOINT,
-    STAGE_LABELS,
-    STAGE_SEQUENTIAL,
+    STRATEGY_SINGLE,
+    STRATEGY_STAGED,
+    TuningStage,
     STRATEGY_SEQUENTIAL,
     SUPPORTED_ENGINES,
     SUPPORTED_MODES,
@@ -183,16 +183,18 @@ class _Run:
     # 结束后的处置（应用最优/恢复初始/回安全值）最近一次结果
     finalize: TuningFinalizeResult | None = None
     # ---- 两阶段策略的运行态 ----
-    # 当前阶段（sequential / joint）与该阶段已用轮次
+    # 当前阶段游标（0 起）与有效轮次
     stage: str = ""
+    stage_cursor: int = 0
+    stage_name: str = ""
     stage_rounds: int = 0
     # 当前这一轮真正会写的信号（阶段 1 只写一个变量，其余保持不动）
     active_signals: list[str] = field(default_factory=list)
     # 未被激活的变量保持的值（初始取启动前快照，每轮按实际回读更新）
     held_values: dict[str, float] = field(default_factory=dict)
-    # 每个变量**自己**的最优点（信号 → (值, 当时的目标值)）：
-    # 联合微调要围绕它收窄，而不是围绕"最后一轮停在哪"
-    variable_best: dict[str, tuple[float, float]] = field(default_factory=dict)
+    previous_stage_values: dict[str, float] = field(default_factory=dict)
+    stage_best_objective: float | None = None
+    stage_best_values: dict[str, float] = field(default_factory=dict)
     # Optuna study 名（= run_id），供分析 API / dashboard 定位持久化 study
     optuna_study_name: str = ""
     # ---- 实时进度（第二批：事件流 / 阶段 / 版本号）----
@@ -395,11 +397,16 @@ class TuningService:
             stage=run.stage,
             stage_variable=(
                 run.active_signals[0]
-                if run.stage == STAGE_SEQUENTIAL and run.active_signals
+                if len(run.active_signals) == 1
                 else ""
             ),
             stage_index=self._stage_index(run),
             stage_total=self._stage_total(run),
+            stage_name=run.stage_name,
+            stage_names=[stage.name for stage in self._stage_specs(run)],
+            stage_signals=list(run.active_signals),
+            stage_rounds=run.stage_rounds,
+            stage_budget=(self._current_stage(run).iterations if self._current_stage(run) else 0),
             anomalies=run.anomalies,
             recovery=run.recovery,
             finalize=run.finalize,
@@ -844,27 +851,45 @@ class TuningService:
             raise TuningError("最大迭代次数至少为 1")
         if request.samples_per_point < 1:
             raise TuningError("每轮目标采样次数至少为 1")
-        # 两阶段策略的参数校验：轮次/比例/保持时间的取值必须自洽，
-        # 否则会得到一个"阶段 1 跑不完"或"联合范围退化成一个点"的任务。
+        # 校验新阶段配置；每阶段内部是联合搜索，跨阶段允许参数重复。
         if request.strategy not in SUPPORTED_STRATEGIES:
             raise TuningError(
                 f"未知的优化策略 {request.strategy!r}，支持："
                 f"{'、'.join(SUPPORTED_STRATEGIES)}"
             )
-        if request.calls_per_variable < 1:
-            raise TuningError("每个变量的调用轮次至少为 1")
-        if not 0.0 < request.joint_frac <= 1.0:
-            raise TuningError("联合微调范围比例必须落在 (0, 1] 之间")
         if request.hold_s < 0:
             raise TuningError("保持时间不能为负")
-        if request.strategy == STRATEGY_SEQUENTIAL:
-            needed = request.calls_per_variable * len(variables)
-            if needed >= request.max_iterations:
+        if request.strategy == STRATEGY_STAGED:
+            if not request.stages:
+                raise TuningError("分阶段调优至少需要配置一个阶段")
+            enabled = {v.signal for v in variables}
+            configured: set[str] = set()
+            total_budget = 0
+            for index, stage in enumerate(request.stages, 1):
+                if not stage.name.strip() or not stage.signals:
+                    raise TuningError(f"阶段 {index} 需要名称和至少一个参数")
+                if stage.iterations < 1:
+                    raise TuningError(f"阶段 {stage.name} 的有效轮次至少为 1")
+                if stage.range_mode not in ("full", "local"):
+                    raise TuningError(f"阶段 {stage.name} 的搜索范围类型无效")
+                if not 0.0 < stage.range_fraction <= 1.0:
+                    raise TuningError(f"阶段 {stage.name} 的局部搜索比例需在 (0, 1] 内")
+                if len(stage.signals) != len(set(stage.signals)):
+                    raise TuningError(f"阶段 {stage.name} 内参数不能重复")
+                unknown = set(stage.signals) - enabled
+                if unknown:
+                    raise TuningError(
+                        f"阶段 {stage.name} 包含未启用参数：{'、'.join(sorted(unknown))}"
+                    )
+                configured.update(stage.signals)
+                total_budget += stage.iterations
+            missing = enabled - configured
+            if missing:
+                raise TuningError("以下启用参数未分配到任何阶段：" + "、".join(sorted(missing)))
+            if total_budget > request.max_iterations:
                 raise TuningError(
-                    f"逐参数阶段需要 {needed} 轮（{len(variables)} 个变量 × "
-                    f"{request.calls_per_variable} 轮），已占满最大轮次 "
-                    f"{request.max_iterations}，联合微调阶段没有轮次可用；"
-                    "请增大最大轮次或减少每变量轮次"
+                    f"各阶段有效轮次合计 {total_budget} 超过最大尝试轮次 "
+                    f"{request.max_iterations}"
                 )
 
         groups: set[str] = set()
@@ -936,173 +961,159 @@ class TuningService:
             )
 
     # ------------------------------------------------------------------
-    # 两阶段策略（改造报告 §5.2）
+    # 单阶段 / 分阶段优化
     # ------------------------------------------------------------------
-    def _stage1_rounds(self, run: _Run) -> int:
-        """阶段 1 的总轮次 = 每个变量轮次 × 变量个数。"""
-        return max(1, run.request.calls_per_variable) * len(run.request.enabled_variables())
+    def _stage_specs(self, run: _Run) -> list[TuningStage]:
+        variables = run.request.enabled_variables()
+        if run.request.strategy in (STRATEGY_SINGLE, "joint"):
+            return [TuningStage(name="单阶段", signals=[v.signal for v in variables],
+                                iterations=run.request.max_iterations)]
+        if run.request.strategy == STRATEGY_SEQUENTIAL:
+            # 旧请求兼容：转成显式阶段，不再由新策略自动追加联合阶段。
+            budget = max(1, run.request.calls_per_variable)
+            phases = [TuningStage(name=f"阶段 {i + 1}", signals=[v.signal], iterations=budget)
+                      for i, v in enumerate(variables)]
+            remaining = run.request.max_iterations - budget * len(variables)
+            if remaining > 0:
+                phases.append(TuningStage(
+                    name="旧版联合阶段", signals=[v.signal for v in variables],
+                    iterations=remaining, range_mode="local",
+                    range_fraction=run.request.joint_frac,
+                ))
+            return phases
+        return list(run.request.stages)
 
-    def _stage_name(self, run: _Run) -> str:
-        if run.request.strategy != STRATEGY_SEQUENTIAL:
-            return STAGE_JOINT
-        if run.stage == STAGE_JOINT:  # 已经进过联合阶段就不再回退
-            return STAGE_JOINT
-        return (
-            STAGE_SEQUENTIAL
-            if run.stage_rounds < self._stage1_rounds(run)
-            else STAGE_JOINT
-        )
+    def _current_stage(self, run: _Run) -> TuningStage | None:
+        stages = self._stage_specs(run)
+        return stages[run.stage_cursor] if run.stage_cursor < len(stages) else None
 
     def _stage_index(self, run: _Run) -> int:
-        """阶段 1 里正在调第几个变量（从 1 起）；联合阶段返回 0。"""
-        if self._stage_name(run) != STAGE_SEQUENTIAL:
-            return 0
-        per = max(1, run.request.calls_per_variable)
-        return min(len(run.request.enabled_variables()), run.stage_rounds // per + 1)
+        return run.stage_cursor + 1 if self._current_stage(run) else 0
 
     def _stage_total(self, run: _Run) -> int:
-        if self._stage_name(run) != STAGE_SEQUENTIAL:
-            return 0
-        return len(run.request.enabled_variables())
+        return len(self._stage_specs(run))
 
     def _active_variables(self, run: _Run) -> list[TuningVariable]:
-        """当前阶段真正参与优化的变量：阶段 1 是单个，联合阶段是全部。"""
-        variables = run.request.enabled_variables()
-        if self._stage_name(run) != STAGE_SEQUENTIAL:
-            return variables
-        per = max(1, run.request.calls_per_variable)
-        index = min(len(variables) - 1, run.stage_rounds // per)
-        return [variables[index]]
+        stage = self._current_stage(run)
+        variables = {v.signal: v for v in run.request.enabled_variables()}
+        return [variables[s] for s in stage.signals if s in variables] if stage else []
 
     def _dimension_for(self, run: _Run, variable: TuningVariable) -> Dimension:
-        """该变量在当前阶段的取值范围。
-
-        联合微调阶段围绕**阶段 1 的最优值**收窄到原范围的 ``joint_frac``：
-        在整段量程上再搜一遍没有意义，微调本来就该是"在最优点附近找更细的解"。
-        """
-        if (
-            run.request.strategy != STRATEGY_SEQUENTIAL
-            or self._stage_name(run) != STAGE_JOINT
-        ):
-            return Dimension(variable.signal, float(variable.low), float(variable.high))
-        center = run.held_values.get(variable.signal)
-        best = run.variable_best.get(variable.signal)
-        if best is not None:
-            center = best[0]  # 优先围绕该变量**自己**的最优点收窄
-        if center is None:
-            center = (float(variable.low) + float(variable.high)) / 2.0
-        frac = max(0.0, min(1.0, float(run.request.joint_frac)))
-        half = (float(variable.high) - float(variable.low)) * frac / 2.0
-        low = max(float(variable.low), center - half)
-        high = min(float(variable.high), center + half)
-        if high <= low:  # 收窄后退化成一个点：退回原范围，别给优化器一个无效维度
-            return Dimension(variable.signal, float(variable.low), float(variable.high))
+        low, high = float(variable.low), float(variable.high)
+        stage = self._current_stage(run)
+        previous_best = run.previous_stage_values.get(variable.signal)
+        if stage and stage.range_mode == "local" and previous_best is not None:
+            half = (high - low) * min(1.0, max(0.01, stage.range_fraction)) / 2.0
+            low = max(low, previous_best - half)
+            high = min(high, previous_best + half)
+        if high <= low:
+            low, high = float(variable.low), float(variable.high)
         return Dimension(variable.signal, low, high)
 
     def _sync_stage(self, run: _Run) -> None:
-        """把优化器切到"当前阶段 + 当前激活变量"。
-
-        切换时必须**重建优化器**：阶段 1 是单维、阶段 2 是全维，旧实例的归一化与
-        观测都按旧维度算；混用会让长度尺度失去意义，候选就变成随机数。
-        已有观测会按新维度**投影接续**——GP 见过的东西不该因为换阶段就忘掉。
-        """
-        active = self._active_variables(run)
-        stage = self._stage_name(run)
-        active_signals = [variable.signal for variable in active]
-        if run.active_signals == active_signals and run.stage == stage:
+        stage = self._current_stage(run)
+        if stage is None:
             return
-        if stage == STAGE_JOINT and run.stage == STAGE_SEQUENTIAL:
-            run.stage_rounds = 0
-        run.stage = stage
-        run.active_signals = active_signals
-        dimensions = [self._dimension_for(run, variable) for variable in active]
-        names = [dimension.name for dimension in dimensions]
-        # 采样 Study 按阶段命名：逐变量阶段各一个，联合阶段一个；
-        # 避免 TPE 因 search space 动态变化出问题。
-        sample_study = f"run_{run.run_id}__sample__{stage}"
-        if stage == STAGE_SEQUENTIAL and active_signals:
-            sample_study += f"_{active_signals[0]}"
-        optimizer = build_optimizer(
-            dimensions, run.request,
-            storage=self._optuna_storage_url,
-            study_name=sample_study,
+        active = self._active_variables(run)
+        signals = [v.signal for v in active]
+        stage_id = f"stage_{run.stage_cursor + 1:02d}"
+        if run.stage == stage_id and run.active_signals == signals:
+            return
+        run.stage = stage_id
+        run.stage_name = stage.name
+        run.active_signals = signals
+        dimensions = [self._dimension_for(run, v) for v in active]
+        # 搜索空间按阶段隔离，严禁把不同维度/固定条件下的观测投影混成一个模型。
+        run.optimizer = build_optimizer(
+            dimensions, run.request, storage=self._optuna_storage_url,
+            study_name=f"run_{run.run_id}__sample__{stage_id}",
         )
-        # 持久化 study 已含历史 trials（load_if_exists），不再重复 seed_history；
-        # 内存 study 或首次创建时，把已观测投影到新维度接续记忆。
-        if optimizer.n_observed == 0:
-            history: list[tuple[list[float], float]] = []
-            dropped = 0
-            for iteration in run.iterations:
-                if iteration.objective is None:
-                    continue
-                # **用设备实际回读**，而不是算法建议值：优化器学到的应该是
-                # "设备在这个位置上的表现"。建议值与实际位置不一致时（斜坡限制、
-                # 未到位、被钳位），拿建议值回灌等于喂给模型一对错配的 (x, y)。
-                values = []
-                for name in names:
-                    raw = (iteration.readback or {}).get(name)
-                    if raw is None:
-                        raw = iteration.proposed.get(name)
-                    if raw is None:
-                        break
-                    values.append(float(raw))
-                if len(values) != len(names):
-                    dropped += 1
-                    continue
-                history.append((values, iteration.objective))
-            # 越界的观测**夹到当前范围的边界**而不是丢掉：
-            # 设备当时的位置可能本来就在"设定范围"之外（操作员收窄了搜索区间），
-            # 那条观测仍然带着真实响应面的信息；而 Optuna 的 create_trial 不接受
-            # 落在分布之外的参数，所以必须夹。夹了多少条会写进事件日志。
-            bounds = {d.name: (float(d.low), float(d.high)) for d in dimensions}
-            clean: list[tuple[list[float], float]] = []
-            clamped = 0
-            for values, obj in history:
-                adjusted: list[float] = []
-                touched = False
-                for name, value in zip(names, values):
-                    low, high = bounds[name]
-                    if value < low:
-                        adjusted.append(low)
-                        touched = True
-                    elif value > high:
-                        adjusted.append(high)
-                        touched = True
-                    else:
-                        adjusted.append(value)
-                clean.append((adjusted, obj))
-                clamped += 1 if touched else 0
-            if clean:
-                optimizer.seed_history(clean)
-            self._emit(
-                run,
-                f"阶段切换：{stage}"
-                + (
-                    f"（{active_signals[0]}）" if stage == STAGE_SEQUENTIAL and active_signals else ""
-                )
-                + f"；接续 {len(clean)} 条历史观测（按实际回读投影，"
-                f"{clamped} 条被夹到当前范围边界，{dropped} 条因缺回读未接续）",
-                phase=PHASE_PROPOSING,
-                stage=stage,
-                seeded=len(clean),
-                clamped=clamped,
-                dropped=dropped,
-            )
-        run.optimizer = optimizer
+        run.stage_rounds = 0
+        run.stage_best_objective = None
+        run.stage_best_values = {}
+        self._emit(
+            run,
+            f"进入{stage.name}：联合优化 {len(signals)} 个参数，"
+            f"预算 {stage.iterations} 个有效轮次，"
+            f"{'围绕前阶段最优点局部搜索' if stage.range_mode == 'local' else '使用完整搜索范围'}",
+            phase=PHASE_PROPOSING, stage=stage_id, signals=signals,
+            budget=stage.iterations,
+        )
 
     # ------------------------------------------------------------------
     # 建议
     # ------------------------------------------------------------------
+    def _seed_starting_point(self, run: _Run) -> None:
+        """首轮把「设备当前实际位置」作为第一条观测喂给优化器。
+
+        优化器没有任何观测时，第一个候选是搜索空间**量程正中心**
+        （GpEiOptimizer.propose 的退化分支；Optuna TPE/CMA 冷启动轮也类似）。
+        SIM 下物理峰虽然被刻意设计在量程一侧（_BEST 60/1850/950/3700），
+        前几轮采样仍全围着中心转，响应面矩阵轴又被缩放成"仅覆盖本次已采
+        样子空间"，于是图上峰看起来永远在正中间。
+
+        用「当前回读 + 当前目标量」做一条真实观测后，首点从设备当前位置
+        出发，矩阵从一开始就是偏的；真实装置上这也更合理——调束从当前
+        工况起步，而不是跳回搜索空间中心。任一路读不到就放弃 seed（回退
+        原逻辑，不阻塞启动）。
+        """
+        names = [d.name for d in run.optimizer.dimensions]
+        bounds = {d.name: (float(d.low), float(d.high)) for d in run.optimizer.dimensions}
+        values: list[float] = []
+        for name in names:
+            entry = self._entry(name)
+            raw = self._signals.read_value(entry.readback_signal or entry.signal)
+            if raw is None:
+                return
+            low, high = bounds[name]
+            if not low <= float(raw) <= high:
+                self._emit(
+                    run,
+                    f"阶段起点 {name}={float(raw):g} 超出本阶段搜索范围，"
+                    "不将其作为 Optuna 观测，以免把实际目标错配到边界值",
+                    level=LEVEL_WARN, phase=PHASE_PROPOSING,
+                )
+                return
+            values.append(float(raw))
+        objective = self._signals.read_value(run.request.target_signal)
+        if objective is None:
+            return
+        run.optimizer.seed_history([(values, float(objective))])
+        if run.baseline_objective is None:
+            run.baseline_objective = float(objective)
+            self._store.set_snapshot(run.run_id, dict(run.snapshot), float(objective))
+        run.held_values.update(dict(zip(names, values, strict=True)))
+        run.stage_best_objective = float(objective)
+        run.stage_best_values = dict(zip(names, values, strict=True))
+        self._emit(
+            run,
+            f"{run.stage_name}以阶段起点实测初始化："
+            + "、".join(f"{n}={v:g}" for n, v in zip(names, values, strict=True))
+            + f"，目标 {run.request.target_signal}={float(objective):g}",
+            phase=PHASE_PROPOSING,
+        )
+
     def _propose_next(self, run: _Run) -> None:
-        schedule_execute = False
         with self._lock:
             if run.state in TERMINAL_STATES:
                 return
             if len(run.iterations) >= run.request.max_iterations:
-                self._finish_completed(run)
+                stage = self._current_stage(run)
+                detail = (
+                    f"达到最大尝试轮次；{stage.name}有效测量 {run.stage_rounds}/"
+                    f"{stage.iterations} 轮，阶段未完成"
+                    if stage and run.stage_rounds < stage.iterations
+                    else "达到最大尝试轮次"
+                )
+                self._finish_completed(run, detail)
                 return
             self._sync_stage(run)
+            if self._current_stage(run) is None:
+                self._finish_completed(run, "所有配置阶段均已完成")
+                return
             active = list(run.active_signals)
+            if run.optimizer.n_observed == 0:
+                self._seed_starting_point(run)
             proposal = run.optimizer.propose()
             # 未激活的变量按"保持不动"填值：候选表与执行记录都要看得到完整一组参数
             values = {variable.signal: run.held_values.get(variable.signal, variable.low)
@@ -1119,7 +1130,7 @@ class TuningService:
                 iteration=len(run.iterations),
                 values=values,
                 active_signals=active,
-                stage=run.stage,
+                stage=run.stage_name or run.stage,
                 predicted=proposal.predicted,
                 std=proposal.std,
                 expected_improvement=(
@@ -1128,11 +1139,7 @@ class TuningService:
                 ),
                 at=_now(),
             )
-            stage_text = (
-                f"{STAGE_LABELS[run.stage]}：{active[0]}"
-                if run.stage == STAGE_SEQUENTIAL and active
-                else STAGE_LABELS.get(run.stage, run.stage)
-            )
+            stage_text = run.stage_name or run.stage
         self._emit(
             run,
             f"第 {proposal.iteration + 1} 轮候选已生成（{stage_text}）："
@@ -1276,13 +1283,20 @@ class TuningService:
                         "quality": quality,
                         "readback": dict(iteration.readback or {}),
                     }
+                # 优化器学习的是设备最终实际位置，而不是事先建议值；正常到位时两者
+                # 相同，但钳位、外部联锁或无稳定判据时不能把错误的 x 配给真实的 y。
+                observed_values = [
+                    float(iteration.readback.get(d.name, proposal.values[d.name]))
+                    for d in run.optimizer.dimensions
+                ]
                 run.optimizer.observe(
-                    [proposal.values[d.name] for d in run.optimizer.dimensions],
+                    observed_values,
                     iteration.objective,
                     **ob_kwargs,
-                )                # "有意义"的改进：提升幅度要超过 stall_fraction（相对当前最优）。
+                )
+                # "有意义"的改进：提升幅度要超过 stall_fraction（相对当前最优）。
                 # stall_fraction=0 时任何刷新都算改进（与旧行为一致）。
-                threshold = run.best_objective
+                threshold = run.stage_best_objective
                 meaningful = (
                     run.best_objective is None
                     or threshold is None
@@ -1300,27 +1314,26 @@ class TuningService:
                     run.no_improvement = 0
                 else:
                     run.no_improvement += 1
+                run.stage_rounds += 1
+                if (run.stage_best_objective is None
+                        or iteration.objective > run.stage_best_objective):
+                    run.stage_best_objective = float(iteration.objective)
+                    run.stage_best_values = {
+                        signal: float(iteration.readback[signal])
+                        for signal in run.active_signals
+                        if signal in iteration.readback
+                    }
             else:
                 # 失败/未稳定/写入拒绝：标 FAIL，不喂优化器，不计历史最优
                 fail = getattr(run.optimizer, "fail_trial", None)
                 if callable(fail):
                     fail()
-            # 非激活变量下一轮要继续"保持"的值 = 设备此刻的实际位置；
-            # 阶段 1 逐变量推进时，后一个变量的起点就是前一个停下时的位置。
+            # 非激活变量下一轮继续保持设备此刻的实际位置。
             for signal in run.active_signals:
                 value = iteration.readback.get(signal)
                 if value is None:
                     continue
                 run.held_values[signal] = float(value)
-                # 同时记这个变量**自己**的最优点：联合微调围绕它收窄
-                if iteration.objective is None:
-                    continue
-                previous = run.variable_best.get(signal)
-                if previous is None or iteration.objective > previous[1]:
-                    run.variable_best[signal] = (float(value), iteration.objective)
-            if run.stage == STAGE_SEQUENTIAL and scored:
-                # 只有真的测到目标才推进阶段：否则"这个变量调完了"是假的
-                run.stage_rounds += 1
             improved = run.best_iteration == iteration.iteration
             best_objective = run.best_objective
             no_improvement = run.no_improvement
@@ -1427,20 +1440,63 @@ class TuningService:
             )
             return self.status(run_id)
 
-        # 收敛早停：连续 patience 轮没有**有意义**的改进即正常结束
-        if run.request.patience > 0 and run.no_improvement >= run.request.patience:
+        stage_spec = self._current_stage(run)
+        patience_hit = run.request.patience > 0 and run.no_improvement >= run.request.patience
+        budget_hit = stage_spec is not None and run.stage_rounds >= stage_spec.iterations
+        if stage_spec is not None and (patience_hit or budget_hit):
+            reason = "达到有效轮次预算" if budget_hit else "阶段内收敛早停"
             self._emit(
                 run,
-                f"连续 {no_improvement} 轮无有意义改进"
-                f"（阈值 {run.request.stall_fraction:.1%}），触发收敛早停",
-                phase=PHASE_IDLE, counter=no_improvement, patience=run.request.patience,
+                f"{stage_spec.name}{reason}（{run.stage_rounds}/{stage_spec.iterations} 有效轮次）",
+                phase=PHASE_IDLE, stage=run.stage, stage_rounds=run.stage_rounds,
+                stage_budget=stage_spec.iterations, patience=run.request.patience,
             )
-            self._finish_completed(
+            if run.stage_cursor + 1 >= self._stage_total(run):
+                self._finish_completed(
+                    run,
+                    f"{stage_spec.name}{reason}；共 {len(run.iterations)} 轮，"
+                    f"其中有效 {valid_rounds} 轮",
+                )
+                return self.status(run_id)
+            if not run.stage_best_values:
+                self._finish_failed(run, f"{stage_spec.name}没有可恢复的有效最优点", state_unknown=True)
+                return self.status(run_id)
+            self._emit(
                 run,
-                f"连续 {run.no_improvement} 轮无显著改进，收敛早停"
-                f"（共 {len(run.iterations)} 轮，其中有效 {valid_rounds} 轮）",
+                f"阶段切换：正在将本阶段参数恢复到最优实测点，完成后进入下一阶段",
+                phase=PHASE_WRITING, stage=run.stage,
+                targets=dict(run.stage_best_values),
             )
-            return self.status(run_id)
+            try:
+                check_interlocks(run.request.interlocks, self._signals.read_value)
+            except InterlockViolation as exc:
+                self._finish_failed(run, f"阶段切换前联锁检查失败，未执行恢复写入：{exc}")
+                return self.status(run_id)
+            restored, problems = self._write_and_settle(
+                run, dict(run.stage_best_values), signals=list(run.active_signals)
+            )
+            if problems:
+                self._emit(
+                    run, "阶段最优点恢复失败，停止自动切换：" + "；".join(problems),
+                    level=LEVEL_ERROR, phase=PHASE_SETTLING, restored=restored,
+                    detail="；".join(problems),
+                )
+                self._finish_failed(
+                    run, "阶段最优点恢复失败：" + "；".join(problems), state_unknown=True
+                )
+                return self.status(run_id)
+            run.held_values.update(restored)
+            run.previous_stage_values.update(restored)
+            with self._lock:
+                run.stage_cursor += 1
+                run.stage_rounds = 0
+                run.no_improvement = 0
+            self._emit(
+                run,
+                f"{stage_spec.name}已恢复最优实测点："
+                + "、".join(f"{s}={v:g}" for s, v in restored.items()),
+                phase=PHASE_IDLE, restored=restored,
+            )
 
         with self._lock:
             if run.stopped:
@@ -1676,22 +1732,21 @@ class TuningService:
         iteration: int | None = None,
         timeout: float = 20.0,
     ) -> dict[str, tuple[bool, float | None, float]]:
-        """并行等所有信号回读进入各自容差；返回 signal → (是否稳定, 最后回读, 耗时)。
+        """批量轮询所有信号回读进入各自容差；返回 signal → (是否稳定, 最后回读, 耗时)。
 
-        一轮轮询同时读所有未到位信号，到位即摘除；每路按自己的容差与同一超时判定。
-        与逐路 ``wait_settled`` 的区别：稳定等待耗时为 **max(各路到位时间)**，
-        而不是各路之和——多参数同时写、同时等，正是"同时写入"省时间的核心。
+        一轮轮询用一个批量快照读取所有未到位信号，到位即摘除；每路按自己的容差
+        与同一超时判定。与逐路 ``wait_settled`` 的区别：稳定等待耗时为各路到位
+        时间的 **max**，且命令行 EPICS 网关只需一次批量 ``caget``，不再每路起进程。
         容差为 None 的路（无稳定判据）读一次当前值即视为已稳定
         （与 ``wait_settled`` 对 ``tolerance is None`` 的行为一致）。
         """
         pending: list[dict] = []
         results: dict[str, tuple[bool, float | None, float]] = {}
+        no_tolerance: list[tuple] = []
         for variable, entry, target, tol in specs:
             tolerance = tol if tol is not None else (entry.settle_tol or None)
             if tolerance is None:
-                results[variable.signal] = (
-                    True, self._signals.readback(entry), 0.0
-                )
+                no_tolerance.append((variable, entry))
                 continue
             pending.append({
                 "signal": variable.signal,
@@ -1701,9 +1756,36 @@ class TuningService:
                 "deadline": time.monotonic() + timeout,
                 "started": time.monotonic(),
             })
+        def snapshot(items: list[dict] | list[tuple]) -> dict[str, float | None]:
+            """按实际回读信号做一次快照，避免每个待稳参数各起一个 caget。"""
+            sources: dict[str, str] = {}
+            for item in items:
+                if isinstance(item, dict):
+                    sources[item["signal"]] = (
+                        item["entry"].readback_signal or item["entry"].signal
+                    )
+                else:
+                    variable, entry = item
+                    sources[variable.signal] = entry.readback_signal or entry.signal
+            batch = self._signals.read_snapshot(list(dict.fromkeys(sources.values())))
+            values_by_source = {
+                reading.signal: (float(reading.value) if reading.connected else None)
+                for reading in batch.readings
+            }
+            return {
+                signal: values_by_source.get(source)
+                for signal, source in sources.items()
+            }
+
+        if no_tolerance:
+            values = snapshot(no_tolerance)
+            for variable, _entry in no_tolerance:
+                results[variable.signal] = (True, values.get(variable.signal), 0.0)
+
         while pending:
+            values = snapshot(pending)
             for item in list(pending):
-                last = self._signals.readback(item["entry"])
+                last = values.get(item["signal"])
                 elapsed = time.monotonic() - item["started"]
                 if last is not None and abs(float(last) - item["target"]) <= item["tol"]:
                     results[item["signal"]] = (True, float(last), elapsed)
@@ -1718,7 +1800,7 @@ class TuningService:
         return results
 
     def _write_and_settle(
-        self, run: _Run, targets: dict[str, float]
+        self, run: _Run, targets: dict[str, float], *, signals: list[str] | None = None
     ) -> tuple[dict[str, float], list[str]]:
         """逐路写目标值并等回读到位；返回（信号→实际回读, 问题清单）。
 
@@ -1728,8 +1810,11 @@ class TuningService:
         """
         applied: dict[str, float] = {}
         problems: list[str] = []
+        selected = set(signals) if signals is not None else None
         for variable in run.request.enabled_variables():
             signal = variable.signal
+            if selected is not None and signal not in selected:
+                continue
             want = targets.get(signal)
             if want is None:
                 problems.append(f"{signal} 没有目标值")
@@ -1985,7 +2070,7 @@ class TuningService:
     def _apply(self, run: _Run, proposal: TuningProposal) -> tuple[TuningIteration, bool]:
         """执行一轮：写**本轮激活的**参数 → 等稳定 → 读回 → 采目标。
 
-        阶段 1（逐参数）只写一个变量，其余按"保持不动"处理——**不写它们**：
+        每阶段只写本轮激活的参数组，其余按"保持不动"处理——**不写它们**：
         对同一台设备重复写同样的值既没有意义，又会白白增加设备动作与等待时间。
         但这些变量的实际回读照样记下来，事后看得到"当时它们在哪"。
 
@@ -2007,11 +2092,9 @@ class TuningService:
         settle_s = 0.0
         measure_s = 0.0
 
-        # 阶段 1：把本轮激活的变量全部写入（写请求是斜坡缓变、同步下发，
-        # 逐路连续执行但**不等稳定**）；稳定确认统一放到阶段 2 并行等待。
-        # 原来"写 A → 等 A 稳定 → 写 B → 等 B 稳定"，稳定耗时被逐路累加；
-        # 改成"写 A → 写 B → 同时等 A/B 稳定"后，稳定等待从 sum 变 max，
-        # 这就是同时写入省下来的时间。
+        # 执行步骤 1：把本轮激活的变量逐路写入，但不在单路写完后等待稳定；
+        # 写入保持串行，避免同一电源阵列/共享 IOC 出现竞态。稳定确认统一放到
+        # 阶段 2 对全部回读批量轮询，因此等待时间接近各路到位时间的最大值。
         write_targets: list[tuple] = []
         for variable in request.enabled_variables():
             entry = self._entry(variable.signal)
@@ -2110,7 +2193,7 @@ class TuningService:
             )
             write_targets.append((variable, entry, float(target_value), variable_tol))
 
-        # 阶段 2：统一并行等所有已写入变量回读进入各自容差。
+        # 执行步骤 2：统一并行等所有已写入变量回读进入各自容差。
         # 每路有独立的到位判定，但轮询共享同一轮：稳定耗时 = max(各路到位时间)。
         if write_targets:
             settle_started = time.monotonic()

@@ -123,6 +123,12 @@ def sanitize(raw: object, *, strategies: tuple[str, ...] = (),
         config["variables"] = variables
 
     strategy = raw.get("strategy")
+    legacy_strategy = strategy
+    if strategy == "joint":
+        strategy = "single"
+    elif strategy == "sequential_then_joint":
+        strategy = "staged"
+        notes.append("旧版逐参数策略已迁移为显式分阶段配置")
     if isinstance(strategy, str) and strategy:
         if strategies and strategy not in strategies:
             notes.append(f"优化策略 {strategy!r} 不认识，已用页面默认值")
@@ -150,13 +156,55 @@ def sanitize(raw: object, *, strategies: tuple[str, ...] = (),
         notes.append(f"调束模式不是字符串（{mode!r}），已用页面默认值")
 
     for key, label in _NUMERIC_FIELDS.items():
-        if key not in raw:
+        if key not in raw or raw.get(key) is None:
+            # JSON 里的 null = "这一项没设置/未启用"，是合法状态（例如
+            # loss_relative_hard 未启用硬阈值），不是坏数据，静默跳过。
             continue
         value = _as_float(raw.get(key))
         if value is None:
             notes.append(f"{label}不是数字（{raw.get(key)!r}），已用页面默认值")
             continue
         config[key] = value
+
+    stages: list[dict] = []
+    for item in raw.get("stages") or []:
+        if not isinstance(item, dict):
+            notes.append("阶段配置项不是对象，已忽略")
+            continue
+        name = str(item.get("name") or "").strip()
+        signals = item.get("signals")
+        iterations = _as_int(item.get("iterations"))
+        mode = item.get("range_mode", "full")
+        fraction = _as_float(item.get("range_fraction", 0.2))
+        if not name or not isinstance(signals, list) or not signals or iterations is None or iterations < 1:
+            notes.append(f"阶段配置不完整（{name or '未命名阶段'}），已忽略")
+            continue
+        stages.append({
+            "name": name,
+            "signals": [str(signal) for signal in signals if isinstance(signal, str) and signal],
+            "iterations": iterations,
+            "range_mode": mode if mode in ("full", "local") else "full",
+            "range_fraction": min(1.0, max(0.01, fraction or 0.2)),
+        })
+    if not stages and legacy_strategy == "sequential_then_joint":
+        enabled = [item["signal"] for item in variables if item.get("enabled", True)]
+        per = max(1, int(config.get("calls_per_variable", 3)))
+        total = int(config.get("max_iterations", 20))
+        stages = [{"name": f"阶段 {index + 1}", "signals": [signal],
+                   "iterations": per, "range_mode": "full", "range_fraction": 0.2}
+                  for index, signal in enumerate(enabled)]
+        remaining = total - per * len(enabled)
+        if remaining > 0 and enabled:
+            legacy_fraction = float(config.get("joint_frac", 20.0))
+            if legacy_fraction > 1.0:
+                legacy_fraction /= 100.0
+            stages.append({"name": "局部联合阶段", "signals": enabled,
+                           "iterations": remaining, "range_mode": "local",
+                           "range_fraction": legacy_fraction})
+        if stages:
+            config["stages"] = stages
+    elif stages:
+        config["stages"] = stages
 
     if "loss_absolute" in raw:
         value = _as_float(raw.get("loss_absolute"))

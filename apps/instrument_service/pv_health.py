@@ -81,6 +81,7 @@ def check_pv_health(
     写进每一项的 detail，让界面能显示「为什么全红」。
     """
     items: list[PvHealthItem] = []
+    started = perf_counter()
     required_failed = 0
     optional_failed = 0
 
@@ -93,7 +94,6 @@ def check_pv_health(
         connect_error = str(exc)
 
     for entry in config.entries:
-        started = perf_counter()
         try:
             if connect_error is not None:
                 raise ConnectionError(connect_error)
@@ -105,7 +105,6 @@ def check_pv_health(
             connected = False
             detail = str(exc)
             severity = None
-        latency_ms = round((perf_counter() - started) * 1000, 2)
         if not connected:
             if entry.required:
                 required_failed += 1
@@ -120,7 +119,7 @@ def check_pv_health(
                 readable=connected,
                 writable=connected and entry.writable,
                 severity=severity,
-                latency_ms=latency_ms,
+                latency_ms=None,
                 detail=detail,
             )
         )
@@ -136,6 +135,7 @@ def check_pv_health(
         status=status,
         checked_at=datetime.now(UTC).isoformat(),
         config_version=f"pv-mapping:{len(config.entries)}",
+        total_latency_ms=round((perf_counter() - started) * 1000, 2),
         summary=PvHealthSummary(
             total=len(items),
             connected=connected_count,

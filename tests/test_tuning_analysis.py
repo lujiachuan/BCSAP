@@ -229,8 +229,8 @@ class LogTests(unittest.TestCase):
             [iteration(0, stage="sequential"), iteration(1, stage="joint")]
         )
 
-        self.assertIn("逐参数优化", lines[0])
-        self.assertIn("联合微调", lines[1])
+        self.assertIn("旧版逐参数阶段", lines[0])
+        self.assertIn("旧版联合阶段", lines[1])
 
     def test_old_records_say_the_stage_was_not_recorded(self) -> None:
         """老库里的历史轮次没有阶段列：如实写"未记录"，不猜成联合微调。"""

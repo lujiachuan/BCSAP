@@ -113,12 +113,13 @@ class InstrumentRuntime:
     def write_signal(self, request: SignalWriteRequest) -> SignalWriteResult:
         """单路手动写入也必须短暂占用设备组，不能穿透扫谱/调束锁。"""
         entry = self.signals.entry(request.signal)
-        cached = self.signals.cached_write_result(request.command_id)
+        cached = self.signals.cached_write_result(request)
         if cached is not None:
             return cached
         owner = f"manual-{uuid4()}"
+        group = entry.group or "__ungrouped__"
         try:
-            self._locks.acquire([entry.group or "__ungrouped__"], owner=owner)
+            self._locks.acquire([group], owner=owner)
         except DeviceBusy as exc:
             return SignalWriteResult(
                 signal=entry.signal,
@@ -132,9 +133,24 @@ class InstrumentRuntime:
                 finished_at=datetime.now(UTC).isoformat(),
             )
         try:
-            return self.signals.write(request)
+            result = self.signals.write(request)
+            if result.device_state_unknown:
+                with self._lock:
+                    self._startup_recoveries[owner] = {
+                        "run_id": owner,
+                        "kind": "manual",
+                        "groups": [group],
+                        "message": (
+                            f"手动写入 {entry.label} 后设备状态未知，请现场核对后确认释放"
+                        ),
+                        "command_id": request.command_id,
+                    }
+            return result
         finally:
-            self._locks.release(owner=owner)
+            with self._lock:
+                needs_confirmation = owner in self._startup_recoveries
+            if not needs_confirmation:
+                self._locks.release(owner=owner)
 
     def mapping_update_blocker(self) -> str | None:
         held = self._locks.held()
@@ -245,10 +261,12 @@ class InstrumentRuntime:
                 raise ValueError(f"没有这个启动恢复项：{run_id}") from exc
             if recovery["kind"] == "scan":
                 self.store.set_state(run_id, "aborted")
-            else:
+            elif recovery["kind"] == "tuning":
                 message = f"已人工确认：{note}".rstrip("：")
                 self.tuning_store.set_state(run_id, "aborted", message)
             self._startup_recoveries.pop(run_id)
+            if recovery["kind"] == "manual":
+                self._locks.release(owner=run_id)
             if not self._startup_recoveries:
                 self._locks.release(owner="startup-recovery")
         recovery["acknowledged"] = True
@@ -306,7 +324,7 @@ class InstrumentRuntime:
         atomic: bool = True,
         note: str = "",
     ) -> SignalBatchWriteResponse:
-        """成组写入：批量校验 → 批量锁定 → 逐路下发 → 逐路明细。
+        """成组写入：先锁定设备组，再批量校验、逐路下发和报告明细。
 
         原子校验（``atomic=True``）用执行层的**干跑**完成：边界、单步、速率、
         可写性、当前值可读性全都按正式写入的同一套规则过一遍，任何一项不过就
@@ -322,21 +340,15 @@ class InstrumentRuntime:
             )
 
         problems: list[str] = []
+        known_entries = []
         for request in requests:
             try:
                 entry = self.signals.entry(request.signal)
             except WriteRejected as exc:
                 problems.append(str(exc))
                 continue
-            preview = self.signals.write(
-                SignalWriteRequest(
-                    signal=request.signal, value=request.value, ramp=request.ramp,
-                    dry_run=True,
-                )
-            )
-            if not preview.accepted:
-                problems.append(f"{entry.label}：{preview.reason}")
-        if atomic and problems:
+            known_entries.append(entry)
+        if problems:
             return SignalBatchWriteResponse(
                 ok=False,
                 message=(
@@ -345,15 +357,13 @@ class InstrumentRuntime:
                 ),
                 requested=len(requests),
                 accepted=0,
-                rejected=len(problems),
+                rejected=len(requests),
                 nothing_written=True,
             )
 
         groups = {
             entry.group or "__ungrouped__"
-            for entry in (
-                self.signals.entry(request.signal) for request in requests
-            )
+            for entry in known_entries
         }
         owner = f"batch-{uuid4()}"
         try:
@@ -369,12 +379,58 @@ class InstrumentRuntime:
                 locked_groups=sorted(self._locks.held()),
             )
         try:
-            results = [self.signals.write(request) for request in requests]
+            for request in requests:
+                entry = self.signals.entry(request.signal)
+                preview = self.signals.write(
+                    SignalWriteRequest(
+                        signal=request.signal, value=request.value,
+                        ramp=request.ramp, dry_run=True,
+                    )
+                )
+                if not preview.accepted:
+                    problems.append(f"{entry.label}：{preview.reason}")
+            if atomic and problems:
+                return SignalBatchWriteResponse(
+                    ok=False,
+                    message=(
+                        f"成组写入被拒绝，整批未下发（{len(problems)} 项不合格）："
+                        + "；".join(problems)
+                    ),
+                    requested=len(requests), accepted=0,
+                    rejected=len(requests), nothing_written=True,
+                )
+            results: list[SignalWriteResult] = []
+            for index, request in enumerate(requests):
+                result = self.signals.write(request)
+                results.append(result)
+                if result.device_state_unknown:
+                    # 当前位置尚不清楚时，后续成员不得继续下发。
+                    for skipped in requests[index + 1:]:
+                        entry = self.signals.entry(skipped.signal)
+                        results.append(SignalWriteResult(
+                            signal=entry.signal, pv=entry.pv, unit=entry.unit,
+                            requested=skipped.value, accepted=False,
+                            reason="前一路设备状态未知，未继续下发",
+                            command_id=skipped.command_id,
+                            finished_at=datetime.now(UTC).isoformat(),
+                        ))
+                    break
+            if any(result.device_state_unknown for result in results):
+                with self._lock:
+                    self._startup_recoveries[owner] = {
+                        "run_id": owner,
+                        "kind": "manual",
+                        "groups": sorted(groups),
+                        "message": "成组写入后部分设备状态未知，请现场核对后确认释放",
+                    }
         finally:
-            self._locks.release(owner=owner)
+            with self._lock:
+                needs_confirmation = owner in self._startup_recoveries
+            if not needs_confirmation:
+                self._locks.release(owner=owner)
 
         accepted = sum(1 for result in results if result.accepted)
-        rejected = len(results) - accepted
+        rejected = len(requests) - accepted
         unknown = [result.signal for result in results if result.device_state_unknown]
         if rejected == 0:
             message = f"成组写入完成（{accepted} 路）" + (f"：{note}" if note else "")
@@ -392,7 +448,7 @@ class InstrumentRuntime:
         return SignalBatchWriteResponse(
             ok=rejected == 0,
             message=message,
-            requested=len(results),
+            requested=len(requests),
             accepted=accepted,
             rejected=rejected,
             results=results,

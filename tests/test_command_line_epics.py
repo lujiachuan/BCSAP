@@ -1,10 +1,12 @@
 """EPICS 命令行后备网关验证。"""
 
+import errno
 import subprocess
 import unittest
 from uuid import uuid4
 
 from packages.epics_adapter import CommandLineEpicsGateway, FailoverEpicsGateway
+from packages.epics_adapter.command_line import EpicsCommandNotStarted
 
 
 class _UnavailableGateway:
@@ -16,6 +18,31 @@ class _UnavailableGateway:
 
 
 class CommandLineEpicsGatewayTests(unittest.TestCase):
+    def test_process_creation_failure_is_not_reported_as_an_unknown_write(self) -> None:
+        def runner(_args, **_kwargs):
+            raise OSError(errno.ENOMEM, "系统资源不足")
+
+        gateway = CommandLineEpicsGateway(
+            {"one": "PV:ONE"}, caget_path="caget.exe",
+            caput_path="caput.exe", runner=runner,
+        )
+
+        with self.assertRaises(EpicsCommandNotStarted):
+            gateway.write("one", 1.0, uuid4())
+
+    def test_unclassified_os_error_keeps_write_state_unknown(self) -> None:
+        def runner(_args, **_kwargs):
+            raise OSError("子进程通信状态未知")
+
+        gateway = CommandLineEpicsGateway(
+            {"one": "PV:ONE"}, caget_path="caget.exe",
+            caput_path="caput.exe", runner=runner,
+        )
+
+        with self.assertRaises(ConnectionError) as error:
+            gateway.write("one", 1.0, uuid4())
+        self.assertNotIsInstance(error.exception, EpicsCommandNotStarted)
+
     def test_reads_with_caget_and_writes_with_caput(self) -> None:
         calls: list[list[str]] = []
 
@@ -38,7 +65,7 @@ class CommandLineEpicsGatewayTests(unittest.TestCase):
         self.assertEqual(reading.value, 20.0)
         self.assertEqual(reading.unit, "sccm")
         self.assertEqual(written.value, 21.0)
-        self.assertEqual(calls[0], ["caget.exe", "-t", "-n", "Part1:Flow_W:CS200A:Setpoint"])
+        self.assertEqual(calls[0], ["caget.exe", "-w", "1", "-t", "-n", "Part1:Flow_W:CS200A:Setpoint"])
         self.assertEqual(calls[1], ["caput.exe", "-t", "Part1:Flow_W:CS200A:Setpoint", "21"])
 
     def test_snapshot_reads_multiple_pvs_in_one_process(self) -> None:
@@ -61,7 +88,7 @@ class CommandLineEpicsGatewayTests(unittest.TestCase):
 
         self.assertEqual(readings["one"].value, 20.0)
         self.assertEqual(readings["two"].value, 21.0)
-        self.assertEqual(calls, [["caget.exe", "-n", "PV:ONE", "PV:TWO"]])
+        self.assertEqual(calls, [["caget.exe", "-w", "1", "-n", "PV:ONE", "PV:TWO"]])
 
     def test_snapshot_keeps_connected_values_when_one_pv_is_missing(self) -> None:
         gateway = CommandLineEpicsGateway(
@@ -82,6 +109,26 @@ class CommandLineEpicsGatewayTests(unittest.TestCase):
         self.assertFalse(readings["missing"].connected)
         self.assertTrue(readings["two"].connected)
 
+    def test_non_numeric_pv_is_reported_as_type_error_without_binary_probing(self) -> None:
+        calls = []
+
+        def runner(args, **_kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(
+                args, 0, stdout="PV:ONE 20\nPV:TEXT ready\n", stderr=""
+            )
+
+        gateway = CommandLineEpicsGateway(
+            {"one": "PV:ONE", "text": "PV:TEXT"},
+            caget_path="caget.exe", caput_path="caput.exe", runner=runner,
+        )
+        readings = gateway.snapshot(["one", "text"])
+
+        self.assertTrue(readings["one"].connected)
+        self.assertFalse(readings["text"].connected)
+        self.assertIn("非数值", readings["text"].detail)
+        self.assertEqual(len(calls), 1)
+
     def test_snapshot_falls_back_per_signal_when_batch_returns_nothing(self) -> None:
         """真机 caget 实测行为：批量里只要有一路离线，整批一个值都不返回、
         只报 ``some PV(s) not found``。此时必须分组隔离坏路，不能串行启动
@@ -91,7 +138,7 @@ class CommandLineEpicsGatewayTests(unittest.TestCase):
 
         def runner(args, **_kwargs):
             calls.append(args)
-            requested = args[2:]
+            requested = args[4:]
             if "PV:MISSING" in requested:
                 return subprocess.CompletedProcess(
                     args,
@@ -180,7 +227,7 @@ class CommandLineEpicsGatewayTests(unittest.TestCase):
 
         def runner(args, **_kwargs):
             calls.append(args)
-            requested = args[2:]
+            requested = args[4:]
             if "PV:MISSING" in requested and not missing_available[0]:
                 return subprocess.CompletedProcess(
                     args, 1, stdout="", stderr="some PV(s) not found"
@@ -208,7 +255,7 @@ class CommandLineEpicsGatewayTests(unittest.TestCase):
         self.assertFalse(second["missing"].connected)
         self.assertEqual(
             calls[first_call_count:],
-            [["caget.exe", "-n", "PV:ONE", "PV:TWO"]],
+            [["caget.exe", "-w", "1", "-n", "PV:ONE", "PV:TWO"]],
         )
 
         missing_available[0] = True

@@ -19,6 +19,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QRectF, Qt, QTimer, QUrl
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
@@ -35,6 +37,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
+    QListWidget,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -83,12 +87,11 @@ FINALIZE_LABELS = {
 
 # 优化策略（键名与执行服务一致）
 STRATEGY_CHOICES = (
-    ("joint", "全部变量联合优化"),
-    ("sequential_then_joint", "逐参数优化 → 联合微调"),
+    ("single", "单阶段调优 · 所选参数一起优化"),
+    ("staged", "分阶段调优 · 每阶段一组参数"),
 )
 
 # 阶段名 → 界面文案
-STAGE_TEXT = {"sequential": "逐参数优化", "joint": "联合微调"}
 
 # 优化引擎（键名与执行服务一致）。界面自己写中文名，不 import 服务端实现。
 # 默认 CMA-ES：自动调束的响应面是连续、光滑、单峰、需要多参数联合对准的类型，
@@ -165,6 +168,291 @@ PHASE_TEXT = {
 }
 
 
+class _StageConfigDialog(QDialog):
+    """分阶段调优的显式编辑器。
+
+    不再把阶段配置塞进一个需要双击的表格。左侧只负责阶段顺序，右侧只负责
+    当前阶段的内容；每次切换阶段都会先提交当前编辑值，因此增删、排序和保存
+    都有确定的状态变化，现场操作时不容易误以为按钮失效。
+    """
+
+    def __init__(
+        self,
+        parent: QWidget,
+        *,
+        available_signals: list[tuple[str, str]],
+        stages: list[dict],
+        max_iterations: int,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("分阶段调优配置")
+        self.resize(920, 560)
+        self._available_signals = available_signals
+        available_ids = {signal for signal, _label in available_signals}
+        self._max_iterations = max(1, int(max_iterations))
+        self._stages = [
+            {
+                "name": str(stage.get("name") or f"阶段 {index + 1}"),
+                "signals": [
+                    signal for signal in stage.get("signals") or []
+                    if signal in available_ids
+                ],
+                "iterations": int(stage.get("iterations") or 1),
+                "range_mode": str(stage.get("range_mode") or "full"),
+                "range_fraction": float(stage.get("range_fraction") or 0.2),
+            }
+            for index, stage in enumerate(stages)
+        ]
+        self._active_index = -1
+        self._loading = False
+
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            "每个阶段是一组共同优化的参数；参数可在多个阶段重复。进入下一阶段前，"
+            "系统会恢复上一阶段的最优实测点；局部范围以该最优点为中心。",
+            objectName="mutedText",
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        body = QSplitter()
+        self.stage_list = QListWidget()
+        self.stage_list.setToolTip("选择一个阶段后，在右侧修改名称、参数、轮次和搜索范围。")
+        body.addWidget(self.stage_list)
+
+        editor = QWidget()
+        editor_layout = QVBoxLayout(editor)
+        editor_layout.setContentsMargins(14, 4, 4, 4)
+        editor_layout.setSpacing(10)
+        form = QGridLayout()
+        form.setColumnStretch(1, 1)
+        form.addWidget(QLabel("阶段名称"), 0, 0)
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("例如：引出段粗调")
+        form.addWidget(self.name_edit, 0, 1)
+        form.addWidget(QLabel("有效轮次"), 1, 0)
+        self.iterations_spin = QSpinBox()
+        self.iterations_spin.setRange(1, self._max_iterations)
+        self.iterations_spin.setSuffix(" 轮")
+        form.addWidget(self.iterations_spin, 1, 1)
+        form.addWidget(QLabel("搜索范围"), 2, 0)
+        self.range_mode_combo = QComboBox()
+        self.range_mode_combo.addItem("完整设备范围", "full")
+        self.range_mode_combo.addItem("以上阶段最优点为中心的局部范围", "local")
+        form.addWidget(self.range_mode_combo, 2, 1)
+        form.addWidget(QLabel("局部范围占比"), 3, 0)
+        self.range_fraction_spin = QDoubleSpinBox()
+        self.range_fraction_spin.setRange(1.0, 100.0)
+        self.range_fraction_spin.setDecimals(1)
+        self.range_fraction_spin.setSingleStep(5.0)
+        self.range_fraction_spin.setSuffix(" %")
+        self.range_fraction_spin.setToolTip("相对于每个参数原始配置范围的比例。")
+        form.addWidget(self.range_fraction_spin, 3, 1)
+        editor_layout.addLayout(form)
+
+        parameter_title = QLabel("本阶段共同优化的参数")
+        editor_layout.addWidget(parameter_title)
+        parameter_hint = QLabel(
+            "勾选参数后，它们会在本阶段一起优化；每个阶段至少需要一个参数。",
+            objectName="mutedText",
+        )
+        parameter_hint.setWordWrap(True)
+        editor_layout.addWidget(parameter_hint)
+        parameter_scroll = QScrollArea()
+        parameter_scroll.setWidgetResizable(True)
+        parameter_body = QWidget()
+        self.parameter_checks: dict[str, QCheckBox] = {}
+        parameter_layout = QVBoxLayout(parameter_body)
+        parameter_layout.setContentsMargins(8, 6, 8, 6)
+        for signal, label in self._available_signals:
+            check = QCheckBox(label)
+            check.setToolTip(signal)
+            self.parameter_checks[signal] = check
+            parameter_layout.addWidget(check)
+        parameter_layout.addStretch(1)
+        parameter_scroll.setWidget(parameter_body)
+        editor_layout.addWidget(parameter_scroll, 1)
+        self.status_label = QLabel("", objectName="mutedText")
+        self.status_label.setWordWrap(True)
+        editor_layout.addWidget(self.status_label)
+        body.addWidget(editor)
+        body.setStretchFactor(0, 1)
+        body.setStretchFactor(1, 3)
+        body.setSizes([250, 650])
+        layout.addWidget(body, 1)
+
+        actions = QHBoxLayout()
+        self.add_button = QPushButton("添加阶段")
+        self.copy_button = QPushButton("复制当前阶段")
+        self.remove_button = QPushButton("删除当前阶段")
+        self.up_button = QPushButton("上移")
+        self.down_button = QPushButton("下移")
+        for button in (
+            self.add_button, self.copy_button, self.remove_button,
+            self.up_button, self.down_button,
+        ):
+            actions.addWidget(button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._accept_if_valid)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.stage_list.currentRowChanged.connect(self._select_stage)
+        self.range_mode_combo.currentIndexChanged.connect(self._update_range_fraction_state)
+        self.add_button.clicked.connect(self._add_stage)
+        self.copy_button.clicked.connect(self._copy_stage)
+        self.remove_button.clicked.connect(self._remove_stage)
+        self.up_button.clicked.connect(lambda _checked=False: self._move_stage(-1))
+        self.down_button.clicked.connect(lambda _checked=False: self._move_stage(1))
+
+        self._refresh_stage_list()
+        self.stage_list.setCurrentRow(0)
+        self._select_stage(0)
+
+    def stages(self) -> list[dict]:
+        """返回已通过保存校验的阶段配置副本。"""
+        return [
+            {**stage, "signals": list(stage["signals"])}
+            for stage in self._stages
+        ]
+
+    def _stage_title(self, index: int, stage: dict) -> str:
+        scope = "完整范围" if stage["range_mode"] == "full" else "局部范围"
+        return (
+            f"{index + 1}. {stage['name']}\n"
+            f"{len(stage['signals'])} 个参数 · {stage['iterations']} 轮 · {scope}"
+        )
+
+    def _refresh_stage_list(self) -> None:
+        self.stage_list.blockSignals(True)
+        self.stage_list.clear()
+        for index, stage in enumerate(self._stages):
+            self.stage_list.addItem(self._stage_title(index, stage))
+        self.stage_list.blockSignals(False)
+
+    def _activate_stage(self, index: int) -> None:
+        """在结构变动后切换阶段，避免旧编辑器内容写入新索引。"""
+        self._active_index = -1
+        self.stage_list.setCurrentRow(index)
+
+    def _store_active_stage(self) -> None:
+        if self._loading or not 0 <= self._active_index < len(self._stages):
+            return
+        stage = self._stages[self._active_index]
+        stage["name"] = self.name_edit.text().strip() or f"阶段 {self._active_index + 1}"
+        stage["iterations"] = self.iterations_spin.value()
+        stage["range_mode"] = self.range_mode_combo.currentData() or "full"
+        stage["range_fraction"] = self.range_fraction_spin.value() / 100.0
+        stage["signals"] = [
+            signal for signal, check in self.parameter_checks.items() if check.isChecked()
+        ]
+
+    def _select_stage(self, index: int) -> None:
+        self._store_active_stage()
+        if not 0 <= index < len(self._stages):
+            self._active_index = -1
+            return
+        self._active_index = index
+        stage = self._stages[index]
+        self._loading = True
+        self.name_edit.setText(stage["name"])
+        self.iterations_spin.setValue(stage["iterations"])
+        self.range_mode_combo.setCurrentIndex(
+            max(0, self.range_mode_combo.findData(stage["range_mode"]))
+        )
+        self.range_fraction_spin.setValue(stage["range_fraction"] * 100.0)
+        selected = set(stage["signals"])
+        for signal, check in self.parameter_checks.items():
+            check.setChecked(signal in selected)
+        self._loading = False
+        self._update_range_fraction_state()
+        self._update_action_state()
+        self.status_label.setText(f"正在编辑第 {index + 1} 个阶段；修改会在切换阶段或保存时提交。")
+
+    def _update_range_fraction_state(self, *_args) -> None:
+        local = self.range_mode_combo.currentData() == "local"
+        self.range_fraction_spin.setEnabled(local)
+
+    def _update_action_state(self) -> None:
+        count = len(self._stages)
+        index = self._active_index
+        self.copy_button.setEnabled(index >= 0)
+        self.remove_button.setEnabled(count > 1 and index >= 0)
+        self.up_button.setEnabled(index > 0)
+        self.down_button.setEnabled(0 <= index < count - 1)
+
+    def _add_stage(self, _checked: bool = False) -> None:
+        self._store_active_stage()
+        self._stages.append({
+            "name": f"阶段 {len(self._stages) + 1}",
+            "signals": [signal for signal, _label in self._available_signals],
+            "iterations": min(5, self._max_iterations),
+            "range_mode": "local",
+            "range_fraction": 0.2,
+        })
+        self._refresh_stage_list()
+        self._activate_stage(len(self._stages) - 1)
+        self.status_label.setText(f"已添加第 {len(self._stages)} 个阶段。")
+
+    def _copy_stage(self, _checked: bool = False) -> None:
+        self._store_active_stage()
+        if self._active_index < 0:
+            return
+        source = self._stages[self._active_index]
+        copied = {**source, "signals": list(source["signals"])}
+        copied["name"] = f"{source['name']}（副本）"
+        target = self._active_index + 1
+        self._stages.insert(target, copied)
+        self._refresh_stage_list()
+        self._activate_stage(target)
+        self.status_label.setText(f"已复制为第 {target + 1} 个阶段。")
+
+    def _remove_stage(self, _checked: bool = False) -> None:
+        self._store_active_stage()
+        if len(self._stages) <= 1 or self._active_index < 0:
+            return
+        removed = self._active_index
+        self._stages.pop(removed)
+        self._refresh_stage_list()
+        self._activate_stage(min(removed, len(self._stages) - 1))
+        self.status_label.setText("已删除阶段。")
+
+    def _move_stage(self, offset: int) -> None:
+        self._store_active_stage()
+        source = self._active_index
+        target = source + offset
+        if source < 0 or not 0 <= target < len(self._stages):
+            return
+        self._stages[source], self._stages[target] = self._stages[target], self._stages[source]
+        self._refresh_stage_list()
+        self._activate_stage(target)
+        self.status_label.setText(f"已调整为第 {target + 1} 个阶段。")
+
+    def _accept_if_valid(self) -> None:
+        self._store_active_stage()
+        for index, stage in enumerate(self._stages, 1):
+            if not stage["name"] or not stage["signals"] or stage["iterations"] < 1:
+                QMessageBox.warning(
+                    self,
+                    "阶段配置无效",
+                    f"第 {index} 阶段需填写名称、参数和正整数轮次。",
+                )
+                return
+        used = sum(stage["iterations"] for stage in self._stages)
+        if used > self._max_iterations:
+            QMessageBox.warning(
+                self,
+                "阶段轮次超出预算",
+                f"阶段合计 {used} 轮，不能超过最大尝试轮次 {self._max_iterations}。",
+            )
+            return
+        self.accept()
+
+
 class TuningPage(QWidget):
     """自动调束页（建议 → 人工确认）。"""
 
@@ -203,6 +491,8 @@ class TuningPage(QWidget):
         self._stale_iteration_fetches = 0
         self._iteration_fetch_baseline = 0
         self._analysis: dict | None = None  # 结束后从 /analysis 拉的 Optuna 分析结果
+        self._analysis_by_stage: dict[int | None, dict] = {}
+        self._analysis_request_stage: int | None = None
         self._analysis_items: list[object] = []
         self._dashboard_url = DASHBOARD_URL
         self._status_in_flight = False
@@ -353,7 +643,8 @@ class TuningPage(QWidget):
             self.engine_combo.addItem(label, key)
         self.engine_combo.setToolTip(
             "CMA-ES 推荐用于连续联合调参；其余为 Optuna 采样器"
-            "（TPE/CMA-ES/QMC/随机/网格），同一份历史观测可复用。"
+            "（TPE/CMA-ES/QMC/随机/网格）。不同阶段的 Trial 独立建模，"
+            "不会跨参数组混用观测；新任务也不会读取上一任务的 Trial。"
         )
         algo_form.add("优化引擎", self.engine_combo, key="engine")
 
@@ -371,27 +662,18 @@ class TuningPage(QWidget):
         for key, label in STRATEGY_CHOICES:
             self.strategy.addItem(label, key)
         self.strategy.setToolTip(
-            "全部联合：所有勾选变量一起优化；"
-            "逐参数 → 联合微调：先一个变量一个变量调（其余保持不动），"
-            "再在最优点附近联合微调"
+            "单阶段：所有勾选变量一次联合优化。分阶段：每阶段选择一组参数共同优化；"
+            "参数可跨阶段重复，切换阶段时会先恢复到上一阶段最优实测点。"
         )
         algo_form.add("优化策略", self.strategy, key="strategy")
-
-        self.calls_spin = QSpinBox()
-        self.calls_spin.setRange(1, 50)
-        self.calls_spin.setValue(3)
-        self.calls_spin.setToolTip("逐参数阶段每个变量用几轮")
-        algo_form.add("逐参数轮次", mark_compact(self.calls_spin), key="calls")
-        self.calls_label = algo_form.labels["calls"]
-
-        self.joint_frac_spin = QDoubleSpinBox()
-        self.joint_frac_spin.setRange(1.0, 100.0)
-        self.joint_frac_spin.setSingleStep(5.0)
-        self.joint_frac_spin.setValue(20.0)
-        self.joint_frac_spin.setSuffix(" %")
-        self.joint_frac_spin.setToolTip("联合微调范围（占各参数原范围）")
-        algo_form.add("联合微调范围", mark_compact(self.joint_frac_spin), key="joint_frac")
-        self.joint_frac_label = algo_form.labels["joint_frac"]
+        self._stage_specs: list[dict] = []
+        self.stage_editor_button = QPushButton("配置阶段…", objectName="plotToolButton")
+        self.stage_editor_button.clicked.connect(self._edit_stages)
+        self.stage_summary = QLabel("", objectName="mutedText")
+        self.stage_summary.setWordWrap(True)
+        algo.add_widget(algo_form)
+        algo.add_widget(self.stage_editor_button)
+        algo.add_widget(self.stage_summary)
 
         self.iterations_spin = QSpinBox()
         self.iterations_spin.setRange(1, 200)
@@ -401,9 +683,10 @@ class TuningPage(QWidget):
         self.auto_hint = QLabel("", objectName="mutedText")
         self.auto_hint.setWordWrap(True)
         self.auto_hint.setVisible(False)
-        algo.add_widget(algo_form)
         algo.add_widget(self.auto_hint)
         strategy.body.addWidget(algo)
+        self.strategy.currentIndexChanged.connect(self._on_strategy_changed)
+        self._on_strategy_changed()
 
         # ---- 卡 2：采样与稳定 ----
         sampling = FoldSection("采样与稳定")
@@ -443,13 +726,14 @@ class TuningPage(QWidget):
         self.stall_fraction_form_spin = QDoubleSpinBox()
         self.stall_fraction_form_spin.setRange(0.1, 50.0)
         self.stall_fraction_form_spin.setSingleStep(0.5)
-        self.stall_fraction_form_spin.setValue(5.0)
+        self.stall_fraction_form_spin.setValue(1.0)
         self.stall_fraction_form_spin.setSuffix(" %")
         self.stall_fraction_form_spin.setDecimals(1)
         self.stall_fraction_form_spin.setToolTip(
             "两个用途：①过程建议里「近 10 轮目标提升不足 X%」的 X；"
             "②收敛早停的「有意义改进」门槛——提升不到 X% 不算改进，"
-            "不会把连续无改进的计数清零（噪声大时调大，免得毛刺一直重置早停计数）。"
+            "不会把连续无改进的计数清零。精细调束建议 0.5%–1%，"
+            "噪声大时再调高，免得毛刺一直重置早停计数。"
         )
         self.stall_fraction_form_spin.valueChanged.connect(lambda _v: self._refresh_advice())
         sample_form.add("停滞阈值", mark_compact(self.stall_fraction_form_spin), key="stall")
@@ -637,6 +921,19 @@ class TuningPage(QWidget):
                 self.loss_absolute_spin.setEnabled(self.loss_absolute_check.isChecked())
 
         self.loss_protection_check.toggled.connect(_toggle_loss_protection)
+        # 折叠摘要跟随配置即时刷新：改阈值/开关后摘要不同步，操作员会误以为
+        # 保护仍是旧配置（界面反馈必须实时，不能只在展开/保存时才重算）。
+        for _spin in (
+            self.loss_absolute_spin, self.loss_relative_spin,
+            self.loss_hard_spin, self.loss_strikes_spin,
+            self.max_invalid_spin, self.write_retries_spin,
+        ):
+            _spin.valueChanged.connect(lambda *_: self._refresh_guard_summary())
+        for _check in (
+            self.loss_absolute_check, self.auto_recover_check,
+            self.reset_before_start_check, self.loss_protection_check,
+        ):
+            _check.toggled.connect(lambda *_: self._refresh_guard_summary())
         guard.add_widget(guard_form)
         guard.toggled.connect(lambda _on: self._refresh_guard_summary())
         strategy.body.addWidget(guard)
@@ -694,13 +991,6 @@ class TuningPage(QWidget):
         splitter.addWidget(self.config_form_scroll)
 
         # 高级项保持展开：布局已紧凑到展开也不溢出，不再提供折叠按钮
-        self._sequential_only_widgets = [
-            self.calls_spin, self.calls_label,
-            self.joint_frac_spin, self.joint_frac_label,
-        ]
-        self.strategy.currentIndexChanged.connect(self._toggle_strategy_options)
-        self._toggle_strategy_options()
-
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         splitter.setSizes([640, 476])
@@ -709,8 +999,9 @@ class TuningPage(QWidget):
 
         for widget in (
             self.strategy, self.mode_combo, self.engine_combo,
-            self.calls_spin, self.iterations_spin, self.settle_spin,
+            self.iterations_spin, self.settle_spin,
             self.samples_spin, self.hold_spin, self.loss_relative_spin,
+            self.startup_spin, self.patience_spin, self.stall_fraction_form_spin,
         ):
             if isinstance(widget, QComboBox):
                 widget.currentIndexChanged.connect(self._update_run_plan)
@@ -718,6 +1009,7 @@ class TuningPage(QWidget):
                 widget.valueChanged.connect(self._update_run_plan)
         self.loss_absolute_check.toggled.connect(self._update_run_plan)
         self.loss_absolute_spin.valueChanged.connect(self._update_run_plan)
+        self.reset_before_start_check.toggled.connect(self._update_run_plan)
         # 长文案下拉框不该把面板最小宽度撑大：按"最小可见字符数"算尺寸，
         # 否则「CMA-ES（推荐：连续联合调参）」这类条目会把左栏挤窄。
         for combo in (
@@ -745,19 +1037,6 @@ class TuningPage(QWidget):
         self._update_run_plan()
         return tab
 
-    def _strategy_is_sequential(self) -> bool:
-        return self.strategy.currentData() == "sequential_then_joint"
-
-    def _toggle_strategy_options(self, *_args) -> None:
-        """逐参数专属配置：选了"逐参数 → 联合微调"就必须可见。
-
-        这两个旋钮是策略本身的参数（每变量几轮、微调范围），不是"高级选项"：
-        选了逐参数却看不到它们，等于让人签一份看不见的合同。
-        """
-        show = self._strategy_is_sequential()
-        for widget in self._sequential_only_widgets:
-            widget.setVisible(show)
-
     @staticmethod
     def _format_duration(seconds: float) -> str:
         minutes = max(0, round(seconds / 60))
@@ -766,6 +1045,27 @@ class TuningPage(QWidget):
         if minutes < 60:
             return f"约 {minutes} 分钟"
         return f"约 {minutes // 60} 小时 {minutes % 60} 分钟"
+
+    @staticmethod
+    def _elapsed_duration(started_at: object, finished_at: object = None) -> str:
+        """根据服务端时间戳显示任务墙钟用时（包含暂停时间）。"""
+        try:
+            start = datetime.fromisoformat(str(started_at))
+            end = datetime.fromisoformat(str(finished_at)) if finished_at else datetime.now(
+                start.tzinfo
+            )
+            if start.tzinfo is not None and end.tzinfo is None:
+                end = end.replace(tzinfo=start.tzinfo)
+            elif start.tzinfo is None and end.tzinfo is not None:
+                start = start.replace(tzinfo=end.tzinfo)
+            total = max(0, int((end - start).total_seconds()))
+        except (TypeError, ValueError, OverflowError):
+            return "--"
+        days, remainder = divmod(total, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        clock = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{days}天 {clock}" if days else clock
 
     def _set_all_variables(self, checked: bool) -> None:
         """一键全选/取消全选；只改勾选列，范围与回读保持不动。"""
@@ -793,24 +1093,30 @@ class TuningPage(QWidget):
             if row["check"].checkState() == Qt.CheckState.Checked
         ]
         total = self.iterations_spin.value()
-        sequential = (
-            self.calls_spin.value() * len(selected)
-            if self.strategy.currentData() == "sequential_then_joint"
-            else 0
-        )
-        joint = max(0, total - sequential) if sequential else total
+        staged = self.strategy.currentData() == "staged"
+        stage_budget = sum(int(item.get("iterations", 0)) for item in self._stage_specs) if staged else total
+        selected_signals = {row["entry"]["signal"] for row in selected}
+        assigned_signals = {signal for stage in self._stage_specs for signal in stage.get("signals", [])}
         seconds = total * (
             self.settle_spin.value() + self.hold_spin.value()
             + max(0, self.samples_spin.value() - 1) * 0.05
         )
-        plan = [
-            f"运行计划：{len(selected)} 个变量 · {total} 轮",
-            f"引擎 {self.engine_combo.currentText()}",
-        ]
-        if sequential:
-            plan.append(f"逐参数 {sequential} 轮 + 联合 {joint} 轮")
-        plan.append(f"预计至少 {self._format_duration(seconds)}")
-        self.run_plan_label.setText("；".join(plan))
+        engine_label = self.engine_combo.currentText().split("（", 1)[0]
+        plan = [f"计划：{len(selected)} 变量 · {total} 轮 · {engine_label}"]
+        if (self.engine_combo.currentData() or "") in {"cmaes", "tpe"}:
+            plan.append(f"探索 {self.startup_spin.value()} 轮")
+        if staged:
+            plan.append(f"{len(self._stage_specs)} 个阶段 · {stage_budget} 个有效轮次")
+        if self.patience_spin.value() > 0:
+            stall_percent = self.stall_fraction_form_spin.value()
+            plan.append(f"早停 {self.patience_spin.value()} 轮/{stall_percent:g}%")
+        plan.append(
+            "起点复位"
+            if self.reset_before_start_check.isChecked()
+            else "保持当前起点"
+        )
+        plan.append(f"≥ {self._format_duration(seconds).removeprefix('约 ')}")
+        self.run_plan_label.setText(" · ".join(plan))
 
         checks = {
             "目标": bool(self.target.currentData()),
@@ -821,7 +1127,15 @@ class TuningPage(QWidget):
             "最大单步": bool(selected) and all(
                 row["entry"].get("max_step") for row in selected
             ),
-            "轮次预算": not sequential or sequential < total,
+            "阶段预算": (
+                stage_budget <= total
+                and (not staged or bool(self._stage_specs))
+                and (not staged or selected_signals <= assigned_signals)
+                and (not staged or all(
+                    set(stage.get("signals", [])) <= selected_signals
+                    for stage in self._stage_specs
+                ))
+            ),
         }
         if self.mode_combo.currentData() == "auto":
             checks["束流保护"] = self.loss_protection_check.isChecked() and (
@@ -857,12 +1171,11 @@ class TuningPage(QWidget):
     # 页签 2：运行监控
     # ------------------------------------------------------------------
     def _monitor_tab(self) -> QWidget:
-        """运行监控页：状态条 + 指标带 + 曲线 + 右栏三页签（日志/轮次/候选）。
+        """运行监控页：状态条、指标带、趋势图和右栏三页签。
 
-        布局目标：曲线独占左列整高（趋势要看的是"形状"，最怕被压扁），
-        过程日志、轮次明细、本轮候选三块收进右栏页签容器——它们都是"看当下状态"
-        的信息，并排或上下堆叠都会把彼此压到只剩几行；页签让每块都拿到整列高度，
-        标签上带轮数/待确认标记，不用点开也知道有没有新东西。
+        趋势图保留左列主要面积；过程日志、完整轮次与当前候选置于同一个右栏
+        页签中，每次切换可占满右栏。轮次表保留本次任务全部轮次，标签显示总数；
+        候选页在待确认时以红点提示，避免人工模式下漏看本轮建议。
         """
         tab = QWidget()
         outer = QVBoxLayout(tab)
@@ -916,14 +1229,19 @@ class TuningPage(QWidget):
         row.addWidget(self.tuning_stop_button)
         outer.addWidget(bar)
 
-        # ---------------- 指标带：压扁的 4 张卡（对象名/属性保持不变）----------------
+        # ---------------- 指标带：当前测量、最优、提升、已用与剩余时间 ----------------
         metrics = QHBoxLayout()
         metrics.setSpacing(8)
         self.current_card = MetricCard("本轮测量", "--")
         self.best_card = MetricCard("历史最优", "--", "", success=True)
         self.gain_card = MetricCard("提升量", "--")
+        self.elapsed_card = MetricCard("已用时间", "--")
         self.eta_card = MetricCard("预计剩余", "--")
-        for card in (self.current_card, self.best_card, self.gain_card, self.eta_card):
+        self.elapsed_card.setToolTip("从执行服务接受任务开始计时，包含暂停时间。")
+        for card in (
+            self.current_card, self.best_card, self.gain_card,
+            self.elapsed_card, self.eta_card,
+        ):
             card.setMaximumHeight(58)
             card.setMinimumHeight(52)
             card.setStyleSheet(
@@ -971,7 +1289,9 @@ class TuningPage(QWidget):
         plot_tool_row.addWidget(self.btn_export_plot)
         plot_panel.body.addLayout(plot_tool_row)
         self.tuning_plot = SpectrumPlot("轮次", "目标量")
-        self.tuning_plot.setMinimumHeight(260)
+        # 工作台下半区常驻轮次/候选，曲线在正常窗口按分隔条获得主要空间；
+        # 这里只设小窗口下限，避免把整个页签的最小高度顶出默认窗口。
+        self.tuning_plot.setMinimumHeight(200)
         self.tuning_plot.use_science_style(x_label="轮次", y_label="目标量", legend=True)
         plot_panel.body.addWidget(self.tuning_plot, 1)
         self.response_note = QLabel("", objectName="mutedText")
@@ -1009,13 +1329,10 @@ class TuningPage(QWidget):
         left_layout.addWidget(self.range_section)
         body.addWidget(left_col)
 
-        # 右侧三块（过程日志 / 轮次明细 / 本轮候选）都是"看当下状态"的常驻信息：
-        # 并排会把每块压到只剩几行，上下堆叠又要把曲线的高度吃掉一大半。
-        # 收进同一个页签容器后，每块都拿到整列高度，需要哪块点哪块。
+        # 三种信息共用右栏，但每种都需要完整可读的高度：用页签切换，
+        # 而不是上下堆叠到只剩几行。轮次表本身保留全部本次记录，不再截断为 5 条。
         detail = QTabWidget()
         detail.setDocumentMode(True)
-        # 面板内的次级页签必须走紧凑样式：主题里 QTabBar::tab 的 150px 最小宽度是给
-        # 主页面签（3 个、横跨整窗）用的，照搬到这一栏会让页签栏溢出成滚动箭头。
         detail.tabBar().setObjectName("innerTabBar")
         detail.tabBar().setExpanding(True)
         self.monitor_detail_tabs = detail
@@ -1056,13 +1373,9 @@ class TuningPage(QWidget):
         )
         log_layout.addWidget(self.event_log_view, 1)
         detail.addTab(log_page, "过程日志")
-        detail.setTabToolTip(
-            0,
-            "按时间记录建议、下发、回读与异常：一行一个事件"
-            "（毫秒时间戳 · 级别 · 阶段 · 轮次 · 内容）",
-        )
+        detail.setTabToolTip(0, "按时间记录建议、下发、回读与异常")
 
-        # 轮次明细：一轮一行，页签标签带轮数，不用点开也知道积累了多少轮。
+        # 轮次明细：一轮一行，表内滚动查看所有已完成轮次，不再截断为最近 5 轮。
         recent_page = QWidget()
         recent_layout = QVBoxLayout(recent_page)
         recent_layout.setContentsMargins(10, 8, 10, 8)
@@ -1126,13 +1439,13 @@ class TuningPage(QWidget):
         detail.addTab(proposal_page, "本轮候选")
         detail.setTabToolTip(2, "当前候选参数；待确认时可逐项核对")
         self.candidate_detail_panel = proposal_page
-        # 页签内容会挡住视线，所以"有待确认候选"必须写在标签上（见 _update_candidate_tab）
         self._candidate_tab_index = 2
 
         body.addWidget(detail)
         body.setStretchFactor(0, 3)
         body.setStretchFactor(1, 2)
         body.setSizes([760, 430])
+        body.setMinimumHeight(0)
         outer.addWidget(body, 1)
 
         # ---------------- 候选确认条（auto 模式下整条隐藏）----------------
@@ -1230,6 +1543,15 @@ class TuningPage(QWidget):
         # 横向滚动区，条目一多就被滚动条压住看不见（变量十几个时尤其明显）。
         # 下拉只有一个控件宽度，条目再多也不影响布局。
         analysis_toolbar.addWidget(QLabel("分析视图", objectName="mutedText"))
+        self.analysis_stage_label = QLabel("分析阶段", objectName="mutedText")
+        self.analysis_stage_combo = QComboBox()
+        mark_compact(self.analysis_stage_combo)
+        self.analysis_stage_combo.setMinimumWidth(150)
+        self.analysis_stage_combo.currentIndexChanged.connect(self._on_analysis_stage_changed)
+        self.analysis_stage_label.setVisible(False)
+        self.analysis_stage_combo.setVisible(False)
+        analysis_toolbar.addWidget(self.analysis_stage_label)
+        analysis_toolbar.addWidget(self.analysis_stage_combo)
         self.analysis_choice_combo = QComboBox()
         mark_compact(self.analysis_choice_combo)
         self.analysis_choice_combo.setMinimumWidth(240)
@@ -1811,6 +2133,18 @@ class TuningPage(QWidget):
         if not hasattr(self, "parameter_table"):
             return
         selected_only = self.variable_filter.currentData() == "selected"
+        selected_count = sum(
+            row["check"].checkState() == Qt.CheckState.Checked
+            for row in getattr(self, "_rows", [])
+        )
+        # 首次进入、已保存配置的信号失配，或取消了最后一个勾选时，
+        # “已选参数”筛选会把整张表藏空。自动退回全量视图，始终留出恢复入口。
+        no_selection_fallback = selected_only and selected_count == 0 and bool(self._rows)
+        if no_selection_fallback:
+            self.variable_filter.blockSignals(True)
+            self.variable_filter.setCurrentIndex(self.variable_filter.findData("all"))
+            self.variable_filter.blockSignals(False)
+            selected_only = False
         any_visible = False
         for index, row in enumerate(getattr(self, "_rows", [])):
             enabled = row["check"].checkState() == Qt.CheckState.Checked
@@ -1824,6 +2158,10 @@ class TuningPage(QWidget):
             any_visible = any_visible or visible
         if hasattr(self, "range_empty_label"):
             self.range_empty_label.setVisible(not any_visible)
+        if no_selection_fallback and hasattr(self, "variable_count_label"):
+            self.variable_count_label.setText(
+                f"{len(self._rows)} 个可调参数 · 当前没有勾选项，已显示全部参数"
+            )
 
     def _refresh_readbacks(self) -> None:
         if self._read_in_flight or not self._rows:
@@ -1948,11 +2286,10 @@ class TuningPage(QWidget):
                 for row in self._rows
             ],
             "strategy": self.strategy.currentData() or "",
+            "stages": [dict(item) for item in self._stage_specs],
             "engine": self.engine_combo.currentData() or "cmaes",
             "mode": self.mode_combo.currentData() or "confirm",
             "patience": self.patience_spin.value(),
-            "calls_per_variable": self.calls_spin.value(),
-            "joint_frac": self.joint_frac_spin.value(),
             "hold_s": self.hold_spin.value(),
             "max_iterations": self.iterations_spin.value(),
             "settle_timeout_s": self.settle_spin.value(),
@@ -2044,6 +2381,12 @@ class TuningPage(QWidget):
             index = self.strategy.findData(strategy)
             if index >= 0:
                 self.strategy.setCurrentIndex(index)
+        self._stage_specs = [
+            {**item, "signals": [s for s in item.get("signals", []) if s in by_signal]}
+            for item in config.get("stages", [])
+            if any(s in by_signal for s in item.get("signals", []))
+        ]
+        self._refresh_stage_summary()
 
         engine = config.get("engine")
         if engine:
@@ -2056,7 +2399,6 @@ class TuningPage(QWidget):
             if index >= 0:
                 self.mode_combo.setCurrentIndex(index)
         for key, widget in (
-            ("calls_per_variable", self.calls_spin),
             ("max_iterations", self.iterations_spin),
             ("samples_per_point", self.samples_spin),
             ("loss_strikes", self.loss_strikes_spin),
@@ -2069,7 +2411,6 @@ class TuningPage(QWidget):
             if config.get(key) is not None:
                 widget.setValue(int(round(float(config[key]))))
         for key, widget in (
-            ("joint_frac", self.joint_frac_spin),
             ("hold_s", self.hold_spin),
             ("settle_timeout_s", self.settle_spin),
             ("loss_relative", self.loss_relative_spin),
@@ -2176,6 +2517,22 @@ class TuningPage(QWidget):
         if not target:
             self._complain("请选择优化目标。")
             return
+        if self.strategy.currentData() == "staged":
+            selected = {item["signal"] for item in variables}
+            assigned = {signal for stage in self._stage_specs for signal in stage["signals"]}
+            if not self._stage_specs:
+                self._complain("分阶段调优尚未配置阶段，请先点击“配置阶段…”。")
+                return
+            if selected - assigned:
+                self._complain("以下已启用参数未分配到阶段：" + "、".join(sorted(selected - assigned)))
+                return
+            if any(set(stage["signals"]) - selected for stage in self._stage_specs):
+                self._complain("阶段中包含当前未勾选的参数，请重新配置阶段参数。")
+                return
+            budget = sum(int(stage["iterations"]) for stage in self._stage_specs)
+            if budget > self.iterations_spin.value():
+                self._complain(f"阶段有效轮次合计 {budget} 超过最大尝试轮次 {self.iterations_spin.value()}。")
+                return
 
         if self.mode_combo.currentData() == "auto":
             protection = self.loss_absolute_check.isChecked() or (
@@ -2206,6 +2563,13 @@ class TuningPage(QWidget):
         self._algorithm = ""
         self._seed = None
         self._analysis = None  # 结束后从 /analysis 拉的 Optuna 分析结果
+        self._analysis_by_stage = {}
+        self.analysis_stage_combo.blockSignals(True)
+        self.analysis_stage_combo.clear()
+        self.analysis_stage_combo.blockSignals(False)
+        self.analysis_stage_label.setVisible(False)
+        self.analysis_stage_combo.setVisible(False)
+        self._analysis_request_stage = None
         self._snapshot = {}
         self._baseline = None
         self._recovery = None
@@ -2239,10 +2603,8 @@ class TuningPage(QWidget):
                 "max_iterations": self.iterations_spin.value(),
                 "settle_timeout_s": self.settle_spin.value(),
                 "samples_per_point": self.samples_spin.value(),
-                # 两阶段策略（改造报告 §5.2）
-                "strategy": self.strategy.currentData() or "joint",
-                "calls_per_variable": self.calls_spin.value(),
-                "joint_frac": self.joint_frac_spin.value() / 100.0,
+                "strategy": self.strategy.currentData() or "single",
+                "stages": self._stage_specs if self.strategy.currentData() == "staged" else [],
                 "hold_s": self.hold_spin.value(),
                 "seed": self._effective_seed(),
                 "n_startup_trials": self.startup_spin.value(),
@@ -2263,11 +2625,75 @@ class TuningPage(QWidget):
                 "max_invalid_rounds": self.max_invalid_spin.value(),
                 "write_retries": self.write_retries_spin.value(),
                 "loss_protection": self.loss_protection_check.isChecked(),
+                # 必须随本次请求发送；仅保存到本地配置并不会影响服务端的实际起点。
+                "reset_before_start": self.reset_before_start_check.isChecked(),
                 "stall_fraction": self.stall_fraction_form_spin.value() / 100.0,
                 "auto_recover": self.auto_recover_check.isChecked(),
             }
         )
         thread.completed.connect(self._on_started)
+
+    def _on_strategy_changed(self, *_args) -> None:
+        staged = self.strategy.currentData() == "staged"
+        self.stage_editor_button.setVisible(staged)
+        self.stage_summary.setVisible(staged)
+        if staged:
+            self._refresh_stage_summary()
+
+    def _selected_stage_signals(self) -> list[str]:
+        return [
+            row["entry"]["signal"]
+            for row in self._rows
+            if self._is_variable_selected(row)
+        ]
+
+    @staticmethod
+    def _is_variable_selected(row: dict) -> bool:
+        """兼容参数表的可勾选表格项与独立复选框。"""
+        check = row["check"]
+        if isinstance(check, QTableWidgetItem):
+            return check.checkState() == Qt.CheckState.Checked
+        return check.isChecked()
+
+    def _edit_stages(self) -> None:
+        available_signals = [
+            (row["entry"]["signal"], row["entry"].get("label", row["entry"]["signal"]))
+            for row in self._rows
+            if self._is_variable_selected(row)
+        ]
+        initial = self._stage_specs or [{
+            "name": "阶段 1",
+            "signals": self._selected_stage_signals(),
+            "iterations": self.iterations_spin.value(),
+            "range_mode": "full",
+            "range_fraction": 0.2,
+        }]
+        dialog = _StageConfigDialog(
+            self,
+            available_signals=available_signals,
+            stages=initial,
+            max_iterations=self.iterations_spin.value(),
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._stage_specs = dialog.stages()
+        self._refresh_stage_summary()
+        self._update_run_plan()
+
+    def _refresh_stage_summary(self) -> None:
+        if not hasattr(self, "stage_summary"):
+            return
+        if not self._stage_specs:
+            self.stage_summary.setText("尚未配置阶段；点击“配置阶段…”添加参数组与轮次预算。")
+            return
+        labels = {row["entry"]["signal"]: row["entry"].get("label", row["entry"]["signal"])
+                  for row in self._rows}
+        rows = [
+            f"{item['name']}：{'、'.join(labels.get(s, s) for s in item['signals'])} · "
+            f"{item['iterations']} 个有效轮次"
+            for item in self._stage_specs
+        ]
+        self.stage_summary.setText("；".join(rows))
 
     def _effective_seed(self) -> int:
         """本次实际使用的种子：勾选随机则现场生成，否则用固定值。"""
@@ -2326,16 +2752,11 @@ class TuningPage(QWidget):
             hint.setText(text)
 
     def _update_candidate_tab(self) -> None:
-        """把"有没有待确认候选"写到页签标签上。
-
-        候选表被收进页签后，切到别的页签就看不见它了；确认模式下的候选是
-        操作员唯一要动手的东西，所以标签必须自带信号（●），否则会干等。
-        """
+        """把待确认状态写在候选页签上，避免人工模式漏看新候选。"""
         tabs = getattr(self, "monitor_detail_tabs", None)
         index = getattr(self, "_candidate_tab_index", None)
-        if tabs is None or index is None:
-            return
-        tabs.setTabText(index, "本轮候选 ●" if self._pending else "本轮候选")
+        if tabs is not None and index is not None:
+            tabs.setTabText(index, "本轮候选 ●" if self._pending else "本轮候选")
 
     def _current_readbacks(self) -> dict[str, float]:
         """从变量行的「当前回读」单元格取最新值。"""
@@ -2761,6 +3182,9 @@ class TuningPage(QWidget):
 
     def _apply_status(self, status: dict) -> None:
         self._state = str(status.get("state", "idle"))
+        self._sync_analysis_stages(
+            status.get("stage_names") or [], status.get("stage_index")
+        )
         # 算法与种子：导出日志要带上（结果能不能复现全靠这两个）
         self._algorithm = str(
             status.get("algorithm_version") or status.get("algorithm") or self._algorithm
@@ -2773,6 +3197,12 @@ class TuningPage(QWidget):
         self._baseline = None if baseline is None else float(baseline)
         self._recovery = status.get("recovery")
         self._snapshot_note = str(status.get("snapshot_note") or "")
+        self.elapsed_card.value_label.setText(
+            self._elapsed_duration(
+                status.get("started_at"),
+                status.get("finished_at") if self._state in TERMINAL_STATES else None,
+            )
+        )
         completed = int(status.get("completed_iterations") or 0)
         remaining = max(0, int(status.get("max_iterations") or 0) - completed)
         self.eta_card.value_label.setText(
@@ -2905,20 +3335,15 @@ class TuningPage(QWidget):
         self._update_result_summary()
 
     def _stage_suffix(self, status: dict) -> str:
-        """把"现在在哪个阶段、正在调哪个参数"写进轮次标签。
-
-        两阶段策略下"调了 3 轮"是不够的信息：操作员要知道这 3 轮是在逐参数
-        还是在联合微调、以及正在动哪个参数。
-        """
-        stage = str(status.get("stage") or "")
-        if stage not in STAGE_TEXT:
+        """将阶段名称与进度写进运行状态，明确当前参数组和阶段预算。"""
+        if status.get("strategy") not in ("single", "staged"):
             return ""
-        if stage == "sequential":
-            index = int(status.get("stage_index") or 0)
-            total = int(status.get("stage_total") or 0)
-            variable = status.get("stage_variable") or ""
-            return f" · 阶段：逐参数 {index}/{total}（{variable}）"
-        return " · 阶段：联合微调"
+        name = str(status.get("stage_name") or "单阶段")
+        index = int(status.get("stage_index") or 0)
+        total = int(status.get("stage_total") or 0)
+        rounds = int(status.get("stage_rounds") or 0)
+        budget = int(status.get("stage_budget") or 0)
+        return f" · {name} {index}/{total}（有效 {rounds}/{budget} 轮）"
 
     def _render_recovery(self) -> None:
         """展示束流丢失保护的执行结果：原因 + 逐路实际回读。
@@ -3431,25 +3856,79 @@ class TuningPage(QWidget):
             scrollbar = view.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
 
+    def _sync_analysis_stages(self, names: list[str], current_index: int | None = None) -> None:
+        combo = getattr(self, "analysis_stage_combo", None)
+        if combo is None:
+            return
+        names = [str(name) for name in names]
+        current = combo.currentData()
+        expected = [(index, name) for index, name in enumerate(names, 1)]
+        actual = [(combo.itemData(i), combo.itemText(i)) for i in range(combo.count())]
+        if actual == expected:
+            return
+        combo.blockSignals(True)
+        combo.clear()
+        for index, name in expected:
+            combo.addItem(f"阶段 {index} · {name}", index)
+        valid_indices = {index for index, _ in expected}
+        selected = current if current in valid_indices else (
+            int(current_index) if current_index in valid_indices else (expected[0][0] if expected else None)
+        )
+        if selected is not None:
+            combo.setCurrentIndex(combo.findData(selected))
+        combo.blockSignals(False)
+        visible = len(expected) > 1
+        self.analysis_stage_label.setVisible(visible)
+        combo.setVisible(visible)
+        self._analysis_request_stage = selected
+
+    def _on_analysis_stage_changed(self, *_args) -> None:
+        combo = getattr(self, "analysis_stage_combo", None)
+        if combo is None:
+            return
+        self._analysis_request_stage = combo.currentData()
+        self._analysis = self._analysis_by_stage.get(self._analysis_request_stage)
+        if self._analysis is None:
+            self._load_analysis()
+        else:
+            self._refresh_result_analysis_choices()
+            self._render_result_analysis()
+            self._fill_analysis_trials()
+
     def _load_analysis(self) -> None:
-        """结束后从服务端拉 Optuna 分析数据（importance / slice / history）。"""
-        if not self._run_id or self._analysis is not None:
+        """结束后按阶段读取独立 Optuna study，避免混合不同搜索空间。"""
+        stage_index = self._analysis_request_stage
+        if not self._run_id:
+            return
+        cached = self._analysis_by_stage.get(stage_index)
+        if cached is not None:
+            self._analysis = cached
             return
         try:
-            thread = instrument_api.request_tuning_analysis(self._run_id)
-            thread.completed.connect(self._on_analysis_ready)
+            thread = instrument_api.request_tuning_analysis(
+                self._run_id, stage_index=stage_index
+            )
+            thread.completed.connect(
+                lambda payload, key=stage_index: self._on_analysis_ready(payload, key)
+            )
         except Exception as exc:
             self.analysis_note.setText(f"Optuna 分析加载失败：{exc}")
 
-    def _on_analysis_ready(self, payload: dict) -> None:
+    def _on_analysis_ready(self, payload: dict, stage_index: int | None = None) -> None:
         if not payload.get("ok"):
+            if stage_index != self._analysis_request_stage:
+                return
             self.analysis_note.setText(
                 f"Optuna 分析暂不可用：{payload.get('message', '未知错误')}"
                 "；优化历史仍使用本地轮次展示。"
             )
             self._render_result_analysis()
             return
-        self._analysis = payload.get("payload") or {}
+        analysis = payload.get("payload") or {}
+        self._analysis_by_stage[stage_index] = analysis
+        if stage_index != self._analysis_request_stage:
+            return
+        self._analysis = analysis
         self._refresh_result_analysis_choices()
         self._render_result_analysis()
         self._fill_analysis_trials()

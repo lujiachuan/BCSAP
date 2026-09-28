@@ -108,9 +108,10 @@ def sample_config() -> dict:
             {"signal": "magnet.m2.current_setpoint", "enabled": False, "low": 0.0, "high": 100.0},
             {"signal": "focus.v1.voltage_setpoint", "enabled": True, "low": 5.0, "high": 40.0},
         ],
-        "strategy": "sequential_then_joint",
-        "calls_per_variable": 4,
-        "joint_frac": 15.0,
+        "strategy": "single",
+        "engine": "cmaes",
+        "mode": "confirm",
+        "patience": 5,
         "hold_s": 3.0,
         "max_iterations": 12,
         "settle_timeout_s": 30.0,
@@ -118,7 +119,14 @@ def sample_config() -> dict:
         "loss_absolute": 2.5,
         "loss_relative": 40.0,
         "loss_strikes": 3,
+        "max_invalid_rounds": 5,
+        "write_retries": 2,
         "auto_recover": False,
+        "loss_protection": True,
+        "reset_before_start": False,
+        "stall_fraction": 0.05,
+        "seed": 0,
+        "random_seed": False,
         "finalize_action": "restore_initial",
     }
 
@@ -137,7 +145,7 @@ class TuningConfigFileTests(unittest.TestCase):
         tuning_config.save(sample_config(), self.path)
 
         loaded, note = tuning_config.load(
-            self.path, strategies=("joint", "sequential_then_joint"),
+            self.path, strategies=("single", "staged"),
             actions=FINALIZE_KEYS,
         )
 
@@ -175,7 +183,7 @@ class TuningConfigFileTests(unittest.TestCase):
         raw["variables"][0]["low"] = "十"
 
         config, notes = tuning_config.sanitize(
-            raw, strategies=("joint", "sequential_then_joint"), actions=FINALIZE_KEYS
+            raw, strategies=("single", "staged"), actions=FINALIZE_KEYS
         )
 
         self.assertNotIn("max_iterations", config)
@@ -191,7 +199,7 @@ class TuningConfigFileTests(unittest.TestCase):
         raw["finalize_action"] = "重启设备"
 
         config, notes = tuning_config.sanitize(
-            raw, strategies=("joint", "sequential_then_joint"), actions=FINALIZE_KEYS
+            raw, strategies=("single", "staged"), actions=FINALIZE_KEYS
         )
 
         self.assertNotIn("strategy", config)
@@ -251,7 +259,7 @@ class TuningConfigFileTests(unittest.TestCase):
         text = tuning_config.describe(sample_config())
 
         self.assertIn("2 个变量", text)
-        self.assertIn("sequential_then_joint", text)
+        self.assertIn("策略 single", text)
         self.assertIn("12", text)
 
     def test_environment_moves_the_default_path(self) -> None:
@@ -325,7 +333,7 @@ class TuningPageConfigTests(unittest.TestCase):
         row["check"].setCheckState(Qt.CheckState.Checked)
         row["low"].setValue(5.0)
         row["high"].setValue(40.0)
-        page.calls_spin.setValue(4)
+        page.samples_spin.setValue(4)
         page.iterations_spin.setValue(12)
         page.hold_spin.setValue(3.0)
         page.finalize_pref.setCurrentIndex(page.finalize_pref.findData("safe_values"))
@@ -334,7 +342,7 @@ class TuningPageConfigTests(unittest.TestCase):
 
         saved = json.loads(self.path.read_text(encoding="utf-8"))
         self.assertEqual(saved["strategy"], page.strategy.currentData())
-        self.assertEqual(saved["calls_per_variable"], 4)
+        self.assertEqual(saved["samples_per_point"], 4)
         self.assertEqual(saved["max_iterations"], 12)
         self.assertEqual(saved["hold_s"], 3.0)
         self.assertEqual(saved["finalize_action"], "safe_values")
@@ -366,9 +374,8 @@ class TuningPageConfigTests(unittest.TestCase):
         )
         self.assertEqual(self.row(page, "magnet.m1.current_setpoint")["high"].value(), 60.0)
         self.assertEqual(self.row(page, "magnet.m1.current_setpoint")["low"].value(), 10.0)
-        self.assertEqual(page.strategy.currentData(), "sequential_then_joint")
-        self.assertEqual(page.calls_spin.value(), 4)
-        self.assertEqual(page.joint_frac_spin.value(), 15.0)
+        self.assertEqual(page.strategy.currentData(), "single")
+        self.assertEqual(page.samples_spin.value(), 5)
         self.assertEqual(page.hold_spin.value(), 3.0)
         self.assertEqual(page.iterations_spin.value(), 12)
         self.assertEqual(page.settle_spin.value(), 30.0)
@@ -456,12 +463,12 @@ class TuningPageConfigTests(unittest.TestCase):
     # ---------------- 载入按钮 / 开跑前自动保存 ----------------
     def test_load_button_reloads_from_disk(self) -> None:
         page = self.make_page()
-        page.calls_spin.setValue(9)
+        page.samples_spin.setValue(9)
         tuning_config.save(sample_config(), self.path)
 
         page.load_tuning_config()
 
-        self.assertEqual(page.calls_spin.value(), 4)
+        self.assertEqual(page.samples_spin.value(), 5)
         self.assertIn("已载入调束配置", page.config_note.text())
 
     def test_starting_saves_the_config_silently(self) -> None:

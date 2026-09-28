@@ -5,6 +5,7 @@
 """
 
 import unittest
+from datetime import UTC, datetime
 
 from fastapi import HTTPException
 
@@ -20,6 +21,8 @@ from packages.contracts import (
     SignalWriteRequest,
 )
 from packages.epics_adapter import SimulatedEpicsGateway
+from packages.epics_adapter.base import Reading
+from packages.epics_adapter.command_line import EpicsCommandNotStarted
 
 
 def entry(
@@ -125,6 +128,42 @@ class SignalWriteServiceTests(unittest.TestCase):
 
         self.assertEqual([r.connected for r in snapshot.readings], [False, False])
         self.assertTrue(all(r.detail for r in snapshot.readings))
+
+    def test_disconnected_zero_is_never_used_as_a_real_value(self) -> None:
+        """CA 网关断线时可能返回 0.0；回落到零也不能因此误判到位。"""
+        class DisconnectedGateway(SimulatedEpicsGateway):
+            def __init__(self):
+                super().__init__({})
+                self.writes = 0
+
+            def read(self, signal):
+                now = datetime.now(UTC)
+                return Reading(signal, 0.0, "sccm", now, now, connected=False)
+
+            def snapshot(self, signals):
+                return {signal: self.read(signal) for signal in signals}
+
+            def write(self, signal, value, command_id):
+                self.writes += 1
+                return super().write(signal, value, command_id)
+
+        gateway = DisconnectedGateway()
+        service = SignalWriteService(gateway, self.config, sleep=lambda _s: None)
+
+        snapshot = service.read_snapshot(["gas.ar.flow_readback"])
+        self.assertFalse(snapshot.readings[0].connected)
+        self.assertIsNone(snapshot.readings[0].value)
+        self.assertIsNone(service.read_value("gas.ar.flow_readback"))
+        settled, value = service.wait_settled(
+            self.config.entries[0], 0.0, tol=0.5, timeout=0.0
+        )
+        self.assertFalse(settled)
+        self.assertIsNone(value)
+        result = service.write(
+            SignalWriteRequest(signal="gas.ar.flow_setpoint", value=0.0)
+        )
+        self.assertFalse(result.accepted)
+        self.assertEqual(gateway.writes, 0)
 
     # ---------------- 边界 ----------------
     def test_write_within_bounds_is_applied(self) -> None:
@@ -284,17 +323,45 @@ class SignalWriteServiceTests(unittest.TestCase):
     def test_same_command_id_does_not_write_twice(self) -> None:
         command = "11111111-2222-3333-4444-555555555555"
         first = self.write(100.0, command_id=command)
-        second = self.write(300.0, command_id=command)
+        second = self.write(100.0, command_id=command)
+        conflict = self.write(300.0, command_id=command)
 
         self.assertEqual(first.applied, second.applied)
+        self.assertFalse(conflict.accepted)
+        self.assertIn("command_id", conflict.reason)
         self.assertEqual(self.service.read_value("gas.ar.flow_setpoint"), 100.0)
 
-    def test_rejected_command_id_is_not_cached(self) -> None:
-        """被拒绝的请求不该占据幂等位，否则修正参数重试会被旧结果挡住。"""
+    def test_rejected_command_id_is_cached(self) -> None:
+        """修改参数必须使用新命令号；旧号保持首次拒绝结果。"""
         command = "11111111-2222-3333-4444-555555555555"
-        self.assertFalse(self.write(900.0, command_id=command).accepted)
+        first = self.write(900.0, command_id=command)
 
-        self.assertTrue(self.write(100.0, command_id=command).accepted)
+        self.assertFalse(first.accepted)
+        self.assertEqual(self.write(900.0, command_id=command), first)
+        self.assertFalse(self.write(100.0, command_id=command).accepted)
+        self.assertTrue(self.write(100.0, command_id="22222222-2222-3333-4444-555555555555").accepted)
+
+    def test_command_not_started_has_known_state_only_before_first_step(self) -> None:
+        class FailsBeforeStart(SimulatedEpicsGateway):
+            def __init__(self):
+                super().__init__({"gas.ar.flow_setpoint": (0.0, "sccm")})
+                self.calls = 0
+
+            def write(self, signal, value, command_id):
+                self.calls += 1
+                if self.calls == 2:
+                    raise EpicsCommandNotStarted("进程未启动")
+                return super().write(signal, value, command_id)
+
+        gateway = FailsBeforeStart()
+        service = SignalWriteService(gateway, self.config, sleep=lambda _s: None)
+        result = service.write(SignalWriteRequest(
+            signal="gas.ar.flow_setpoint", value=100.0,
+        ))
+
+        self.assertFalse(result.accepted)
+        self.assertTrue(result.device_state_unknown)
+        self.assertEqual(gateway.calls, 2)
 
 
 class SettleTests(unittest.TestCase):

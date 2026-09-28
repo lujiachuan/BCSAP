@@ -5,11 +5,8 @@
 - 每个 run 一个 study（study_name = "run_{run_id}"），从 sqlite storage 打开。
 - 数据量小（几十轮），直接全量返回，不分页。
 
-**范围（批次 3 的 D13 修正）**：采样 Study 按阶段拆分（逐参数 / 联合微调），
-逐参数阶段每个变量各一个 search space。把它们合并起来算重要性/响应面，
-等于把"单变量切片"和"四维联合"的数据混在一张图上——峰位是假的，重要性排名也不可信。
-所以分析默认**只取联合阶段**（`scope="joint"`），拿不到时才退回合并数据并显式标注
-`scope="mixed"` 与原因，让看图的人自己决定要不要用。
+**范围**：新版每个配置阶段使用独立 Study。响应面、参数重要性和切片只分析单个阶段，
+不把不同参数组或搜索范围的数据合并。
 
 参数值优先取**设备实际回读**（trial 的 ``user_attrs.readback``）：分析应该反映
 "设备当时在哪"，而不是"算法建议了哪"。
@@ -23,11 +20,19 @@ import optuna
 from optuna.trial import TrialState
 
 
-def open_study(storage_url: str, run_id: str) -> optuna.Study | None:
+def open_study(storage_url: str, run_id: str, stage_index: int | None = None) -> optuna.Study | None:
     """打开指定 run 的分析 Study；不存在或无 COMPLETE trial 返回 None。
 
-    采样 Study 按阶段拆分（run_{id}__sample__seq_xxx / joint），分析层优先只读联合阶段。
+    新版每个阶段独立建 Study；默认读取最后一个阶段，指定阶段时只读该阶段。
     """
+    # 新版每阶段独立 Study；指定阶段时绝不合并其他阶段的数据。
+    if stage_index is not None:
+        name = f"run_{run_id}__sample__stage_{stage_index:02d}"
+        try:
+            study = optuna.load_study(study_name=name, storage=storage_url)
+            return study if study.trials else None
+        except (KeyError, ValueError):
+            return None
     # 先试旧版单 Study（向后兼容）
     for name in (f"run_{run_id}",):
         try:
@@ -38,6 +43,11 @@ def open_study(storage_url: str, run_id: str) -> optuna.Study | None:
             pass
     summaries = optuna.get_all_study_summaries(storage_url)
     all_names = [s.study_name for s in summaries]
+    stage_names = [n for n in all_names if n.startswith(f"run_{run_id}__sample__stage_")]
+    if stage_names:
+        latest = max(stage_names, key=lambda n: int(n.rsplit("stage_", 1)[-1]))
+        study = optuna.load_study(study_name=latest, storage=storage_url)
+        return study if study.trials else None
     joint = f"run_{run_id}__sample__joint"
     if joint in all_names:
         study = optuna.load_study(study_name=joint, storage=storage_url)
@@ -267,22 +277,26 @@ def surface_data(study: optuna.Study) -> dict[str, Any]:
     }
 
 
-def analyze(storage_url: str, run_id: str) -> dict[str, Any] | None:
+def analyze(storage_url: str, run_id: str, stage_index: int | None = None) -> dict[str, Any] | None:
     """一站式分析结果：history + importance + slice + trials + best。
 
-    ``scope`` 说明这份数据来自哪个范围：``joint``（只有联合阶段的 trial，可信）
-    或 ``mixed``（各阶段合并，仅作趋势参考——逐参数阶段的单变量 trial 与联合阶段的
-    多维 trial 混在一起，重要性与响应面的排名会失真）。
+    ``scope`` 标识单阶段、旧版联合 Study 或兼容合并数据。
     """
-    study = open_study(storage_url, run_id)
+    study = open_study(storage_url, run_id, stage_index)
     if study is None:
         return None
+    is_phase = "__sample__stage_" in study.study_name
     joint = _is_joint(study)
     return {
         "study_name": study.study_name,
-        "scope": "joint" if joint else "mixed",
+        "scope": "stage" if is_phase else ("joint" if joint else "mixed"),
+        "stage_index": (
+            int(study.study_name.rsplit("stage_", 1)[-1]) if is_phase else None
+        ),
         "scope_note": (
-            ""
+            "当前仅展示所选阶段的数据；阶段间参数组、搜索范围互相独立，不跨阶段混算。"
+            if is_phase
+            else ""
             if joint
             else "同一次任务里的逐参数阶段与联合阶段被合并计算：重要性与响应面"
             "只应作为趋势参考，不要据此下结论"

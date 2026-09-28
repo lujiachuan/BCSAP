@@ -276,7 +276,9 @@ class ValidRoundTests(_ServiceHarness):
 
         self.set_target(11.0)  # 第 3 轮有效
         service.approve(status.run_id)
-        self.assertEqual(run.stage_rounds, 2)
+        # 阶段 1 预算（calls_per_variable=2）已用尽：进入阶段 2，计数重置——
+        # 无效轮没被算成阶段进展，预算仍然精确只吃有效轮。
+        self.assertEqual(run.stage_rounds, 0)
         self.assertEqual(run.invalid_streak, 0)
 
     def test_consecutive_invalid_rounds_stop_the_task(self) -> None:

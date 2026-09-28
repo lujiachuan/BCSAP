@@ -32,7 +32,7 @@ JITTER_RATIO = 3.0
 # 变量多到这个数就建议降维（原 demo 的阈值）
 MANY_VARIABLES = 6
 
-STAGE_TEXT = {"sequential": "逐参数优化", "joint": "联合微调"}
+STAGE_TEXT = {"sequential": "旧版逐参数阶段", "joint": "旧版联合阶段"}
 
 # 轮次质量（服务端的 ``quality``）→ 现场看得懂的短标签。
 # 把 ``write_rejected`` / ``unsettled`` 这类内部标识原样摆到表里，操作员得先背一份
@@ -128,15 +128,15 @@ def best_point(xs: Sequence[float], ys: Sequence[float]) -> tuple[float, float] 
 def stage_of(record: Mapping) -> str:
     """这一轮的阶段文案（老记录没有阶段字段 → 如实说"未记录"）。"""
     stage = record.get("stage")
-    return STAGE_TEXT.get(str(stage), "未记录阶段")
+    return STAGE_TEXT.get(str(stage), str(stage) if stage else "未记录阶段")
 
 
 def startup_advice(variables: Sequence[str]) -> list[str]:
     """开跑前的建议（原 demo 的 R5：参与变量过多）。"""
     if len(variables) >= MANY_VARIABLES:
         return [
-            f"参与变量 {len(variables)} 个较多：建议用「逐参数优化 → 联合微调」，"
-            "或分批勾选降低维度——维度一高，同样的轮次摊到每个参数上就不够看出趋势了"
+            f"参与变量 {len(variables)} 个较多：建议按束线阶段分组，"
+            "每阶段共同调优一组相关参数，避免一次联合搜索维度过高"
         ]
     return []
 

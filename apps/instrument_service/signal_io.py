@@ -29,6 +29,7 @@ from packages.contracts import (
     SignalWriteResult,
 )
 from packages.epics_adapter import EpicsGateway, Reading
+from packages.epics_adapter.command_line import EpicsCommandNotStarted
 
 # 斜坡分步上限：超出即拒绝而不是放宽 max_step（宁可拒绝也不静默违反安全约束）。
 MAX_RAMP_STEPS = 128
@@ -69,8 +70,8 @@ class SignalWriteService:
         self._entries: dict[str, PvMappingEntry] = {
             entry.signal: entry for entry in config.entries
         }
-        # command_id -> 首次写入结果，用于重放幂等
-        self._completed: dict[str, SignalWriteResult] = {}
+        # command_id -> (请求内容, 首次结果)，含失败与状态未知结果。
+        self._completed: dict[str, tuple[tuple, SignalWriteResult]] = {}
 
     # ------------------------------------------------------------------
     # 映射查询
@@ -85,12 +86,29 @@ class SignalWriteService:
         except KeyError as exc:
             raise WriteRejected(f"未配置的业务信号：{signal}") from exc
 
-    def cached_write_result(self, command_id: str | None) -> SignalWriteResult | None:
-        """返回已经成功完成的幂等写结果；查询本身不会触碰设备。"""
-        if not command_id:
+    def cached_write_result(self, request: SignalWriteRequest) -> SignalWriteResult | None:
+        """同一命令号只返回首次结果；不同请求复用命令号时明确拒绝。"""
+        if not request.command_id:
             return None
         with self._lock:
-            return self._completed.get(command_id)
+            completed = self._completed.get(request.command_id)
+            if completed is None:
+                return None
+            key, result = completed
+            if key == self._request_key(request):
+                return result
+            entry = self.entry(request.signal)
+            return SignalWriteResult(
+                signal=entry.signal, pv=entry.pv, unit=entry.unit,
+                requested=request.value, accepted=False,
+                reason="command_id 已用于不同的写入请求，未再次下发",
+                command_id=request.command_id, dry_run=request.dry_run,
+                finished_at=_now(),
+            )
+
+    @staticmethod
+    def _request_key(request: SignalWriteRequest) -> tuple:
+        return (request.signal, request.value, request.ramp, request.dry_run)
 
     def resolve(self, signals: list[str] | None = None) -> list[PvMappingEntry]:
         """把请求的信号名列表解析成条目；None/空表示全部。"""
@@ -159,7 +177,8 @@ class SignalWriteService:
         return SignalReading(
             signal=entry.signal,
             pv=entry.pv,
-            value=float(reading.value),
+            # 网关可能用 0.0 作为断线占位值；它绝不能参与写前校验或稳定判定。
+            value=float(reading.value) if reading.connected else None,
             unit=entry.unit,
             connected=reading.connected,
             writable=entry.writable,
@@ -180,7 +199,8 @@ class SignalWriteService:
         已验证，并把命令失败统一转换成带原因的未连接读数。
         """
         try:
-            return self._read_entry(self.entry(signal)).value
+            reading = self._read_entry(self.entry(signal))
+            return reading.value if reading.connected else None
         except Exception:  # noqa: BLE001  单路读失败按「读不到」处理，不打断调用方
             return None
 
@@ -193,6 +213,25 @@ class SignalWriteService:
         同 ``command_id`` 的重复请求返回首次结果，不重复下发设备写命令。
         """
         entry = self.entry(request.signal)
+
+        if request.command_id:
+            # 锁住「查缓存—执行—记结果」整个区间，避免相同 ID 并发写两次。
+            with self._lock:
+                cached = self.cached_write_result(request)
+                if cached is not None:
+                    return cached
+                result = self._write_uncached(entry, request)
+                self._completed[request.command_id] = (
+                    self._request_key(request), result
+                )
+                while len(self._completed) > _IDEMPOTENCY_CACHE:
+                    self._completed.pop(next(iter(self._completed)))
+                return result
+        return self._write_uncached(entry, request)
+
+    def _write_uncached(
+        self, entry: PvMappingEntry, request: SignalWriteRequest
+    ) -> SignalWriteResult:
 
         if self._read_only:
             # 拒绝在**校验之前**：只读部署下连"这个值是否合法"也不必回答，
@@ -213,19 +252,7 @@ class SignalWriteService:
                 finished_at=_now(),
             )
 
-        if request.command_id:
-            cached = self.cached_write_result(request.command_id)
-            if cached is not None:
-                return cached
-
-        result = self._execute(entry, request)
-
-        if request.command_id and result.accepted:
-            with self._lock:
-                self._completed[request.command_id] = result
-                while len(self._completed) > _IDEMPOTENCY_CACHE:
-                    self._completed.pop(next(iter(self._completed)))
-        return result
+        return self._execute(entry, request)
 
     def _execute(
         self, entry: PvMappingEntry, request: SignalWriteRequest
@@ -307,6 +334,12 @@ class SignalWriteService:
                 if index and delay:
                     self._sleep(delay)
                 self._gateway.write(entry.signal, value, command)
+        except EpicsCommandNotStarted as exc:
+            # 第一步尚未启动时可以确定设备没动；后续步骤失败则是部分执行。
+            return reject(
+                f"写入命令未启动：{exc}", previous=previous,
+                state_unknown=index > 0,
+            )
         except Exception as exc:  # noqa: BLE001  写入失败如实返回，绝不假装成功
             # 下发中报错意味着「是否已执行未知」：可能已经写到设备了。
             # 调用方必须按结果未知处理，不能当成「设备没动」。
@@ -392,8 +425,7 @@ class SignalWriteService:
         默认用条目自己的 ``readback_signal``。
 
         传错条目（例如只读的回读条目上没有容差）会得到 ``tolerance is None``，
-        从而**直接判定为已稳定**——这正是把未稳定点混进谱图的常见原因，
-        所以调用方应当传设定条目。
+        此时只能确认回读可读，不能证明到位；调用方应当传设定条目。
 
         超时不算异常：调用方据返回值决定继续还是判定失败
         （文档 9.2：稳定判据按设备定义，不假设写完成即稳定）。
@@ -407,14 +439,27 @@ class SignalWriteService:
             return self._read_signal(source)
 
         if tolerance is None:
-            return True, current()
+            last = current()
+            return last is not None, last
 
         deadline = None if limit is None else time.monotonic() + limit
         last: float | None = None
+        missing_delay = poll
         while True:
             last = current()
             if last is not None and abs(last - target) <= tolerance:
                 return True, last
             if deadline is not None and time.monotonic() >= deadline:
                 return False, last
-            self._sleep(poll)
+            if last is None:
+                # 离线单路 caget 自身可能已等待约 1 秒；逐次退避可避免
+                # 在设备掉线的整段稳定超时内每 0.2 秒继续起新进程。
+                missing_delay = min(max(poll, missing_delay * 2), 2.0)
+            else:
+                missing_delay = poll
+            remaining = None if deadline is None else deadline - time.monotonic()
+            sleep_for = (
+                missing_delay if remaining is None
+                else min(missing_delay, max(0.0, remaining))
+            )
+            self._sleep(sleep_for)
