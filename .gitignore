@@ -16,3 +16,33 @@ logs/
 unins000.exe
 unins000.dat
 *.lnk
+
+# 根目录调试残留（一次性补丁脚本/日志/截图/请求体/探针输出）。
+# 只忽略不删除；确需入库时用 git add -f。
+/patch_*.py
+/fix_*.py
+/diag_*.py
+/probe_*.py
+/compare*.py
+/clear_recovery.py
+/revert_split.py
+/smoke_s1_s4.py
+/test_drop.py
+/test_reset_inmem.py
+/test_start_inmem.py
+/test_startup.py
+/test_surface.py
+/test_ui_startup.py
+/tmp*
+/*.png
+/*.log
+/*.json
+/*.txt
+
+# demo 现场运行产物（临时脚本、调参日志、LabVIEW 原始导出）
+demo/argon_tuning/argon_tuning/_tmp/
+demo/argon_tuning/argon_tuning/tuning_logs/
+demo/argon_tuning/argon_tuning/labview_exports/
+demo/argon_tuning/argon_tuning/*.log
+demo/argon_tuning/argon_tuning/*.jsonl
+demo/argon_tuning/argon_tuning/*.db
