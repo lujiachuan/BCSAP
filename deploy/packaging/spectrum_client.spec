@@ -17,7 +17,9 @@ ROOT = Path(SPECPATH).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 # UI 通过 pages/registry 组织页面；收集全部子模块，避免个别模块只被间接引用时漏掉。
-hiddenimports = collect_submodules("apps.desktop_client") + collect_submodules("packages")
+# packages 保持由 PyInstaller 按实际 import 递归分析；全量收集会把仅服务端使用的
+# optimizer/optuna/sklearn/scipy 一并打入客户端。
+hiddenimports = collect_submodules("apps.desktop_client")
 # scienceplots 的样式是 .mplstyle 数据文件：只收模块字节码不收集样式文件，
 # 运行时 style.use("science") 会抛 OSError 直接崩掉整个客户端。
 scienceplots_datas = collect_data_files("scienceplots")
@@ -31,7 +33,8 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # pyqtgraph 会探测可选的 scipy/pytest，基础绘图和导出路径并不使用它们。
+    excludes=["scipy", "pytest"],
     noarchive=False,
 )
 

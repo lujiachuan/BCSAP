@@ -346,6 +346,28 @@ class PvMappingSafetyFieldTests(CacheDirSettingsTests):
         self.assertTrue(collected["visible"])
         self.assertFalse(collected["scan_axis"])
 
+    MAX_VALUE_COLUMN = 9  # PV_COLUMNS 里的「最大值」：边界列现在直接在主表里改
+
+    def test_a_non_numeric_safety_bound_is_reported_instead_of_raising(self) -> None:
+        """四个边界列能在主表直接编辑，手滑填了非数字要给提示、不发请求，而不是抛异常。"""
+        page = self.loaded_page(mapping_entry("gas.ar.flow_setpoint"))
+        page._set_pv_text(0, self.MAX_VALUE_COLUMN, "五百")
+
+        page._save_pv_mapping()
+
+        self.assertEqual(self.mapping_requests, [], "数值不合法时不该发请求")
+        self.assertEqual(page.pv_feedback.property("state"), "error")
+        self.assertIn("必须是数字", page.pv_feedback.text())
+
+    def test_clearing_a_safety_bound_saves_as_none(self) -> None:
+        """留空表示不限制：要存成 None，不能变成 0（0 是"锁死到 0"的真边界）。"""
+        page = self.loaded_page(mapping_entry("gas.ar.flow_setpoint"))
+        page._set_pv_text(0, self.MAX_VALUE_COLUMN, "")
+
+        collected = page._collect_pv_mapping()["entries"][0]
+
+        self.assertIsNone(collected["max_value"])
+
     def test_hover_shows_the_hidden_fields_and_survives_clear_marks(self) -> None:
         page = self.loaded_page(mapping_entry("gas.ar.flow_setpoint"))
 
@@ -469,7 +491,8 @@ class PvDuplicateRowTests(PvMappingSafetyFieldTests):
         page._duplicate_pv_rows()
 
         self.assertIn("共 2 行", page.pv_summary.text())
-        self.assertIn("请修改业务信号", page.pv_feedback.text())
+        # 业务信号改到「编辑设备属性」里维护，提示随之改成指路而不是让人就地改单元格。
+        self.assertIn("在设备属性中修改业务信号", page.pv_feedback.text())
         self.assertEqual(page.pv_table.currentRow(), 1)
 
 
@@ -518,7 +541,10 @@ class PvProbeTests(CacheDirSettingsTests):
             page.pv_table.horizontalHeaderItem(index).text()
             for index in range(page.pv_table.columnCount())
         ]
-        self.assertEqual(headers[-2:], ["连接", "当前值"])
+        # 四个边界/限速列排在检测结果之后（现在可在主表直接编辑），所以不能再按"最后两列"取。
+        self.assertEqual(headers[-4:], ["最小值", "最大值", "最大单步", "最大速率"])
+        self.assertEqual(headers[PV_STATUS_COLUMN], "连接")
+        self.assertEqual(headers[PV_VALUE_COLUMN], "当前值")
         for row in range(page.pv_table.rowCount()):
             for column in (PV_STATUS_COLUMN, PV_VALUE_COLUMN):
                 item = page.pv_table.item(row, column)

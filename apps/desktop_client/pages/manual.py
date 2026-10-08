@@ -598,6 +598,11 @@ class _TopBar(QFrame):
         self.all_off_button.setEnabled(False)
         layout.addWidget(self.all_off_button)
 
+        self.auto_apply = QCheckBox("自动下发")
+        self.auto_apply.setToolTip("启用后，设定值改变会自动写入设备，并隐藏所有下发按钮")
+        self.auto_apply.toggled.connect(page.set_auto_apply)
+        layout.addWidget(self.auto_apply)
+
     def set_readouts(self, entries: Sequence[dict]) -> None:
         """顶栏大字读数（demo 顶栏就是 FC1/FC2 电流）。
 
@@ -693,6 +698,7 @@ class _SetpointEditor(QWidget):
         self.signal = str(entry.get("signal") or "")
         self.unit = str(entry.get("unit") or "")
         self._on_submit = on_submit
+        self._auto_enabled = False
         self.base_step, decimals = _input_format(entry)
 
         low = entry.get("min_value")
@@ -720,6 +726,19 @@ class _SetpointEditor(QWidget):
         self.send_button.setToolTip(f"下发 {entry.get('label', self.signal)}")
         self.send_button.clicked.connect(lambda: self._on_submit(self.spin.value()))
         layout.addWidget(self.send_button)
+        self.spin.valueChanged.connect(lambda value: self._on_value_changed(value))
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setSingleShot(True)
+        self._auto_timer.setInterval(350)
+        self._auto_timer.timeout.connect(lambda: self._on_submit(self.spin.value()))
+
+    def _on_value_changed(self, _value: float) -> None:
+        if self._auto_enabled:
+            self._auto_timer.start()
+
+    def set_auto_apply(self, enabled: bool) -> None:
+        self._auto_enabled = enabled
+        self.send_button.setVisible(not enabled)
 
     def set_level(self, level: int) -> None:
         """页面级步进档变化时重设单步步长。"""
@@ -741,7 +760,9 @@ class _SetpointEditor(QWidget):
         """按实际值回填，便于「在当前值上微调」（正在输入时不打断）。"""
         if value is None or self.spin.hasFocus():
             return
+        self.spin.blockSignals(True)
         self.spin.setValue(float(value))  # type: ignore[arg-type]
+        self.spin.blockSignals(False)
 
 
 class _GroupPanel(QFrame):
@@ -1076,10 +1097,18 @@ class _MagnetGroupPanel(QWidget):
         self.rate_spin.setFixedWidth(SPIN_WIDTH)
         self.rate_spin.setEnabled(False)
         row_layout.addWidget(self.rate_spin)
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setSingleShot(True)
+        self._auto_timer.setInterval(350)
+        self._auto_timer.timeout.connect(self._submit)
+        self.current_spin.valueChanged.connect(self._schedule_auto_submit)
+        self.rate_spin.valueChanged.connect(self._schedule_auto_submit)
 
         self.send_button = QPushButton("成组下发", objectName="setButton")
         self.send_button.setToolTip("由执行服务整批校验后一起下发；失败会逐路报出")
         self.send_button.clicked.connect(self._submit)
+        # 卡片重build 时可能已经处于自动下发；page 允许为 None（用例只检查旋钮样式）
+        self.send_button.setVisible(not getattr(self.page, "_auto_apply", False))
         row_layout.addWidget(self.send_button)
         row_layout.addStretch()
         layout.addWidget(row)
@@ -1091,6 +1120,10 @@ class _MagnetGroupPanel(QWidget):
 
     def _on_rate_toggled(self, checked: bool) -> None:
         self.rate_spin.setEnabled(checked)
+
+    def _schedule_auto_submit(self, _value: float) -> None:
+        if self.page._auto_apply:
+            self._auto_timer.start()
 
     def _set_result(self, text: str, state: str) -> None:
         self.result_label.setText(text)
@@ -1166,6 +1199,7 @@ class _DeviceRow(QWidget):
         self.switches: list[tuple[str, QPushButton, QPushButton]] = []
         self.modes: list[tuple[dict, _WheelSpinBox, QPushButton]] = []
         self.triggers: list[QPushButton] = []
+        self._mode_auto_timers: dict[str, QTimer] = {}
         self.output_layout: QHBoxLayout | None = None
 
         row = QHBoxLayout(self)
@@ -1284,9 +1318,28 @@ class _DeviceRow(QWidget):
         send.clicked.connect(
             lambda _checked=False, s=signal, w=spin: self.page.write_signal(self, s, w.value())
         )
+        spin.valueChanged.connect(
+            lambda value, s=signal: self._schedule_auto_write(s, value)
+        )
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(350)
+        timer.timeout.connect(lambda s=signal, w=spin: self._auto_write_signal(s, w.value()))
+        self._mode_auto_timers[signal] = timer
         self.output_layout.addWidget(spin)
         self.output_layout.addWidget(send)
+        send.setVisible(not getattr(self.page, "_auto_apply", False))
         self.modes.append((entry, spin, send))
+
+    def _schedule_auto_write(self, signal: str, _value: float) -> None:
+        if self.page._auto_apply:
+            timer = self._mode_auto_timers.get(signal)
+            if timer is not None:
+                timer.start()
+
+    def _auto_write_signal(self, signal: str, value: float) -> None:
+        if self.page._auto_apply:
+            self.page.write_signal(self, signal, value)
 
     # ------------------------------------------------------------------
     # 刷新
@@ -1356,7 +1409,9 @@ class _DeviceRow(QWidget):
             signal = str(entry.get("signal") or "")
             reading = readings.get(signal) or {}
             if reading.get("connected") and not spin.hasFocus():
+                spin.blockSignals(True)
                 spin.setValue(float(reading.get("value") or 0.0))
+                spin.blockSignals(False)
 
     def _refresh_readback(self, readings: dict[str, dict], connected: bool) -> None:
         if not self.spec.readbacks:
@@ -1871,6 +1926,7 @@ class ManualControlPage(QWidget):
         self._topbar_signals: list[dict] = []
         # 卡片布局是否已按真实画布尺寸恢复过（防止 hidden 构建时尺寸误判）
         self._layout_restored = False
+        self._auto_apply = False
 
         layout = page_layout(self)
         layout.addWidget(
@@ -1951,6 +2007,16 @@ class ManualControlPage(QWidget):
 
     def step_level(self) -> int:
         return STEP_LEVELS[getattr(self, "_step_level_index", 0)]
+
+    def set_auto_apply(self, enabled: bool) -> None:
+        self._auto_apply = enabled
+        for row in self._rows:
+            for editor in row.editors:
+                editor.set_auto_apply(enabled)
+            for _entry, _spin, send in row.modes:
+                send.setVisible(not enabled)
+        if self.magnet_group_panel is not None:
+            self.magnet_group_panel.send_button.setVisible(not enabled)
 
     def toggle_layout_lock(self, locked: bool) -> None:
         """锁定/解锁所有卡片拖拽。"""
@@ -2239,6 +2305,8 @@ class ManualControlPage(QWidget):
         panel.body.addWidget(_header_row(_slot_labels(specs)))
         for spec in specs:
             widget = _DeviceRow(spec, self)
+            for editor in widget.editors:
+                editor.set_auto_apply(self._auto_apply)
             panel.body.addWidget(widget)
             self._rows.append(widget)
             self._editors.extend(widget.editors)

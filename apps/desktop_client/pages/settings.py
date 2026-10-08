@@ -59,7 +59,7 @@ DEFAULT_SERVICE_URLS = {
 # 设备访问统一走真实 EPICS Channel Access，没有模式开关；无 IOC 时健康检查会如实报未连接。
 # 表格列：设备参数 / 业务信号 / PV 名称 / 单位 / 可写 / 必需 + 两列**检测结果**
 # （连接 / 当前值）：后两列是 caget 的现场快照，只读、不参与保存。
-PV_COLUMNS = ("设备参数", "业务信号", "PV 名称", "单位", "可写", "必需", "连接", "当前值")
+PV_COLUMNS = ("设备参数", "业务信号", "PV 名称", "单位", "可写", "必需", "连接", "当前值", "最小值", "最大值", "最大单步", "最大速率")
 # 业务信号列：行的身份，也是「未显示的安全字段」的载体（保存时按行合并回去）
 PV_SIGNAL_COLUMN = 1
 PV_STATUS_COLUMN = 6
@@ -155,6 +155,7 @@ class _DevicePropertiesDialog(QDialog):
     """编辑映射的设备语义；现有控件类型无需再修改手动页代码。"""
 
     TEXT_FIELDS = (
+        ("signal", "业务信号"),
         ("group", "设备分组"),
         ("device_id", "设备 ID（同一卡片填相同值）"),
         ("device_label", "设备显示名"),
@@ -184,6 +185,14 @@ class _DevicePropertiesDialog(QDialog):
         form = QFormLayout()
         for key, label in self.TEXT_FIELDS:
             edit = QLineEdit(str(entry.get(key) or ""))
+            edit.setToolTip({
+                "signal": "程序内部使用的唯一业务标识；修改后请确认回读配对等配置仍指向正确通道。",
+                "group": "设备组标识，用于互斥锁定；同一设备组正在执行任务时，其他操作会被阻止。",
+                "device_id": "同一实体设备的多个信号填写相同 ID，可归并到手动控制页的一张设备卡片。",
+                "device_label": "手动控制页显示的设备名称。",
+                "readback_signal": "设定值对应的实际回读信号；用于确认设备是否到位。",
+                "rate_signal": "该设备斜坡速率的设定信号；磁铁成组控制可先写入速率。",
+            }.get(key, ""))
             self._texts[key] = edit
             form.addRow(label, edit)
         self.role = QComboBox()
@@ -196,6 +205,16 @@ class _DevicePropertiesDialog(QDialog):
         for key, label in self.NUMBER_FIELDS:
             edit = QLineEdit(_value_text(entry.get(key)).replace("—", ""))
             edit.setPlaceholderText("留空表示不限制")
+            edit.setToolTip({
+                "min_value": "设备允许的最低设定值；执行服务会拒绝低于此值的写入。",
+                "max_value": "设备允许的最高设定值；执行服务会拒绝高于此值的写入。",
+                "max_step": "单次写入允许变化的最大幅度；超出时拒绝，避免设定值突变。单位与该信号一致。",
+                "max_rate": "斜坡写入允许的最大变化速率；降低设备变化过快带来的风险。单位与该信号每秒变化量一致。",
+                "settle_tol": "回读与目标值的最大允许差值；小于该差值视为到位。",
+                "settle_timeout": "等待设备达到目标值的最长时间；超时后操作会报告未到位。",
+                "safe_value": "安全回退目标；全部关断等安全操作会优先使用此值，否则使用下限或 0。",
+                "display_order": "设备卡片的显示排序值，数值越小越靠前。",
+            }.get(key, "留空表示不设置该项限制。"))
             self._numbers[key] = edit
             form.addRow(label, edit)
         for key, label in self.FLAG_FIELDS:
@@ -560,6 +579,25 @@ class SystemSettingsPage(QWidget):
         panel = Panel("业务信号 → PV 映射", "执行服务受控配置 · 保存后立即生效")
         self.pv_table = QTableWidget(0, len(PV_COLUMNS))
         self.pv_table.setHorizontalHeaderLabels(PV_COLUMNS)
+        self.pv_table.horizontalHeaderItem(4).setToolTip(
+            "控制该 PV 是否允许客户端发起写入；关闭后仍可读取，但手动控制、扫谱和调束都不能向它写值。"
+        )
+        self.pv_table.horizontalHeaderItem(5).setToolTip(
+            "标记关键 PV。必需 PV 未连接会影响仪器服务健康状态；非必需 PV 掉线不会阻止其他通道操作。"
+        )
+        self.pv_table.horizontalHeaderItem(8).setToolTip(
+            "设定值安全下限；执行服务拒绝低于此值的写入。"
+        )
+        self.pv_table.horizontalHeaderItem(9).setToolTip(
+            "设定值安全上限；执行服务拒绝高于此值的写入。"
+        )
+        self.pv_table.horizontalHeaderItem(10).setToolTip(
+            "单次写入允许的最大变化幅度；留空表示不限制。"
+        )
+        self.pv_table.horizontalHeaderItem(11).setToolTip(
+            "斜坡写入允许的最大变化速率；留空表示不限制。"
+        )
+        self.pv_table.setColumnHidden(PV_SIGNAL_COLUMN, True)
         header = self.pv_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
@@ -641,7 +679,7 @@ class SystemSettingsPage(QWidget):
             "\n「连接 / 当前值」两列是点「测试连接并读取」后的现场快照（caget），"
             "只读、不参与保存；双击某一行可以只重读那一路。"
             "\n点「编辑设备属性」可以配置分组、控件类型、回读配对、安全边界，以及"
-            "扫谱/调束能力；悬停「业务信号」可快速查看。"
+            "扫谱/调束能力；业务信号在「设备属性」中维护，最小值和最大值可直接在主表编辑。"
             "**某一路连不上不影响扫谱/调束入口**：各自只用得到自己那几路，缺哪一路"
             "由执行服务在启动时点名拒绝。"
         )
@@ -727,6 +765,10 @@ class SystemSettingsPage(QWidget):
             self._set_pv_text(row, 3, entry.get("unit", ""))
             self._set_pv_flag(row, 4, bool(entry.get("writable", True)))
             self._set_pv_flag(row, 5, bool(entry.get("required", True)))
+            self._set_pv_text(row, 8, _value_text(entry.get("min_value")))
+            self._set_pv_text(row, 9, _value_text(entry.get("max_value")))
+            self._set_pv_text(row, 10, _value_text(entry.get("max_step")))
+            self._set_pv_text(row, 11, _value_text(entry.get("max_rate")))
             self._remember_pv_entry(row, entry)
         for row in range(self.pv_table.rowCount()):
             self._clear_pv_row_marks(row)
@@ -984,18 +1026,21 @@ class SystemSettingsPage(QWidget):
         for row in created:
             self.pv_table.selectRow(row)
         first = created[0]
-        self.pv_table.setCurrentCell(first, PV_SIGNAL_COLUMN)
-        self.pv_table.editItem(self.pv_table.item(first, PV_SIGNAL_COLUMN))
+        self.pv_table.setCurrentCell(first, 0)
         self._apply_pv_filter()
         self._set_pv_feedback(
             "idle",
-            f"已复制 {len(created)} 行为新增行，请修改业务信号与 PV 名称"
+            f"已复制 {len(created)} 行为新增行，请在设备属性中修改业务信号，并检查 PV 名称"
             "（不能与现有行重复）后保存。",
         )
 
     def _duplicate_pv_row(self, source: int, target: int) -> None:
         """把 source 行的 6 个显示字段 + 未显示安全字段整体复制到 target 行。"""
         for column in (0, PV_SIGNAL_COLUMN, 2, 3):
+            self._set_pv_text(target, column, self._pv_text(source, column))
+        for column in (8, 9):
+            self._set_pv_text(target, column, self._pv_text(source, column))
+        for column in (10, 11):
             self._set_pv_text(target, column, self._pv_text(source, column))
         for column in (4, 5):
             self._set_pv_flag(target, column, self._pv_flag(source, column))
@@ -1017,6 +1062,8 @@ class SystemSettingsPage(QWidget):
         self._set_pv_text(row, 3, "")
         self._set_pv_flag(row, 4, True)
         self._set_pv_flag(row, 5, True)
+        for column in (8, 9, 10, 11):
+            self._set_pv_text(row, column, "")
         self._remember_pv_entry(
             row,
             {
@@ -1036,8 +1083,7 @@ class SystemSettingsPage(QWidget):
             },
         )
         self._reset_pv_probe_cells(row)
-        self.pv_table.setCurrentCell(row, PV_SIGNAL_COLUMN)
-        self.pv_table.editItem(self.pv_table.item(row, PV_SIGNAL_COLUMN))
+        self.pv_table.setCurrentCell(row, 0)
         self._refresh_pv_summary()
 
     def _edit_pv_properties(self) -> None:
@@ -1045,7 +1091,9 @@ class SystemSettingsPage(QWidget):
         if row < 0:
             self._set_pv_feedback("warn", "请先选择一行设备参数。")
             return
-        dialog = _DevicePropertiesDialog(self._pv_row_entry(row) or {}, self)
+        previous_entry = self._pv_row_entry(row) or {}
+        previous_signal = self._pv_text(row, PV_SIGNAL_COLUMN)
+        dialog = _DevicePropertiesDialog(previous_entry, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
@@ -1053,6 +1101,11 @@ class SystemSettingsPage(QWidget):
         except ValueError:
             self._set_pv_feedback("error", "设备属性中的数值格式不正确。")
             return
+        if str(entry.get("signal") or "") != previous_signal:
+            entry["readback_signal"] = ""
+        self._set_pv_text(row, PV_SIGNAL_COLUMN, str(entry.get("signal") or ""))
+        for column, key in ((8, "min_value"), (9, "max_value"), (10, "max_step"), (11, "max_rate")):
+            self._set_pv_text(row, column, _value_text(entry.get(key)))
         self._remember_pv_entry(row, entry)
         self._set_pv_feedback("idle", "设备属性已更新，点击“保存映射”后生效。")
 
@@ -1089,7 +1142,14 @@ class SystemSettingsPage(QWidget):
                 "warn", "全局只读模式：执行服务禁用了所有写入，PV 映射不可保存。"
             )
             return
-        payload = self._collect_pv_mapping()
+        try:
+            payload = self._collect_pv_mapping()
+        except ValueError:
+            # 四个边界列现在能在主表里直接编辑：填了非数字要给提示，不能把异常抛到界面上。
+            self._set_pv_feedback(
+                "error", "最小值、最大值、最大单步、最大速率必须是数字，或留空。"
+            )
+            return
         warning = self._shrink_warning(payload)
         if warning and not self._pv_shrink_confirmed:
             # 第一次只提醒；再点一次才真的存（并要求服务端带 confirm_shrink）
@@ -1131,6 +1191,10 @@ class SystemSettingsPage(QWidget):
                     "unit": self._pv_text(row, 3),
                     "writable": self._pv_flag(row, 4),
                     "required": self._pv_flag(row, 5),
+                    "min_value": self._parse_optional_number(self._pv_text(row, 8)),
+                    "max_value": self._parse_optional_number(self._pv_text(row, 9)),
+                    "max_step": self._parse_optional_number(self._pv_text(row, 10)),
+                    "max_rate": self._parse_optional_number(self._pv_text(row, 11)),
                 }
             )
             entries.append(entry)
@@ -1138,6 +1202,10 @@ class SystemSettingsPage(QWidget):
             "version": self._pv_config_version,
             "entries": entries,
         }
+
+    @staticmethod
+    def _parse_optional_number(value: str) -> float | None:
+        return float(value) if value.strip() else None
 
     # ---- PV 映射：单元格读写与标红 ----
 
