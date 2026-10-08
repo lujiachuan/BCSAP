@@ -93,10 +93,13 @@ _ROLE_LABELS = {
 LOG_LEVELS = (("调试", "debug"), ("信息", "info"), ("警告", "warning"), ("错误", "error"))
 
 
+VALUE_PLACEHOLDER = "—"  # 不限制该项校验时的显示文本；解析时要按"空"处理
+
+
 def _value_text(value: object) -> str:
     """安全参数的显示文本；None 表示该项不校验，用「—」而不是 0。"""
     if value is None or value == "":
-        return "—"
+        return VALUE_PLACEHOLDER
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value)
@@ -1205,7 +1208,11 @@ class SystemSettingsPage(QWidget):
 
     @staticmethod
     def _parse_optional_number(value: str) -> float | None:
-        return float(value) if value.strip() else None
+        """空文本与显示用的「—」都表示不限制；其余必须能解析成数字。"""
+        text = value.strip()
+        if not text or text == VALUE_PLACEHOLDER:
+            return None
+        return float(text)
 
     # ---- PV 映射：单元格读写与标红 ----
 

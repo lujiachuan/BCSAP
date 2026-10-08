@@ -256,6 +256,9 @@ class PvMappingSafetyFieldTests(CacheDirSettingsTests):
     退化、调束因缺 max_step 拒绝启动。
     """
 
+    MIN_VALUE_COLUMN = 8  # PV_COLUMNS 里的「最小值」
+    MAX_VALUE_COLUMN = 9  # 「最大值」：四个边界列现在直接在主表里改
+
     def loaded_page(self, *entries: dict) -> SystemSettingsPage:
         page = self.make_page()
         page._render_pv_mapping({"version": 1, "entries": list(entries)})
@@ -346,8 +349,6 @@ class PvMappingSafetyFieldTests(CacheDirSettingsTests):
         self.assertTrue(collected["visible"])
         self.assertFalse(collected["scan_axis"])
 
-    MAX_VALUE_COLUMN = 9  # PV_COLUMNS 里的「最大值」：边界列现在直接在主表里改
-
     def test_a_non_numeric_safety_bound_is_reported_instead_of_raising(self) -> None:
         """四个边界列能在主表直接编辑，手滑填了非数字要给提示、不发请求，而不是抛异常。"""
         page = self.loaded_page(mapping_entry("gas.ar.flow_setpoint"))
@@ -367,6 +368,24 @@ class PvMappingSafetyFieldTests(CacheDirSettingsTests):
         collected = page._collect_pv_mapping()["entries"][0]
 
         self.assertIsNone(collected["max_value"])
+
+    def test_the_untouched_placeholder_saves_as_none(self) -> None:
+        """没配边界的行显示「—」（`_value_text` 的约定）：保存时要当"不限制"，
+        既不能抛异常，也不能把占位符拦成错误把保存挡下来。"""
+        page = self.loaded_page(
+            mapping_entry("gas.ar.flow_setpoint", min_value=None, max_value=None)
+        )
+
+        self.assertEqual(page._pv_text(0, self.MIN_VALUE_COLUMN), "—")
+
+        collected = page._collect_pv_mapping()["entries"][0]
+
+        self.assertIsNone(collected["min_value"])
+        self.assertIsNone(collected["max_value"])
+
+        page._save_pv_mapping()
+
+        self.assertEqual(len(self.mapping_requests), 1, "占位符不该拦下这次保存")
 
     def test_hover_shows_the_hidden_fields_and_survives_clear_marks(self) -> None:
         page = self.loaded_page(mapping_entry("gas.ar.flow_setpoint"))
