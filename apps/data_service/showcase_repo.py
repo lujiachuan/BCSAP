@@ -206,11 +206,18 @@ def get_spectrum_meta(spectrum_id: int) -> Optional[dict[str, Any]]:
         )
         ann_rows = _dicts(cur)
 
-    metal = metrics.get("metal") or _metal_from_element_set(row.get("element_set"))
+    # 列表与详情一致：主金属取元素集第一个金属（MoAg → Mo）。
+    # calibration metrics 里的 metal 可能是双同位素锁（Ag），只作校正线索。
+    metal = _metal_from_element_set(row.get("element_set"))
+    cal_metal = metrics.get("metal") if isinstance(metrics.get("metal"), str) else None
+    if metal is None:
+        metal = cal_metal
     method = metrics.get("method")
     side = _axis_sidecar(sid)
     policy = side.get("policy") or _policy_from_method(method if isinstance(method, str) else None)
     hint = side.get("mono_hint") or side.get("hint") or metrics.get("hint")
+    if cal_metal and metal and cal_metal != metal and not hint:
+        hint = f"校正锁金属={cal_metal}"
 
     peaks = [
         {
