@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException, Query, Response
 
 from packages.contracts import ServiceStatus, SyncChanges, SyncManifest
 
+from .showcase_api import router as showcase_router
 from .sync_catalog import (
     SPECTRUM_CONTENT,
     SYNC_CURSOR,
@@ -16,6 +17,7 @@ def create_app() -> FastAPI:
     """创建共享数据服务应用。"""
 
     app = FastAPI(title="谱图平台数据服务", version="0.1.0")
+    app.include_router(showcase_router)
 
     @app.get("/api/v1/health/live", response_model=ServiceStatus)
     def get_liveness() -> ServiceStatus:

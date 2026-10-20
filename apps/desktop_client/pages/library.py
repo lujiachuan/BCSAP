@@ -1,4 +1,4 @@
-"""谱图库页：已预留入口，当前为占位页。独立文件便于后续单独实现。"""
+"""谱图库页：经 data_service showcase 读 cluster_ms。"""
 
 from __future__ import annotations
 
@@ -10,5 +10,9 @@ PAGE_SPEC = PageSpec(
     label="谱图库",
     icon="database",
     section="data",
-    factory=lambda: PlaceholderPage("谱图库", "检索与多人访问界面按计划暂缓建设。"),
+    factory=lambda: PlaceholderPage(
+        "谱图库",
+        "数据走共享服务 Showcase 只读接口：GET /api/v1/showcase/spectra "
+        "（已接本机 cluster_ms）。完整检索 UI 建设中；客户端不直连数据库。",
+    ),
 )

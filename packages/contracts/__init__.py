@@ -27,6 +27,13 @@ from .scan import (
     ScanRunRequest,
     ScanRunStatus,
 )
+from .showcase import (
+    ShowcasePeakAnnotation,
+    ShowcaseSpectrumList,
+    ShowcaseSpectrumMeta,
+    ShowcaseSpectrumSummary,
+    ShowcaseStatus,
+)
 from .signals import (
     SignalBatchWriteRequest,
     SignalBatchWriteResponse,
@@ -96,6 +103,11 @@ __all__ = [
     "ScanRunRequest",
     "ScanRunStatus",
     "ServiceStatus",
+    "ShowcasePeakAnnotation",
+    "ShowcaseSpectrumList",
+    "ShowcaseSpectrumMeta",
+    "ShowcaseSpectrumSummary",
+    "ShowcaseStatus",
     "SignalBatchWriteRequest",
     "SignalBatchWriteResponse",
     "SignalReading",

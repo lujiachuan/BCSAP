@@ -8,6 +8,7 @@
 
 ### 已实现
 
+- **Showcase 只读（数据服务 → cluster_ms）**：`/api/v1/showcase/status|spectra|{id}` 已接本机 PostgreSQL（默认 `127.0.0.1:5433/cluster_ms`，DSN 见 `SPECTRUM_PG_DSN` / 上级 `db_config.json`）；返回谱图列表、校正摘要与 working 标注。写校正/重标注仍旁路 `web_manager`。
 - 基于 PySide6 的统一桌面客户端，支持浅色/深色主题、侧栏收起和会话偏好保存。
 - 工作台、扫谱、自动调束和系统设置页面。
 - 使用内存数据驱动的模拟扫谱，可开始、暂停、安全停止并实时绘制曲线。
