@@ -34,6 +34,7 @@ class PvHealthResponse(BaseModel):
     status: Literal["ready", "degraded", "unavailable"]
     checked_at: str
     config_version: str
+    total_latency_ms: float | None = None
     summary: PvHealthSummary
     items: list[PvHealthItem]
 

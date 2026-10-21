@@ -13,7 +13,7 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QObject, QSettings, Qt, Signal
+from PySide6.QtCore import QItemSelectionModel, QObject, QSettings, Qt, Signal
 from PySide6.QtWidgets import QApplication, QPushButton
 
 from apps.desktop_client import instrument_api
@@ -256,6 +256,9 @@ class PvMappingSafetyFieldTests(CacheDirSettingsTests):
     退化、调束因缺 max_step 拒绝启动。
     """
 
+    MIN_VALUE_COLUMN = 8  # PV_COLUMNS 里的「最小值」
+    MAX_VALUE_COLUMN = 9  # 「最大值」：四个边界列现在直接在主表里改
+
     def loaded_page(self, *entries: dict) -> SystemSettingsPage:
         page = self.make_page()
         page._render_pv_mapping({"version": 1, "entries": list(entries)})
@@ -346,6 +349,44 @@ class PvMappingSafetyFieldTests(CacheDirSettingsTests):
         self.assertTrue(collected["visible"])
         self.assertFalse(collected["scan_axis"])
 
+    def test_a_non_numeric_safety_bound_is_reported_instead_of_raising(self) -> None:
+        """四个边界列能在主表直接编辑，手滑填了非数字要给提示、不发请求，而不是抛异常。"""
+        page = self.loaded_page(mapping_entry("gas.ar.flow_setpoint"))
+        page._set_pv_text(0, self.MAX_VALUE_COLUMN, "五百")
+
+        page._save_pv_mapping()
+
+        self.assertEqual(self.mapping_requests, [], "数值不合法时不该发请求")
+        self.assertEqual(page.pv_feedback.property("state"), "error")
+        self.assertIn("必须是数字", page.pv_feedback.text())
+
+    def test_clearing_a_safety_bound_saves_as_none(self) -> None:
+        """留空表示不限制：要存成 None，不能变成 0（0 是"锁死到 0"的真边界）。"""
+        page = self.loaded_page(mapping_entry("gas.ar.flow_setpoint"))
+        page._set_pv_text(0, self.MAX_VALUE_COLUMN, "")
+
+        collected = page._collect_pv_mapping()["entries"][0]
+
+        self.assertIsNone(collected["max_value"])
+
+    def test_the_untouched_placeholder_saves_as_none(self) -> None:
+        """没配边界的行显示「—」（`_value_text` 的约定）：保存时要当"不限制"，
+        既不能抛异常，也不能把占位符拦成错误把保存挡下来。"""
+        page = self.loaded_page(
+            mapping_entry("gas.ar.flow_setpoint", min_value=None, max_value=None)
+        )
+
+        self.assertEqual(page._pv_text(0, self.MIN_VALUE_COLUMN), "—")
+
+        collected = page._collect_pv_mapping()["entries"][0]
+
+        self.assertIsNone(collected["min_value"])
+        self.assertIsNone(collected["max_value"])
+
+        page._save_pv_mapping()
+
+        self.assertEqual(len(self.mapping_requests), 1, "占位符不该拦下这次保存")
+
     def test_hover_shows_the_hidden_fields_and_survives_clear_marks(self) -> None:
         page = self.loaded_page(mapping_entry("gas.ar.flow_setpoint"))
 
@@ -371,6 +412,107 @@ class PvMappingSafetyFieldTests(CacheDirSettingsTests):
         page._clear_all_pv_marks()
 
         self.assertIn("分组：气体流量", page.pv_table.item(0, PV_SIGNAL_COLUMN).toolTip())
+
+
+class PvDuplicateRowTests(PvMappingSafetyFieldTests):
+    """「复制为新增」：把选中行整行复制成新行，追加到表格底部，只改编号即可。
+
+    关键约束：显示字段与**未显示安全字段**都要带过去（不然复制出来的行
+    没有边界/限速/稳定判据，调束会因缺 max_step 拒绝启动）；回读/速率配对
+    指向源通道，新行改了编号就失效，必须清空；连接状态列是现场快照，
+    复制后重置为未测。
+    """
+
+    def test_duplicating_a_selected_row_appends_a_full_copy_at_the_bottom(self) -> None:
+        page = self.loaded_page(mapping_entry("gas.ar.flow_setpoint"))
+        page.pv_table.selectRow(0)
+
+        page._duplicate_pv_rows()
+
+        self.assertEqual(page.pv_table.rowCount(), 2)
+        for column in (0, PV_SIGNAL_COLUMN, 2, 3):
+            self.assertEqual(
+                page._pv_text(1, column), page._pv_text(0, column), column
+            )
+        for column in (4, 5):
+            self.assertEqual(
+                page._pv_flag(1, column), page._pv_flag(0, column), column
+            )
+        # 连接状态是现场快照，不参与复制：新行回到「未测」
+        self.assertEqual(page._pv_text(1, PV_STATUS_COLUMN), "")
+
+        collected = page._collect_pv_mapping()["entries"][1]
+        self.assertEqual(collected["signal"], "gas.ar.flow_setpoint")  # 原值，留给操作员改编号
+        self.assertEqual(collected["pv"], "PV:gas.ar.flow_setpoint")
+        self.assertEqual(collected["readback_signal"], "")  # 指向源通道，必须清空
+        self.assertEqual(collected["rate_signal"], "")
+        # 安全字段整体带过去：分组、写入边界、稳定判据一个都不能丢
+        self.assertEqual(collected["group"], "气体流量")
+        self.assertEqual(collected["max_value"], 500.0)
+        self.assertEqual(collected["max_step"], 10.0)
+        self.assertEqual(collected["settle_tol"], 2.0)
+        self.assertEqual(collected["settle_timeout"], 30.0)
+
+    def test_duplicating_keeps_the_source_row_intact(self) -> None:
+        page = self.loaded_page(mapping_entry("gas.ar.flow_setpoint"))
+        page.pv_table.selectRow(0)
+
+        page._duplicate_pv_rows()
+
+        collected = page._collect_pv_mapping()["entries"][0]
+        self.assertEqual(collected["readback_signal"], "gas.ar.flow_readback")
+        self.assertEqual(collected["max_step"], 10.0)
+
+    def test_duplicate_without_selection_only_reports(self) -> None:
+        page = self.loaded_page(mapping_entry("gas.ar.flow_setpoint"))
+        page.pv_table.clearSelection()
+
+        page._duplicate_pv_rows()
+
+        self.assertEqual(page.pv_table.rowCount(), 1)
+        self.assertIn("先选中", page.pv_feedback.text())
+
+    def test_duplicating_several_rows_appends_copies_at_the_bottom(self) -> None:
+        page = self.loaded_page(
+            mapping_entry("gas.ar.flow_setpoint"),
+            mapping_entry("magnet.m1.current_setpoint"),
+            mapping_entry("detector.fc1.beam_current"),
+        )
+        page.pv_table.selectRow(0)
+        page.pv_table.selectionModel().select(
+            page.pv_table.model().index(2, 0),
+            QItemSelectionModel.SelectionFlag.Select
+            | QItemSelectionModel.SelectionFlag.Rows,
+        )
+
+        page._duplicate_pv_rows()
+
+        self.assertEqual(page.pv_table.rowCount(), 5)
+        signals = [
+            page._collect_pv_mapping()["entries"][row]["signal"]
+            for row in range(5)
+        ]
+        self.assertEqual(
+            signals,
+            [
+                "gas.ar.flow_setpoint",        # 0：源，原样
+                "magnet.m1.current_setpoint",  # 1：源，原样
+                "detector.fc1.beam_current",   # 2：源，原样
+                "gas.ar.flow_setpoint",        # 3：0 的复制，追加到底部
+                "detector.fc1.beam_current",   # 4：2 的复制，追加到底部
+            ],
+        )
+
+    def test_duplicating_updates_the_summary_and_edits_the_new_signal(self) -> None:
+        page = self.loaded_page(mapping_entry("gas.ar.flow_setpoint"))
+        page.pv_table.selectRow(0)
+
+        page._duplicate_pv_rows()
+
+        self.assertIn("共 2 行", page.pv_summary.text())
+        # 业务信号改到「编辑设备属性」里维护，提示随之改成指路而不是让人就地改单元格。
+        self.assertIn("在设备属性中修改业务信号", page.pv_feedback.text())
+        self.assertEqual(page.pv_table.currentRow(), 1)
 
 
 class PvProbeTests(CacheDirSettingsTests):
@@ -418,7 +560,10 @@ class PvProbeTests(CacheDirSettingsTests):
             page.pv_table.horizontalHeaderItem(index).text()
             for index in range(page.pv_table.columnCount())
         ]
-        self.assertEqual(headers[-2:], ["连接", "当前值"])
+        # 四个边界/限速列排在检测结果之后（现在可在主表直接编辑），所以不能再按"最后两列"取。
+        self.assertEqual(headers[-4:], ["最小值", "最大值", "最大单步", "最大速率"])
+        self.assertEqual(headers[PV_STATUS_COLUMN], "连接")
+        self.assertEqual(headers[PV_VALUE_COLUMN], "当前值")
         for row in range(page.pv_table.rowCount()):
             for column in (PV_STATUS_COLUMN, PV_VALUE_COLUMN):
                 item = page.pv_table.item(row, column)

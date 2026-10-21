@@ -140,17 +140,22 @@ class TuningPageCatalogTests(unittest.TestCase):
             page.parameter_table.horizontalHeaderItem(index).text()
             for index in range(page.parameter_table.columnCount())
         ]
-        self.assertEqual(headers, ["启用", "设备参数", "下限", "上限", "当前回读"])
+        self.assertEqual(
+            headers,
+            ["启用", "设备参数", "下限", "上限", "起始值", "回读容差", "当前回读"],
+        )
         self.assertNotIn("PV", headers)
 
         cell = page.parameter_table.item(0, 1)
         self.assertEqual(cell.text(), "magnet.m1.current_setpoint")
         self.assertIn("业务信号：magnet.m1.current_setpoint", cell.toolTip())
         self.assertIn("PV：PV:magnet.m1.current_setpoint", cell.toolTip())
-        # 范围与回读列都跟着左移了一格：控件还在原来的位置上
-        self.assertIsNotNone(page.parameter_table.cellWidget(0, 2))
-        self.assertIsNotNone(page.parameter_table.cellWidget(0, 3))
-        self.assertIsNotNone(page.parameter_table.cellWidget(0, 4))
+        # 下限/上限/起始值/回读容差/回读列都在各自位置上
+        for column in (2, 3, 4, 5, 6):
+            self.assertIsNotNone(page.parameter_table.cellWidget(0, column))
+        # 左栏下方的范围标尺：每个变量一行（设备边界/设定区间/起始值/当前回读）
+        self.assertTrue(hasattr(page, "range_rows"))
+        self.assertEqual(page.range_rows.count(), 3)  # 名称 + 标尺 + 数值文本
 
     def test_rate_setpoint_and_switch_are_not_offered(self) -> None:
         page = self.make_page(marked_mapping())
@@ -196,14 +201,16 @@ class TuningPageCatalogTests(unittest.TestCase):
         self.assertIn("已自动勾选", page.variable_hint.text())
 
     def test_hint_explains_exclusions_and_linked_groups(self) -> None:
+        """提示行必须回答"为什么只列出这几个参数"：白名单外的量要点名数量与原因。"""
         page = self.make_page(marked_mapping(), CATALOG)
 
         hint = page.variable_hint.text()
 
         self.assertIn("未列入", hint)
-        self.assertIn("保护类设定", hint)
+        self.assertIn("变化速率/保护类设定", hint)
+        self.assertIn("不是束流测量", hint, "两条排除原因都要点名")
         self.assertIn("联动组", hint)
-        self.assertIn("同一个优化维度", hint)
+        self.assertIn("单路下发", hint)
         self.assertNotIn("回退过滤", hint, "服务端给了标记就不该提示回退")
 
     def test_missing_catalog_still_filters_and_skips_autoselect(self) -> None:
@@ -258,9 +265,10 @@ class TuningGuardDisplayTests(unittest.TestCase):
 
         page._fill_changes()
 
+        # 列语义：启动前 / 最优轮 / 最后一轮 / 当前
         self.assertEqual(page.changes_table.item(0, 1).text(), "150.000")
         self.assertEqual(page.changes_table.item(0, 2).text(), "200.000")
-        self.assertEqual(page.changes_table.item(0, 3).text(), "+50.000")
+        self.assertEqual(page.changes_table.item(0, 3).text(), "200.000")
         self.assertIn("启动前快照", page.change_note.text())
 
     def test_change_note_says_when_there_is_no_snapshot(self) -> None:
@@ -376,6 +384,7 @@ class TuningGuardDisplayTests(unittest.TestCase):
         page.loss_relative_spin.setValue(35.0)
         page.loss_strikes_spin.setValue(3)
         page.auto_recover_check.setChecked(False)
+        page.reset_before_start_check.setChecked(True)
         captured: dict = {}
 
         def fake_start(request: dict, base_url=None):  # noqa: ANN001
@@ -389,6 +398,7 @@ class TuningGuardDisplayTests(unittest.TestCase):
         self.assertAlmostEqual(captured["loss_relative"], 0.35)
         self.assertEqual(captured["loss_strikes"], 3)
         self.assertFalse(captured["auto_recover"])
+        self.assertTrue(captured["reset_before_start"])
 
     def test_absolute_threshold_is_omitted_when_not_enabled(self) -> None:
         page = self.make_page()
@@ -451,7 +461,8 @@ class TuningFinalizeUiTests(unittest.TestCase):
         page = self.make_page(run_id=None)
 
         self.assertEqual(
-            list(page.finalize_buttons), ["apply_best", "restore_initial", "safe_values"]
+            list(page.finalize_buttons),
+            ["apply_best", "restore_initial", "start_values", "safe_values"],
         )
         self.assertTrue(all(not b.isEnabled() for b in page.finalize_buttons.values()))
 
@@ -612,30 +623,36 @@ class TuningStrategyUiTests(unittest.TestCase):
         self._start_patch.start()
         return captured
 
-    def test_default_strategy_is_full_joint(self) -> None:
+    def test_default_strategy_is_single_stage(self) -> None:
         page = self.ready_page()
         captured = self.capture_start(page)
 
         page.start_tuning()
 
-        self.assertEqual(captured["strategy"], "joint")
-        self.assertEqual(captured["joint_frac"], 0.2)
-        self.assertEqual(captured["calls_per_variable"], 3)
+        self.assertEqual(captured["strategy"], "single")
+        self.assertEqual(captured["samples_per_point"], 3)
         self.assertEqual(captured["hold_s"], 0.0)
+        self.assertEqual(captured["stages"], [])
 
-    def test_sequential_strategy_and_its_parameters_are_sent(self) -> None:
+    def test_staged_strategy_and_its_parameters_are_sent(self) -> None:
         page = self.ready_page()
-        page.strategy.setCurrentIndex(1)  # 逐参数 → 联合微调
-        page.calls_spin.setValue(4)
-        page.joint_frac_spin.setValue(35.0)
+        page.strategy.setCurrentIndex(1)  # 分阶段调优
+        page._stage_specs = [
+            {
+                "name": "引出阶段",
+                "signals": ["magnet.m1.current_setpoint"],
+                "iterations": 4,
+            }
+        ]
+        page.samples_spin.setValue(4)
         page.hold_spin.setValue(2.5)
         captured = self.capture_start(page)
 
         page.start_tuning()
 
-        self.assertEqual(captured["strategy"], "sequential_then_joint")
-        self.assertEqual(captured["calls_per_variable"], 4)
-        self.assertAlmostEqual(captured["joint_frac"], 0.35)
+        self.assertEqual(captured["strategy"], "staged")
+        self.assertEqual(captured["stages"][0]["name"], "引出阶段")
+        self.assertEqual(captured["samples_per_point"], 4)
         self.assertEqual(captured["hold_s"], 2.5)
 
     def test_stage_position_is_shown_in_the_iteration_label(self) -> None:
@@ -646,20 +663,21 @@ class TuningStrategyUiTests(unittest.TestCase):
                 "state": "awaiting_confirmation",
                 "completed_iterations": 2,
                 "max_iterations": 9,
-                "strategy": "sequential_then_joint",
-                "stage": "sequential",
+                "strategy": "staged",
+                "stage_name": "阶段 1",
                 "stage_index": 1,
                 "stage_total": 3,
-                "stage_variable": "magnet.m1.current_setpoint",
+                "stage_rounds": 2,
+                "stage_budget": 4,
             }
         )
 
         text = page.iteration_label.text()
         self.assertIn("已完成 2 / 9 轮", text)
-        self.assertIn("逐参数 1/3", text)
-        self.assertIn("magnet.m1.current_setpoint", text)
+        self.assertIn("阶段 1 1/3", text)
+        self.assertIn("2/4", text)
 
-    def test_joint_stage_is_shown_too(self) -> None:
+    def test_single_stage_suffix_shows_single_stage(self) -> None:
         page = TuningPage()
 
         page._apply_status(
@@ -667,11 +685,11 @@ class TuningStrategyUiTests(unittest.TestCase):
                 "state": "awaiting_confirmation",
                 "completed_iterations": 6,
                 "max_iterations": 9,
-                "stage": "joint",
+                "strategy": "single",
             }
         )
 
-        self.assertIn("联合微调", page.iteration_label.text())
+        self.assertIn("单阶段", page.iteration_label.text())
 
     def test_proposal_scope_names_the_active_variable(self) -> None:
         page = TuningPage()

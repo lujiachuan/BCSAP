@@ -112,6 +112,7 @@ class BatchWriteTests(unittest.TestCase):
 
         self.assertFalse(response.ok)
         self.assertTrue(response.nothing_written)
+        self.assertEqual(response.rejected, 4)
         self.assertEqual(response.accepted, 0)
         self.assertIn("整批未下发", response.message)
         self.assertIn("超过上限", response.message)
@@ -127,6 +128,7 @@ class BatchWriteTests(unittest.TestCase):
 
         self.assertFalse(response.ok)
         self.assertTrue(response.nothing_written)
+        self.assertEqual(response.rejected, 2)
         self.assertIn("magnet.m9.current_setpoint", response.message)
 
     def test_read_only_member_blocks_the_whole_batch(self) -> None:
@@ -178,6 +180,22 @@ class BatchWriteTests(unittest.TestCase):
 
         self.assertEqual(self.runtime.locks.held(), {})
 
+    def test_batch_holds_group_during_preflight_reads(self) -> None:
+        gateway = self.runtime.gateway()
+        original_read = gateway.read
+        seen = []
+
+        def checked_read(signal):
+            seen.append(bool(self.runtime.locks.held().get("磁铁电源")))
+            return original_read(signal)
+
+        gateway.read = checked_read
+        response = self.runtime.write_batch(batch([100.0] * 4))
+
+        self.assertTrue(response.ok)
+        self.assertTrue(seen)
+        self.assertTrue(all(seen))
+
     def test_single_write_is_refused_while_task_holds_group(self) -> None:
         self.runtime.locks.acquire({"磁铁电源"}, owner="scan-1")
         before = self.readback(1)
@@ -203,6 +221,34 @@ class BatchWriteTests(unittest.TestCase):
 
         self.assertTrue(first.accepted)
         self.assertEqual(repeated, first)
+
+    def test_unknown_manual_write_keeps_group_locked_until_acknowledged(self) -> None:
+        gateway = self.runtime.gateway()
+        original_write = gateway.write
+
+        def fail_write(*_args):
+            raise TimeoutError("写命令已发出但未收到结果")
+
+        gateway.write = fail_write
+        request = SignalWriteRequest(
+            signal=SETPOINTS[0], value=120.0,
+            command_id="00000000-0000-4000-8000-000000000002",
+        )
+        result = self.runtime.write_signal(request)
+
+        self.assertFalse(result.accepted)
+        self.assertTrue(result.device_state_unknown)
+        self.assertIn("磁铁电源", self.runtime.locks.held())
+        self.assertEqual(self.runtime.write_signal(request), result)
+        self.assertFalse(self.runtime.write_signal(
+            SignalWriteRequest(signal=SETPOINTS[1], value=120.0)
+        ).accepted)
+
+        recovery = self.runtime.startup_recoveries[0]
+        self.assertEqual(recovery["kind"], "manual")
+        self.runtime.acknowledge_startup_recovery(recovery["run_id"], "现场已核对")
+        self.assertEqual(self.runtime.locks.held(), {})
+        gateway.write = original_write
 
     def test_restart_recovery_blocks_group_until_acknowledged(self) -> None:
         run_id = "interrupted-scan"
@@ -250,13 +296,15 @@ class BatchWriteTests(unittest.TestCase):
 
         self.assertFalse(response.ok)
         self.assertFalse(response.nothing_written, "这是执行途中失败，不是整批没写")
-        self.assertEqual(response.accepted, 3)
-        self.assertEqual(response.rejected, 1)
+        self.assertEqual(response.accepted, 2)
+        self.assertEqual(response.rejected, 2)
         self.assertIn(SETPOINTS[2], response.message)
         self.assertIn("部分成功", response.message)
         # 前两台已经动了：必须逐路标明，不能只报一句"失败"
         self.assertTrue(response.results[0].accepted)
         self.assertFalse(response.results[2].accepted)
+        self.assertIn("未继续下发", response.results[3].reason)
+        self.assertEqual(list(dict.fromkeys(calls)), SETPOINTS[:3])
 
 
 if __name__ == "__main__":

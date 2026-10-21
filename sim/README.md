@@ -186,8 +186,14 @@ caput BD:MSScan:01:ScanStart 1
 
 - **没有设备限值**：`ao` 记录未设 `DRVH`/`DRVL`，越界设定值照样接受。应用侧目前也还没有
   参数边界校验，所以「写越界值」这条路径暂时测不出拦截行为。
-- **没有物理耦合**：`calc` 镜像回读只跟随设定值，不会模拟真实设备的动态响应；其余只读值
-  是静态初值。用它跑自动调束时，优化目标不会有真实响应。
+- **FC1 已有束流物理模型**：`BD:FC:01:BeamCurrent` 是 `calc` 记录，随 DW1~4 设定变化，
+  峰在 DW1=100、DW2=1500、DW3=1500、DW4=3000，峰值 12 nA 的缓高斯（几何平均），
+  可直接拿它跑自动调束。因 calc 的 CALC 字段上限 40 字符，模型拆成 4 个归一化辅助记录
+  `BD:FC:01:BeamCurrent:n1..n4` + 主记录，1 秒周期扫描。模型在生成器
+  `tools/generate_sim_ioc.py` 的 `PHYSICAL_OUTPUTS` 中维护，与
+  `packages/epics_adapter/simulated.py` 对齐。
+- **其余只读值仍是静态初值**：除 FC1 外，`calc` 镜像回读只跟随设定值，不模拟更复杂的
+  动态响应；FC2 等仍为静态值。
 - **只在内存里**：写入的新值存在于 IOC 进程内存中，重启 IOC 后回到 `ioc.db` 的初值。
 - **只有 CA**：用的是 Channel Access（`ca.dll`），没有 PVA/pvAccess。EPICS base 里的
   `softIocPVA.exe` 本模拟未使用。

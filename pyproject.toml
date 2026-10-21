@@ -17,10 +17,16 @@ dependencies = [
 client = [
     "PySide6>=6.8,<7",
     "pyqtgraph>=0.13.7,<1",
+    "matplotlib>=3.9,<4",
+    "SciencePlots>=2,<3",
 ]
 service = [
     "fastapi>=0.115,<1",
     "uvicorn[standard]>=0.34,<1",
+    "optuna>=4.0,<5",
+    "cmaes>=0.13",
+    "optuna-dashboard>=0.21",
+    "scikit-learn>=1.5",
 ]
 database = [
     "alembic>=1.14,<2",
@@ -46,4 +52,3 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
-

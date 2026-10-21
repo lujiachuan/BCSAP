@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -22,6 +23,86 @@ from PySide6.QtWidgets import QApplication, QLabel
 from apps.desktop_client import instrument_api
 from apps.desktop_client.pages import manual
 from apps.desktop_client.pages.registry import page_specs
+
+
+class RequestReadLifecycleTests(unittest.TestCase):
+    """快读请求必须先绑回调再启动，避免本机快速响应丢完成信号。"""
+
+    def test_completion_callback_is_connected_before_thread_start(self) -> None:
+        events: list[str] = []
+
+        class FakeSignal:
+            def connect(self, _callback) -> None:
+                events.append("connect")
+
+        class FakeReader:
+            def __init__(self, *_args, **_kwargs) -> None:
+                self.completed = FakeSignal()
+
+            def start(self) -> None:
+                events.append("start")
+
+        with mock.patch.object(instrument_api, "SignalReadThread", FakeReader):
+            instrument_api.request_read(on_completed=lambda _payload: None)
+
+        self.assertEqual(events, ["connect", "start"])
+
+
+class ManualPollingLifecycleTests(unittest.TestCase):
+    """手动页能从遗留的“在飞”假状态自行恢复。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        with mock.patch.object(manual.ManualControlPage, "_load_mapping"):
+            self.page = manual.ManualControlPage()
+        self.page._mapping_loaded = True
+
+    def tearDown(self) -> None:
+        self.page.deleteLater()
+
+    def test_stopped_reader_does_not_block_the_next_poll(self) -> None:
+        class StoppedReader:
+            @staticmethod
+            def isRunning() -> bool:
+                return False
+
+        class RunningReader:
+            @staticmethod
+            def isRunning() -> bool:
+                return True
+
+        calls: list[dict] = []
+
+        def fake_read(**kwargs):
+            calls.append(kwargs)
+            return RunningReader()
+
+        self.page._read_in_flight = True
+        self.page._reader = StoppedReader()
+        with mock.patch.object(instrument_api, "request_read", fake_read):
+            self.page._poll()
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["on_completed"], self.page._on_snapshot)
+        self.assertTrue(self.page._read_in_flight)
+
+    def test_poll_reads_only_displayed_signals(self) -> None:
+        calls = []
+        self.page._entries = [{"signal": "hidden.signal"}]
+        self.page._topbar_signals = [{"signal": "detector.fc1.beam_current"}]
+        self.page._rows = [SimpleNamespace(
+            spec=SimpleNamespace(signals=lambda: ["visible.setpoint", "visible.readback"])
+        )]
+
+        with mock.patch.object(instrument_api, "request_read", side_effect=lambda **kwargs: calls.append(kwargs)):
+            self.page._poll()
+
+        self.assertEqual(calls[0]["signals"], [
+            "detector.fc1.beam_current", "visible.setpoint", "visible.readback",
+        ])
 
 
 class _GroupPanelSignal:
@@ -204,6 +285,43 @@ def wheel_delta(setpoint: dict, level: int, start: float) -> float:
     before = spin.value()
     wheel(spin, 1)
     return spin.value() - before
+
+
+class SpinButtonSymbolsTests(unittest.TestCase):
+    """行内/成组设定框一律不带上下箭头：滚轮与方向键已能调值。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_wheel_spin_box_has_no_arrow_buttons(self) -> None:
+        spin = manual._WheelSpinBox()
+        self.assertEqual(
+            spin.buttonSymbols(),
+            manual.QAbstractSpinBox.ButtonSymbols.NoButtons,
+        )
+
+    def test_setpoint_editor_spin_has_no_arrow_buttons(self) -> None:
+        editor = manual._SetpointEditor(
+            {"signal": "x.a", "label": "A 电压设定", "min_value": 0.0,
+             "max_value": 5000.0, "unit": "V"},
+            lambda value: None,
+        )
+        self.assertEqual(
+            editor.spin.buttonSymbols(),
+            manual.QAbstractSpinBox.ButtonSymbols.NoButtons,
+        )
+
+    def test_magnet_group_spins_have_no_arrow_buttons(self) -> None:
+        panel = manual._MagnetGroupPanel(
+            None, [("组1", ["m1", "m2"])], []  # type: ignore[arg-type]
+        )
+        for spin in (panel.current_spin, panel.rate_spin):
+            with self.subTest(spin=spin):
+                self.assertEqual(
+                    spin.buttonSymbols(),
+                    manual.QAbstractSpinBox.ButtonSymbols.NoButtons,
+                )
 
 
 class StepLevelRatioTests(unittest.TestCase):
@@ -534,6 +652,12 @@ class SlotLabelTests(unittest.TestCase):
     def test_row_budget_fits_the_real_window(self) -> None:
         """客户端窗口 1745 宽：减侧栏、页面边距与滚动条后，三列必须放得下。"""
         available = 1745 - 168 - 36 - 14
+
+        self.assertLessEqual(manual.MIN_HOLDER_WIDTH, available)
+
+    def test_row_budget_fits_the_smallest_floor_screen(self) -> None:
+        """现场最小屏 1600x1000（可用约 1346px）下三列也无需横向滚动。"""
+        available = 1600 - 168 - 36 - 14 - 36  # 侧栏 + 页边距 + 滚动条 + 富余
 
         self.assertLessEqual(manual.MIN_HOLDER_WIDTH, available)
 
@@ -1034,8 +1158,8 @@ class PageTests(unittest.TestCase):
         )
 
         values = [label.text() for _entry, label in self.page.topbar.readouts]
-        # 顶栏读数固定两位小数，位数不再随数值变化（否则整条顶栏每秒抖）
-        self.assertEqual(values, ["12.50 nA", "8.00 nA"])
+        # 顶栏读数固定六位小数，位数不再随数值变化（否则整条顶栏每秒抖）
+        self.assertEqual(values, ["12.500000 nA", "8.000000 nA"])
 
     def test_topbar_falls_back_to_a_panel_when_there_are_too_many_readouts(self) -> None:
         many = [
@@ -1128,6 +1252,25 @@ class PageTests(unittest.TestCase):
 
         self.assertIn("整批未下发", self.page.status_label.text())
         self.assertTrue(self.page.all_off_button.isEnabled())
+
+    def test_all_off_unknown_state_refreshes_recovery_items(self) -> None:
+        with mock.patch.object(self.page, "_load_startup_recoveries") as refresh:
+            self.page._on_all_off_result({
+                "ok": True,
+                "payload": {
+                    "ok": False,
+                    "message": "设备状态未知，请人工确认",
+                    "results": [{"device_state_unknown": True}],
+                },
+            })
+
+        refresh.assert_called_once_with()
+
+    def test_recovery_acknowledgement_reloads_remaining_items(self) -> None:
+        with mock.patch.object(self.page, "_load_startup_recoveries") as refresh:
+            self.page._on_startup_recovery_acknowledged({"ok": True})
+
+        refresh.assert_called_once_with()
 
     def test_all_off_is_sent_as_one_atomic_batch(self) -> None:
         self.page._on_mapping({"ok": True, "config": {"entries": dw_entries()}})
@@ -1461,7 +1604,7 @@ class CardVisibilityTests(unittest.TestCase):
             }
         )
 
-        trend_frame = next(f for f in self.page._frames if f._key == "__trend__")
+        trend_frame = next(f for f in self.page._frames if f._key == manual.TREND_CARD_ID)
 
         self.assertFalse(trend_frame.isHidden())
 
@@ -1581,14 +1724,31 @@ class LayoutPersistenceTests(unittest.TestCase):
         self.settings.setValue(
             f"{manual.LAYOUT_SETTINGS_PREFIX}测试卡片/rect", [1200, 800, 460, 200]
         )
-        self.page._canvas.resize(862, 640)
+        canvas_width = (2 * manual.COLUMN_MIN_WIDTH + manual.COLUMN_SPACING
+               + 2 * manual.CANVAS_MARGIN)
+        self.page._canvas.resize(canvas_width, 640)
         frame = self.make_frame()
-        # x 钳回画布内（862-460=402）；y=800 超出画布高度但保留，靠滚动条查看
-        self.assertEqual((frame.x(), frame.y()), (402, 800))
+        # x 钳回画布内；y=800 超出画布高度但保留，靠滚动条查看
+        self.assertEqual((frame.x(), frame.y()), (canvas_width - 460, 800))
         # 画布最低高度被撑到能看到这张卡片
         self.assertGreaterEqual(
             self.page._canvas.minimumHeight(), 800 + 200 + manual.CANVAS_MARGIN
         )
+
+    def test_restore_keeps_content_minimum_width(self) -> None:
+        """旧存档宽度低于内容最小需求（如设备名列加宽后）时，恢复不能裁掉右侧内容。"""
+        panel = manual._GroupPanel("测试卡片")
+        wide = QLabel("宽内容")
+        wide.setFixedWidth(500)
+        panel.body.addWidget(wide)
+        frame = self.page._place_panel(panel, key="测试卡片", column=0, height=150)
+        # 存档宽度 400 远小于内容需求
+        self.settings.setValue(
+            f"{manual.LAYOUT_SETTINGS_PREFIX}测试卡片/rect", [100, 100, 400, 200]
+        )
+        ok = frame.restore_geometry(self.page._canvas)
+        self.assertTrue(ok)
+        self.assertGreaterEqual(frame.width(), panel.minimumSizeHint().width())
 
     def test_saved_layout_is_restored_after_canvas_is_laid_out(self) -> None:
         """卡片在页面显示前构建时，恢复被钳到初始画布内；显示后统一恢复到位。
@@ -1601,11 +1761,13 @@ class LayoutPersistenceTests(unittest.TestCase):
         self.settings.setValue(
             f"{manual.LAYOUT_SETTINGS_PREFIX}测试卡片/rect", [700, 700, 460, 200]
         )
-        # 不 resize canvas：保持 hidden 构建时的初始尺寸
-        self.page._canvas.resize(862, 640)
+        # 不 resize canvas：保持 hidden 构建时的初始尺寸（随 COLUMN_MIN_WIDTH 变化）
+        canvas_width = (2 * manual.COLUMN_MIN_WIDTH + manual.COLUMN_SPACING
+               + 2 * manual.CANVAS_MARGIN)
+        self.page._canvas.resize(canvas_width, 640)
         frame = self.make_frame()
         # 横向钳回画布内（左右锁死）；纵向保留越界值（画布滚动查看）
-        self.assertEqual((frame.x(), frame.y()), (862 - 460, 700))
+        self.assertEqual((frame.x(), frame.y()), (canvas_width - 460, 700))
 
         # 页面显示、画布布局完成 → 统一恢复
         self.page._canvas.resize(1400, 900)
@@ -1660,7 +1822,7 @@ class LayoutPersistenceTests(unittest.TestCase):
             }
         )
 
-        trend = next(f for f in self.page._frames if f._key == "__trend__")
+        trend = next(f for f in self.page._frames if f._key == manual.TREND_CARD_ID)
 
         self.assertEqual(trend.property("layoutColumn"), 1)
 
@@ -1672,10 +1834,10 @@ class LayoutPersistenceTests(unittest.TestCase):
             ("溅射电源", 120, 0),
             ("腔体真空", 120, 0),
             ("聚焦/漂移管", 164, 0),
-            ("__trend__", manual._TrendPanel.HEIGHT, 1),
+            (manual.TREND_CARD_ID, manual._TrendPanel.HEIGHT, 1),
             ("高压阵列 DW", 416, 1),
             ("新高压电源 BD", 216, 2),
-            ("磁铁电源", 260, 2),
+            ("磁铁电源", 260 + manual.MAGNET_GROUP_CONTROLS_HEIGHT, 2),
         )
         columns = [manual.CANVAS_MARGIN] * manual.COLUMN_COUNT
         for _name, height, column in expected:
@@ -1723,9 +1885,9 @@ class TrendCardTests(unittest.TestCase):
                     "payload": {
                         "readings": [
                             {"signal": "detector.fc1.beam_current", "connected": True,
-                             "value": 10.0 + index, "received_time": iso(index)},
+                             "value": 10.0 + index, "received_time": iso(samples - index)},
                             {"signal": "detector.fc2.beam_current", "connected": True,
-                             "value": 5.0 + index, "received_time": iso(index)},
+                             "value": 5.0 + index, "received_time": iso(samples - index)},
                         ]
                     },
                 }
@@ -1757,14 +1919,27 @@ class TrendCardTests(unittest.TestCase):
 
         self.assertEqual(panel.window_s, 30.0)
 
-    def test_clear_empties_the_buffer(self) -> None:
+    def test_clear_only_empties_the_active_channel(self) -> None:
         panel = self.load()
         self.feed(panel)
         self.assertTrue(self.page.trend.signals())
 
         panel.clear_button.click()
 
-        self.assertEqual(self.page.trend.signals(), [])
+        self.assertEqual(self.page.trend.signals(), ["detector.fc2.beam_current"])
+
+    def test_fc_channels_switch_instead_of_overlaying(self) -> None:
+        panel = self.load()
+        self.feed(panel)
+
+        _xs, ys = panel.plot.raw_data()
+        self.assertEqual(list(ys), [10.0, 11.0, 12.0, 13.0, 14.0])
+
+        panel.signal_buttons[1].click()
+
+        _xs, ys = panel.plot.raw_data()
+        self.assertEqual(list(ys), [5.0, 6.0, 7.0, 8.0, 9.0])
+        self.assertIn("FC2", panel.stats_label.text())
 
     def test_best_toggle_is_off_by_default(self) -> None:
         panel = self.load()
@@ -1881,7 +2056,7 @@ class TrendRecordingTests(unittest.TestCase):
         _entry, label = self.page.topbar.readouts[0]
         trend = self.page.topbar.readout_trends[0]
 
-        self.assertEqual(label.text(), "12.50 nA")
+        self.assertEqual(label.text(), "12.500000 nA")
         self.assertIn("▲", trend.text())
         self.assertIn("+2.5", trend.text())
 
@@ -2102,6 +2277,8 @@ class MagnetGroupPanelTests(unittest.TestCase):
         panel = page.magnet_group_panel
         self.assertIsNotNone(panel)
         self.assertEqual(panel.group_combo.count(), len(manual._magnet_group_choices()))
+        self.assertNotIn("__magnet_group__", [frame._key for frame in page._frames])
+        self.assertTrue(any(frame.child.isAncestorOf(panel) for frame in page._frames))
 
     def test_panel_is_skipped_without_magnet_signals(self) -> None:
         page = self.make_page(
@@ -2185,6 +2362,22 @@ class MagnetGroupPanelTests(unittest.TestCase):
         self.assertIn("magnet.m2.current_setpoint", text)
         self.assertIn("CA 写入超时", text)
         self.assertEqual(panel.result_label.property("state"), "error")
+
+    def test_batch_unknown_state_refreshes_recovery_items(self) -> None:
+        page = self.make_page()
+        panel = page.magnet_group_panel
+
+        with mock.patch.object(page, "_load_startup_recoveries") as refresh:
+            panel._on_done({
+                "ok": True,
+                "payload": {
+                    "ok": False,
+                    "message": "设备状态未知，请人工确认",
+                    "results": [{"device_state_unknown": True, "accepted": False}],
+                },
+            })
+
+        refresh.assert_called_once_with()
 
     def test_transport_failure_is_never_shown_as_success(self) -> None:
         page = self.make_page()

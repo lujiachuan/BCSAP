@@ -229,8 +229,8 @@ class LogTests(unittest.TestCase):
             [iteration(0, stage="sequential"), iteration(1, stage="joint")]
         )
 
-        self.assertIn("逐参数优化", lines[0])
-        self.assertIn("联合微调", lines[1])
+        self.assertIn("旧版逐参数阶段", lines[0])
+        self.assertIn("旧版联合阶段", lines[1])
 
     def test_old_records_say_the_stage_was_not_recorded(self) -> None:
         """老库里的历史轮次没有阶段列：如实写"未记录"，不猜成联合微调。"""
@@ -276,7 +276,7 @@ class TuningAnalysisPageTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
-        self._directory = tempfile.TemporaryDirectory()
+        self._directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self._directory.cleanup)
         self.config_path = Path(self._directory.name) / "tuning_config.json"
         self._env = mock.patch.dict(
@@ -488,33 +488,31 @@ class TuningAnalysisPageTests(unittest.TestCase):
         self.assertIn("已取消", page.log_note.text())
 
     # ---------------- 高级参数 ----------------
-    def test_noise_and_seed_are_sent_with_the_run(self) -> None:
+    # 观测噪声（noise）已从界面撤掉：它进的是 GP 的核，Optuna 采样器并不使用，
+    # 界面上给一个"看起来能调、实际不影响候选"的框只会误导操作员。
+    # 现在只保留随机种子（真能改变并复现探索路径）。
+    def test_seed_is_sent_with_the_run(self) -> None:
         page = self.make_page()
         row = next(r for r in page._rows if r["entry"]["signal"] == MAGNET)
         row["check"].setCheckState(tuning_module.Qt.CheckState.Checked)
-        page.noise_spin.setValue(0.5)
         page.seed_spin.setValue(7)
 
         page.start_tuning()
 
-        self.assertEqual(self.requests[0]["noise"], 0.5)
         self.assertEqual(self.requests[0]["seed"], 7)
+        self.assertNotIn("noise", self.requests[0])
 
-    def test_noise_and_seed_are_saved_and_restored(self) -> None:
+    def test_seed_is_saved_and_restored(self) -> None:
         page = self.make_page()
-        page.noise_spin.setValue(0.25)
         page.seed_spin.setValue(11)
         page.save_tuning_config()
 
         saved = json.loads(self.config_path.read_text(encoding="utf-8"))
-        self.assertEqual(saved["noise"], 0.25)
         self.assertEqual(saved["seed"], 11)
 
-        page.noise_spin.setValue(1.0)
         page.seed_spin.setValue(0)
         page.load_tuning_config()
 
-        self.assertEqual(page.noise_spin.value(), 0.25)
         self.assertEqual(page.seed_spin.value(), 11)
 
 

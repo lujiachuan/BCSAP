@@ -21,7 +21,7 @@ from tests.test_tuning_service import MAGNET, MAGNET_RB, TARGET, build_config, r
 
 class TuningGuardTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._directory = tempfile.TemporaryDirectory()
+        self._directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.store = TuningStore(Path(self._directory.name))
         self.locks = DeviceLockManager()
 
@@ -31,7 +31,24 @@ class TuningGuardTests(unittest.TestCase):
     def build(self) -> TuningService:
         self.config = build_config()
         self.gateway = create_simulated_gateway(self.config)
-        self.signals = SignalWriteService(self.gateway, self.config, sleep=lambda _s: None)
+        # 目标读数由用例接管：SIM 里 fc1 是**由 4 路 DW 电压算出来的**
+        # （packages/epics_adapter/simulated._compute_fc1_beam），
+        # 往 `_values[TARGET]` 里塞值不生效、pop 也删不掉。
+        # 于是这些"保护没触发"的失败其实是**用例的摆布手段跟不上模拟器**，
+        # 而不是状态机的问题。这里把 target 的读数接过来，保护判据才测得到。
+        self._target_value: float | None = 10.0
+        gateway = self.gateway
+        real_read = gateway.read
+
+        def read(signal: str):
+            if signal == TARGET:
+                if self._target_value is None:
+                    raise KeyError(f"未配置模拟信号：{signal}")
+                return gateway._reading(signal, float(self._target_value), "nA")
+            return real_read(signal)
+
+        gateway.read = read  # type: ignore[method-assign]
+        self.signals = SignalWriteService(gateway, self.config, sleep=lambda _s: None)
         self.service = TuningService(
             lambda: self.signals, self.locks, self.store, sleep=lambda _s: None
         )
@@ -42,10 +59,7 @@ class TuningGuardTests(unittest.TestCase):
 
     def set_target(self, value: float | None) -> None:
         """把目标（束流）摆到指定值；None = 这一路读不到。"""
-        if value is None:
-            self.gateway._values.pop(TARGET, None)
-        else:
-            self.gateway._values[TARGET] = (value, "nA")
+        self._target_value = None if value is None else float(value)
 
     # ---------------- 启动前快照 ----------------
     def test_start_records_pre_run_snapshot_and_baseline(self) -> None:

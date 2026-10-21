@@ -1,4 +1,4 @@
-"""根据当前设备配置生成 ``sim/ioc.db``。
+﻿"""根据当前设备配置生成 ``sim/ioc.db``。
 
 用法::
 
@@ -55,6 +55,24 @@ HEADER = """\
 """
 
 
+# 束流物理输出：signal -> (峰值, [(输入信号, 最优值, sigma), ...])。
+# 生成 calc 记录：各维高斯衰减取几何平均（EXP(-0.5*sum(((x-best)/sigma)^2)/n)），
+# 让软 IOC 的 FC1 随 DW 电压变化，可直接拿真实 CA 链路跑自动调束。
+# 参数与 packages/epics_adapter/simulated.py 的 _BEST/_SIGMA/_PEAK_BEAM 对齐。
+PHYSICAL_OUTPUTS: dict[str, tuple[float, list[tuple[str, float, float]]]] = {
+    "detector.fc1.beam_current": (
+        12.0,
+        [
+            ("hv_array.dw01.voltage_setpoint", 100.0, 75.0),
+            ("hv_array.dw02.voltage_setpoint", 1500.0, 1000.0),
+            ("hv_array.dw03.voltage_setpoint", 1500.0, 1000.0),
+            ("hv_array.dw04.voltage_setpoint", 3000.0, 2000.0),
+        ],
+    ),
+}
+_INP_LETTERS = "ABCDEFGHIJKL"
+
+
 def _num(value: float) -> str:
     """EPICS 友好的数值字面量：避免 %g 产生 1e-05 这类指数写法。"""
     text = f"{value:.6f}".rstrip("0").rstrip(".")
@@ -88,8 +106,51 @@ def main() -> int:
         if entry.readback_signal
     }
 
+    pv_by_signal = {e.signal: e.pv for e in entries}
     for entry in entries:
         unit = entry.unit if entry.unit.isascii() else ""
+        physical = PHYSICAL_OUTPUTS.get(entry.signal)
+        if physical is not None:
+            peak, inputs = physical
+            n = len(inputs)
+            # calc 的 CALC 字段上限 40 字符，放不下完整 4 维高斯，
+            # 拆成「每维归一化偏差 aux calc」+「主 calc 汇总」两步。
+            aux_pvs: list[str] = []
+            for i, (src_signal, best, sigma) in enumerate(inputs):
+                src_pv = pv_by_signal[src_signal]
+                aux_pv = f"{entry.pv}:n{i + 1}"
+                aux_pvs.append(aux_pv)
+                lines.append(f"# --- {entry.signal} aux {i + 1} | normalized offset^2 ---")
+                lines.append(f'record(calc, "{aux_pv}") {{')
+                lines.append(f'    field(DESC, "{entry.signal} aux {i + 1}")')
+                lines.append(f'    field(INPA, "{src_pv} CP")')
+                lines.append(
+                    f'    field(CALC, "((A-{_num(best)})/{_num(sigma)})^2")'
+                )
+                lines.append('    field(SCAN, "1 second")')
+                lines.append('    field(PREC, "6")')
+                lines.append("}")
+                lines.append("")
+            letters = _INP_LETTERS[:n]
+            sum_expr = "+".join(letters)
+            lines.append(f"# --- {entry.signal} | physical beam model ---")
+            lines.append(f'record(calc, "{entry.pv}") {{')
+            lines.append(f'    field(DESC, "{entry.signal}")')
+            for i, aux_pv in enumerate(aux_pvs):
+                letter = _INP_LETTERS[i]
+                lines.append(f'    field(INP{letter}, "{aux_pv} CP")')
+            # 几何平均：PEAK * exp(-0.5 * sum(offset^2) / n)
+            lines.append(
+                f'    field(CALC, "{_num(peak)}*EXP(-.5*({sum_expr})/{n})")'
+            )
+            # CP 输入 + I/O Intr：任一 DW 变化经 aux 即时重算
+            lines.append('    field(SCAN, "1 second")')
+            if unit:
+                lines.append(f'    field(EGU,  "{unit}")')
+            lines.append('    field(PREC, "6")')
+            lines.append("}")
+            lines.append("")
+            continue
         mirror = mirror_of.get(entry.signal)
         if mirror is not None and not entry.writable:
             source = next(e.pv for e in entries if e.signal == mirror)
@@ -145,3 +206,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

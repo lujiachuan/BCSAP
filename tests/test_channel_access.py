@@ -21,11 +21,16 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 from apps.instrument_service import pv_mapping
 from apps.instrument_service.runtime import InstrumentRuntime
 from packages.contracts import PvMappingConfig, PvMappingEntry
-from packages.epics_adapter import ChannelAccessGateway, load_ca_library
+from packages.epics_adapter import (
+    ChannelAccessGateway,
+    ca_library_candidates,
+    load_ca_library,
+)
 
 PV_Q1 = "BL:Q1:ISET"
 PV_Q2 = "BL:Q2:ISET"
@@ -304,6 +309,14 @@ class ChannelAccessIntegrationTests(unittest.TestCase):
         self.assertEqual(len(health.items), 1)
         self.assertEqual(health.items[0].pv, PV_Q1)
         self.assertTrue(health.items[0].connected)
+
+
+class CaLibraryCandidateTests(unittest.TestCase):
+    def test_path_directory_with_ca_dll_is_discovered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "ca.dll").touch()
+            with mock.patch.dict(os.environ, {"PATH": directory}, clear=True):
+                self.assertIn(Path(directory), ca_library_candidates())
 
 
 @unittest.skipUnless(SOFT_IOC is not None, "本机没有 EPICS softIoc.exe")

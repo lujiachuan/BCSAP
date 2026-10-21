@@ -222,14 +222,14 @@ if ($Target -eq 'release') {
     }
     Write-Host "    dist\README-DEPLOY.txt     (ship this note with the package)"
 
-    # EPICS ca.dll is loaded at runtime via ctypes; tell the operator where it comes from.
-    $caVars = @('SPECTRUM_CA_LIB_DIR', 'EPICS_CA_LIB_DIR', 'EPICS_BASE') |
-        Where-Object { [Environment]::GetEnvironmentVariable($_) }
-    if ($caVars) {
-        Write-Host "    EPICS hint: $($caVars -join ', ') is set on this machine; target PCs configure their own."
+    # The service invokes caget/caput at runtime; target PCs must expose both commands.
+    $caget = Get-Command caget -ErrorAction SilentlyContinue
+    $caput = Get-Command caput -ErrorAction SilentlyContinue
+    if ($caget -and $caput) {
+        Write-Host "    EPICS hint: caget/caput found; target PCs must provide their own EPICS command tools."
     } else {
-        Write-Host "    EPICS hint: no ca.dll path configured here - target control PCs set"
-        Write-Host "                SPECTRUM_CA_LIB_DIR or EPICS_BASE (see README-DEPLOY.txt)."
+        Write-Host "    EPICS hint: caget/caput not both found on this build PC."
+        Write-Host "                Target control PCs must add them to PATH or configure EPICS_BASE."
     }
 } elseif ($Target -eq 'operator-package') {
     $AssemblyDir = New-OperatorPackage

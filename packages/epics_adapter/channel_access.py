@@ -32,6 +32,7 @@ from __future__ import annotations
 import ctypes
 import os
 import queue
+import sys
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -128,6 +129,11 @@ def ca_library_candidates(configured_dir: str | None = None) -> list[Path]:
         add(str(Path(base) / "bin" / arch))
     if base:
         add(str(Path(base) / "bin"))
+        bin_dir = Path(base) / "bin"
+        if bin_dir.is_dir():
+            for child in sorted(bin_dir.iterdir()):
+                if child.is_dir() and (child / "ca.dll").is_file():
+                    add(str(child))
     # 同盘旁挂的官方 CA 分发（EPICS 官方 release 目录名形如 CA-3.15.6-windows-x64）
     if base:
         parent = Path(base).parent
@@ -136,6 +142,15 @@ def ca_library_candidates(configured_dir: str | None = None) -> list[Path]:
                 add(str(child))
             for child in sorted(parent.glob("CA-*")):
                 add(str(child))
+    # 打包程序允许把 CA 运行库直接放在执行服务 exe 旁边。
+    if getattr(sys, "frozen", False):
+        add(str(Path(sys.executable).resolve().parent))
+    # 现场电脑已经能直接运行 caget 时，ca.dll 通常就在 PATH 的同一目录。
+    # 复用该目录，避免还要额外配置一份 SPECTRUM_CA_LIB_DIR。
+    for raw in os.environ.get("PATH", "").split(os.pathsep):
+        directory = Path(raw.strip().strip('"'))
+        if raw.strip() and (directory / "ca.dll").is_file():
+            add(str(directory))
     return candidates
 
 
@@ -152,15 +167,18 @@ def load_ca_library(configured_dir: str | None = None) -> tuple[ctypes.CDLL, Pat
             attempts.append(f"{directory}：无 ca.dll")
             continue
         try:
-            os.add_dll_directory(str(directory))
+            dll_directory = os.add_dll_directory(str(directory))
         except (OSError, AttributeError) as exc:
             attempts.append(f"{directory}：无法注册依赖目录（{exc}）")
             continue
         try:
             library = ctypes.CDLL(str(dll))
         except OSError as exc:
+            dll_directory.close()
             attempts.append(f"{directory}：{exc}")
             continue
+        # 保持句柄存活，确保 CA 后续加载的依赖 DLL 仍能从同一目录解析。
+        library._spectrum_dll_directory = dll_directory
         return library, directory
     detail = "；".join(attempts) if attempts else "未配置任何候选目录"
     raise ConnectionError(
@@ -316,11 +334,19 @@ class ChannelAccessGateway:
             ca.ca_flush_io()
             # 关键：不能信 ca_pend_io 的返回值，必须轮询 ca_state
             deadline = monotonic() + self._connect_timeout
+            first_connection_at: float | None = None
             while monotonic() < deadline:
                 ca.ca_pend_event(0.05)
-                if self._channels and all(
+                connected = sum(
                     ca.ca_state(handle) == CS_CONN for handle in self._channels.values()
-                ):
+                )
+                if connected == len(self._channels):
+                    break
+                if connected and first_connection_at is None:
+                    first_connection_at = monotonic()
+                # 有通道成功后再给 CA 0.5 秒完成同批搜索；个别缺席的 PV 会在后续
+                # read/snapshot 的 pend_event 中继续自愈，不能因此每次冷启动等满 5 秒。
+                if first_connection_at is not None and monotonic() - first_connection_at >= 0.5:
                     break
             self._connected = True
             return True
@@ -384,10 +410,46 @@ class ChannelAccessGateway:
         return self._submit(job, timeout=self._io_timeout + 5.0)
 
     def snapshot(self, signals: list[str]) -> dict[str, Reading]:
-        readings: dict[str, Reading] = {}
-        for signal in signals:
-            readings[signal] = self.read(signal)
-        return readings
+        if not self._connected:
+            raise ConnectionError("EPICS 网关尚未连接")
+        unknown = [signal for signal in signals if signal not in self._paths]
+        if unknown:
+            raise KeyError(f"未配置业务信号：{unknown[0]}")
+
+        def job(ca) -> dict[str, Reading]:
+            ca.ca_pend_event(0.05)
+            readings: dict[str, Reading] = {}
+            pending: dict[str, _DbrTimeDouble] = {}
+            for signal in signals:
+                handle = self._channels[signal]
+                if ca.ca_state(handle) != CS_CONN:
+                    readings[signal] = self._reading(
+                        signal, 0.0, connected=False, severity=None
+                    )
+                    continue
+                payload = _DbrTimeDouble()
+                rc = ca.ca_array_get(
+                    DBR_TIME_DOUBLE, 1, handle, ctypes.byref(payload)
+                )
+                if rc != ECA_NORMAL:
+                    readings[signal] = self._reading(
+                        signal, 0.0, connected=False, severity=None
+                    )
+                    continue
+                pending[signal] = payload
+            if pending:
+                ca.ca_pend_io(self._io_timeout)
+            for signal, payload in pending.items():
+                readings[signal] = self._reading(
+                    signal,
+                    payload.value,
+                    connected=True,
+                    severity=payload.severity,
+                    source_time=_stamp_to_datetime(payload.stamp),
+                )
+            return readings
+
+        return self._submit(job, timeout=self._io_timeout + 5.0)
 
     def close(self) -> None:
         """停止专用线程并销毁 CA 上下文。"""

@@ -1025,10 +1025,51 @@ record(ao, "BD:DipoleMagnet:04:Reset") {
     field(PREC, "6")
 }
 
-# --- detector.fc1.beam_current | read-only ---
-record(ai, "BD:FC:01:BeamCurrent") {
+# --- detector.fc1.beam_current aux 1 | normalized offset^2 ---
+record(calc, "BD:FC:01:BeamCurrent:n1") {
+    field(DESC, "detector.fc1.beam_current aux 1")
+    field(INPA, "Part1:DW:Voltage_Set1 CP")
+    field(CALC, "((A-100)/75)^2")
+    field(SCAN, "1 second")
+    field(PREC, "6")
+}
+
+# --- detector.fc1.beam_current aux 2 | normalized offset^2 ---
+record(calc, "BD:FC:01:BeamCurrent:n2") {
+    field(DESC, "detector.fc1.beam_current aux 2")
+    field(INPA, "Part1:DW:Voltage_Set2 CP")
+    field(CALC, "((A-1500)/1000)^2")
+    field(SCAN, "1 second")
+    field(PREC, "6")
+}
+
+# --- detector.fc1.beam_current aux 3 | normalized offset^2 ---
+record(calc, "BD:FC:01:BeamCurrent:n3") {
+    field(DESC, "detector.fc1.beam_current aux 3")
+    field(INPA, "Part1:DW:Voltage_Set3 CP")
+    field(CALC, "((A-1500)/1000)^2")
+    field(SCAN, "1 second")
+    field(PREC, "6")
+}
+
+# --- detector.fc1.beam_current aux 4 | normalized offset^2 ---
+record(calc, "BD:FC:01:BeamCurrent:n4") {
+    field(DESC, "detector.fc1.beam_current aux 4")
+    field(INPA, "Part1:DW:Voltage_Set4 CP")
+    field(CALC, "((A-3000)/2000)^2")
+    field(SCAN, "1 second")
+    field(PREC, "6")
+}
+
+# --- detector.fc1.beam_current | physical beam model ---
+record(calc, "BD:FC:01:BeamCurrent") {
     field(DESC, "detector.fc1.beam_current")
-    field(VAL,  "8.31")
+    field(INPA, "BD:FC:01:BeamCurrent:n1 CP")
+    field(INPB, "BD:FC:01:BeamCurrent:n2 CP")
+    field(INPC, "BD:FC:01:BeamCurrent:n3 CP")
+    field(INPD, "BD:FC:01:BeamCurrent:n4 CP")
+    field(CALC, "12*EXP(-.5*(A+B+C+D)/4)")
+    field(SCAN, "1 second")
     field(EGU,  "nA")
     field(PREC, "6")
 }

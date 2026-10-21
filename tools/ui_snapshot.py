@@ -92,6 +92,9 @@ def block_network() -> None:
         "request_tuning_catalog",
         "request_tuning_status",
         "request_tuning_iterations",
+        "request_tuning_progress",
+        "request_tuning_events",
+        "request_tuning_runs",
         "request_magnet_retract",
         "request_pv_health",
     ):
@@ -361,11 +364,9 @@ def fill_tuning(app: QApplication, window: main_module.MainWindow) -> None:
     )
     tuning._on_iterations({"ok": True, "payload": {"iterations": records}})
     tuning.tabs.setTabEnabled(1, True)
-    tuning.tabs.setTabEnabled(2, False)
-    tuning.tabs.setCurrentIndex(1)
+    tuning.tabs.setTabEnabled(2, True)
     tuning.tuning_stop_button.setEnabled(True)
     goto(app, window, "tuning")
-    snap(app, window, SNAP_DIR, f"{theme_name()}_04_tuning-monitor")
 
     # 结果页（tab 2）：终态 + 三种设备处置可用
     tuning._apply_status(
@@ -388,8 +389,42 @@ def fill_tuning(app: QApplication, window: main_module.MainWindow) -> None:
     )
     tuning._on_iterations({"ok": True, "payload": {"iterations": records}})
     tuning.tabs.setTabEnabled(0, True)
+    tuning.tabs.setTabEnabled(1, True)
     tuning.tabs.setTabEnabled(2, True)
-    tuning.tabs.setCurrentIndex(2)
+    # 停在运行监控页：调用方（capture_theme）负责切页与截图
+    tuning.tabs.setCurrentIndex(1)
+    app.processEvents()
+
+
+def fill_tuning_many_variables(app: QApplication, window: main_module.MainWindow) -> None:
+    """12 路变量的参数配置页：左栏表格与范围标尺的极端情形（密集布局的守门场景）。"""
+    tuning = window.pages.findChild(TuningPage)
+    entries = []
+    for index in range(1, 13):
+        entries.append(
+            {
+                "signal": f"magnet.m{index}.current_setpoint",
+                "label": f"磁铁{index} 电流设定",
+                "pv": f"BD:DipoleMagnet:{index:02d}:CurrentSet",
+                "unit": "A",
+                "writable": True,
+                "required": False,
+                "group": "磁铁电源",
+                "role": "setpoint",
+                "readback_signal": f"magnet.m{index}.current_readback",
+                "min_value": 0.0,
+                "max_value": 600.0,
+                "max_step": 20.0,
+                "settle_tol": 0.5,
+                "tunable": True,
+            }
+        )
+    entries.append(dict(tuning_mapping()[-1]))
+    tuning._on_mapping({"ok": True, "config": {"entries": entries}})
+    for row in tuning._rows:
+        row["check"].setCheckState(tuning_module.Qt.CheckState.Checked)
+    tuning._update_run_plan()
+    tuning.tabs.setCurrentIndex(0)
     app.processEvents()
 
 
@@ -447,14 +482,22 @@ def capture_theme(app: QApplication, theme: str) -> None:
     fill_manual(app, window)
     snap(app, window, SNAP_DIR, f"{theme}_09_manual", page_key="manual")
 
-    # 4) 自动调束：参数配置
+    # 4) 自动调束：参数配置（2 变量）
     tuning = window.pages.findChild(TuningPage)
     tuning.tabs.setCurrentIndex(0)
     goto(app, window, "tuning")
     snap(app, window, SNAP_DIR, f"{theme}_03_tuning-config", page_key="tuning")
 
+    # 4b) 自动调束：参数配置（12 变量，最坏情形）
+    fill_tuning_many_variables(app, window)
+    app.processEvents()
+    snap(app, window, SNAP_DIR, f"{theme}_03b_tuning-config-many", page_key="tuning")
+
     # 5) 自动调束：运行监控 / 6) 结果确认
     fill_tuning(app, window)
+    snap(app, window, SNAP_DIR, f"{theme}_04_tuning-monitor", page_key="tuning")
+    tuning.tabs.setCurrentIndex(2)
+    app.processEvents()
     snap(app, window, SNAP_DIR, f"{theme}_05_tuning-result", page_key="tuning")
 
     # 7) 谱图库（占位页）

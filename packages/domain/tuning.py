@@ -20,6 +20,8 @@ class TuningState(StrEnum):
     AWAITING_CONFIRMATION = "awaiting_confirmation"
     # 正在写入并等待读回稳定
     APPLYING = "applying"
+    # 用户暂停：参数冻结，等待继续（只在不写设备时进入）
+    PAUSED = "paused"
     STOP_REQUESTED = "stop_requested"
     COMPLETED = "completed"
     ABORTED = "aborted"
@@ -34,6 +36,9 @@ ALLOWED_TRANSITIONS: dict[TuningState, frozenset[TuningState]] = {
     TuningState.RUNNING: frozenset(
         {
             TuningState.AWAITING_CONFIRMATION,
+            # auto 模式：候选生成后不经过等待确认，直接进写设备
+            TuningState.APPLYING,
+            TuningState.PAUSED,
             TuningState.STOP_REQUESTED,
             TuningState.COMPLETED,
             TuningState.FAILED,
@@ -41,8 +46,12 @@ ALLOWED_TRANSITIONS: dict[TuningState, frozenset[TuningState]] = {
     ),
     # 等确认期间用户可以直接停止，或确认后进入写入
     TuningState.AWAITING_CONFIRMATION: frozenset(
-        {TuningState.APPLYING, TuningState.STOP_REQUESTED, TuningState.COMPLETED,
-         TuningState.FAILED}
+        {TuningState.APPLYING, TuningState.PAUSED, TuningState.STOP_REQUESTED,
+         TuningState.COMPLETED, TuningState.FAILED}
+    ),
+    # 暂停后可继续（RUNNING），也可直接停止
+    TuningState.PAUSED: frozenset(
+        {TuningState.RUNNING, TuningState.STOP_REQUESTED}
     ),
     TuningState.APPLYING: frozenset(
         {TuningState.RUNNING, TuningState.STOP_REQUESTED, TuningState.COMPLETED,
@@ -54,7 +63,11 @@ ALLOWED_TRANSITIONS: dict[TuningState, frozenset[TuningState]] = {
     TuningState.FAILED: frozenset({TuningState.RECOVERY_REQUIRED}),
     TuningState.COMPLETED: frozenset(),
     TuningState.ABORTED: frozenset(),
-    TuningState.RECOVERY_REQUIRED: frozenset(),
+    # 「需人工确认」不是死路：操作员现场确认设备状态后，允许**带着新的实际回读**
+    # 重新回到 RUNNING 继续调（服务端会先重读全部变量建立新的地面真值，
+    # 并把这次确认与重读结果写进事件流；设备组被占用时拒绝继续）。
+    # 只有显式的 acknowledge(resume=True) 会走这条边——不会自动发生。
+    TuningState.RECOVERY_REQUIRED: frozenset({TuningState.RUNNING}),
 }
 
 
