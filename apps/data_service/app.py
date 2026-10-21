@@ -1,7 +1,7 @@
 """共享数据服务的 HTTP 应用。"""
 
 from fastapi import FastAPI, HTTPException, Query, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from packages.contracts import ServiceStatus, SyncChanges, SyncManifest
 
@@ -57,6 +57,11 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="谱图平台数据服务", version="0.1.0")
     app.include_router(showcase_router)
+
+    @app.get("/", include_in_schema=False)
+    def root() -> RedirectResponse:
+        # 根路径无业务；浏览器打开 :8000/ 时直接进 Showcase，避免看到 {"detail":"Not Found"}
+        return RedirectResponse(url="/showcase", status_code=307)
 
     @app.get("/showcase", response_class=HTMLResponse)
     def showcase_ui() -> str:
