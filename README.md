@@ -2,13 +2,13 @@
 
 面向实验室质谱数据管理与离子光学控制的一体化平台。项目希望用同一个桌面客户端承载样品管理、扫谱、自动调束、谱图库检索与谱图分析，并通过独立的仪器执行服务隔离硬件控制，通过共享数据服务统一管理实验记录。
 
-> 当前版本为 `0.1.0`。控制与数据能力进度不同：仪器执行侧多数页面仍可为演示/骨架；**团簇谱 Showcase 已只读接入现网 PostgreSQL `cluster_ms`**（经 `data_service`）。BCSAP 自有 Alembic 迁移、样品/实验上传归档与完整谱图库 UI 仍待建设。当前界面中未接 Showcase 的实验记录、服务状态和 PV 数据大多仍是演示数据。
+> 当前版本为 `0.1.0`。控制与数据能力进度不同：仪器执行侧多数页面仍可为演示/骨架；**团簇谱 Showcase / 谱图库已对标现网六步工作流**（经 `data_service` 读 PG 或代理上游 `SHOWCASE_UPSTREAM`，默认 `http://172.16.12.143:8787`）。写路径（标注/峰确认/校正/Good3/交付）代理 `web_manager`，长图按现网规则在服务器生成。BCSAP 自有 Alembic 与算法包迁入仍待建设。
 
 ## 1. 当前能力
 
 ### 已实现
 
-- **Showcase 只读（数据服务 → cluster_ms）**：`/api/v1/showcase/status|spectra|{id}` 已接本机 PostgreSQL（默认 `127.0.0.1:5433/cluster_ms`，DSN 见 `SPECTRUM_PG_DSN` / 上级 `db_config.json`）；返回谱图列表、校正摘要与 working 标注。写校正/重标注仍旁路 `web_manager`。
+- **Showcase / 谱图库（数据服务）**：`/api/v1/showcase/status|facets|spectra|rank|good3|{id}|curve|images`；写接口 `annotate` / `peaks/confirm` / `correct/*` / `good3/refresh` / `export/pack` 代理上游 `SHOWCASE_UPSTREAM`。桌面「谱图库」为六步 UI（身份→筛选→峰值→校正→分析→交付），含曲线与长图。
 - 基于 PySide6 的统一桌面客户端，支持浅色/深色主题、侧栏收起和会话偏好保存。
 - 工作台、扫谱、自动调束和系统设置页面。
 - 使用内存数据驱动的模拟扫谱，可开始、暂停、安全停止并实时绘制曲线。
@@ -21,13 +21,13 @@
 
 ### 尚未实现
 
-- 桌面客户端调用仪器执行服务、数据服务的正式 API（Showcase HTTP 已可调；谱图库/分析页仍是占位）。
-- **BCSAP 自有** PostgreSQL 数据模型与 Alembic 迁移（把 `cluster_ms` 正式纳入本仓迁移体系；样品/实验/上传会话等中央表）。说明：Showcase **已经在读**现网 `cluster_ms`（web_manager 旁路库），这不等于 Alembic/平台级持久化已完成。
-- Showcase 写路径：重标注、质量轴校正写回、good3 打包（算法仍在旁路 `web_manager`）。
+- 桌面客户端调用仪器执行服务的正式扫谱/调束 API 仍待接满；谱图库已走 Showcase 代理链路。
+- **BCSAP 自有** PostgreSQL 数据模型与 Alembic 迁移（把 `cluster_ms` 正式纳入本仓迁移体系）。
+- 将 `web_manager` 算法 vendoring 进 `packages/spectrum`（当前写路径仍代理上游）。
 - 本地暂存、断线续传、幂等上传和同步队列。
 - 真实 EPICS CA/PVA 连接、受控 PV 映射、设备锁与硬件联锁协同。
 - 登录、角色权限、审计日志和生产环境鉴权。
-- 谱图库、谱图分析、样品管理、任务与同步的完整业务实现。
+- 样品管理、任务与同步的完整业务实现；谱图分析页的多谱对比增强。
 - 正式安装包、Windows 服务、生产配置与部署资源。
 
 ## 2. 系统总体架构
@@ -141,8 +141,8 @@ packages/domain、contracts、spectrum、epics_adapter、optimizer
 │  │  │  ├─ samples.py           # 样品管理占位页
 │  │  │  ├─ scan.py              # 扫谱页
 │  │  │  ├─ tuning.py            # 自动调束页
-│  │  │  ├─ library.py           # 谱图库占位页
-│  │  │  ├─ analysis.py          # 谱图分析占位页
+│  │  │  ├─ library.py           # 谱图库六步（对标 showcase）
+│  │  │  ├─ analysis.py          # 谱图分析（按 ID 摘要）
 │  │  │  ├─ sync.py              # 任务与同步占位页
 │  │  │  └─ settings.py          # 系统设置页
 │  │  ├─ spectrum_plot.py        # 谱图/收敛曲线实时绘图控件
@@ -233,8 +233,8 @@ packages/domain、contracts、spectrum、epics_adapter、optimizer
 | 样品管理 | 已保留导航入口，目前为占位页 |
 | 扫谱 | 配置模拟扫描参数，实时展示曲线、进度和峰值，支持暂停/停止 |
 | 自动调束 | 参数/PV 表、策略与保护选项、模拟收敛曲线、优化前后结果对比 |
-| 谱图库 | 已保留导航入口，目前为占位页 |
-| 谱图分析 | 已保留导航入口，目前为占位页 |
+| 谱图库 | 六步工作流：队列/Good3/曲线/长图/校正代理/交付 |
+| 谱图分析 | 按 ID 只读摘要；完整流程见谱图库 |
 | 任务与同步 | 已保留导航入口，目前为占位页 |
 | 系统设置 | 主题、服务地址、PV 映射增删改（带连接状态 / 当前值检测、关键字查找与筛选）、日志等级和本机偏好设置 |
 
@@ -353,6 +353,8 @@ spectrum-client
 | --- | --- | --- |
 | `SPECTRUM_READ_ONLY` | 全局只读模式（`1`/`true`/`yes`/`on`） | 整台服务禁止一切写入：单点/成组/回落一律被拒并说明原因，扫谱与调束**启动即 400**，`PUT /control/v1/pv-mapping` 也 400（映射决定写入边界，只读下改它等于绕过只读）。客户端会把该标记显示在启动检查里，并压住手动/扫谱/调束/设置页的写入入口。读取链路不受影响。默认关闭 |
 | `SPECTRUM_SCAN_STORE` | 扫谱与调束的本地暂存目录 | 默认在用户数据目录下；服务起不来并提示"暂存目录不可写"时用它换一个落点 |
+| `SHOWCASE_UPSTREAM` | 谱图库写/曲线/图片/Good3 上游 | data_service 代理的 web_manager 根地址，默认 `http://172.16.12.143:8787`。桌面客户端只访问 data_service，不直连该端口 |
+| `SPECTRUM_PG_DSN` / `MS_PG_DSN` | PostgreSQL DSN | 可选；本机有 `cluster_ms` 时用于详情/标注直读，否则列表等可回落上游 |
 
 只读部署长这样（端口与在线实例分开，便于同时在线的联调实例不受影响）：
 

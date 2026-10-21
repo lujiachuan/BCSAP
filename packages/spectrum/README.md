@@ -22,3 +22,4 @@
 | 元素推断 / 质量分 | `web_manager/quality/` | `quality.py` |
 
 契约 DTO 在 `packages/contracts/showcase.py`；HTTP 在 `apps/data_service/showcase_api.py`。
+当前桌面谱图库写路径与曲线/长图经 `SHOWCASE_UPSTREAM` 代理现网 `web_manager`，算法尚未迁入本包。

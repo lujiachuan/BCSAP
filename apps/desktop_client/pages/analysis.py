@@ -64,8 +64,8 @@ class AnalysisPage(QWidget):
         layout.addWidget(
             PageHeading(
                 "谱图分析",
-                "只读查看 Showcase 标注与质量轴摘要。"
-                " 峰值重标、分段校正写回仍在旁路 web_manager；多谱对比与导出后续补。",
+                "按 ID 查看 working 标注摘要。完整六步工作流（筛选/长图/校正/交付）请用「谱图库」；"
+                "写操作经 data_service 代理 SHOWCASE_UPSTREAM。",
             )
         )
         row = QHBoxLayout()

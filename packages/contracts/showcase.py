@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -33,6 +33,8 @@ class ShowcaseStatus(BaseModel):
     algorithms_vendored: bool = False
     n_spectra: int | None = None
     dsn_hint: str | None = None
+    upstream: str | None = None
+    upstream_ok: bool | None = None
 
 
 class ShowcaseSpectrumSummary(BaseModel):
@@ -49,6 +51,9 @@ class ShowcaseSpectrumSummary(BaseModel):
     isotope_class: IsotopeClass = "unknown"
     n_annotations: int = 0
     peak_count: int = 0
+    score: float | None = None
+    rank: int | None = None
+    chip: str | None = None
 
 
 class ShowcaseSpectrumList(BaseModel):
@@ -90,3 +95,84 @@ class ShowcaseSpectrumMeta(BaseModel):
     calibration_method: str | None = None
     peaks: list[ShowcasePeakAnnotation] = Field(default_factory=list)
     detail: str | None = None
+    power: str | None = None
+    ar_flow: str | None = None
+    he_flow: str | None = None
+    pressure: str | None = None
+    condensation_distance: str | None = None
+    notes: str | None = None
+
+
+class ShowcaseCurve(BaseModel):
+    """谱曲线（可降采样）。"""
+
+    model_config = ConfigDict(strict=True)
+
+    spectrum_id: int
+    name: str | None = None
+    x: list[float] = Field(default_factory=list)
+    y: list[float] = Field(default_factory=list)
+    n_points: int = 0
+    n_full: int | None = None
+    downsampled: bool = False
+    lane: str | None = None
+    detail: str | None = None
+
+
+class ShowcaseImageItem(BaseModel):
+    """谱图附属图片（长图 / 分幅）。"""
+
+    model_config = ConfigDict(strict=True)
+
+    id: int | None = None
+    name: str
+    kind: str | None = None
+    mime: str | None = None
+    byte_size: int | None = None
+    rel_path: str | None = None
+    url: str | None = None
+    created_at: str | None = None
+
+
+class ShowcaseImageList(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    spectrum_id: int
+    items: list[ShowcaseImageItem] = Field(default_factory=list)
+    detail: str | None = None
+
+
+class ShowcaseFacets(BaseModel):
+    """筛选分面。"""
+
+    model_config = ConfigDict(strict=True)
+
+    statuses: list[dict[str, Any]] = Field(default_factory=list)
+    element_sets: list[dict[str, Any]] = Field(default_factory=list)
+    detail: str | None = None
+
+
+class ShowcaseGood3(BaseModel):
+    """Good3 / 质量排序结果。"""
+
+    model_config = ConfigDict(strict=True)
+
+    ok: bool = True
+    updated_at: str | None = None
+    weights: dict[str, float] = Field(default_factory=dict)
+    elements: list[str] = Field(default_factory=list)
+    items: list[ShowcaseSpectrumSummary] = Field(default_factory=list)
+    detail: str | None = None
+
+
+class ShowcaseJobAccepted(BaseModel):
+    """异步写任务受理。"""
+
+    model_config = ConfigDict(strict=True)
+
+    ok: bool = True
+    async_job: bool = True
+    job_id: str | None = None
+    spectrum_id: int | None = None
+    detail: str | None = None
+    raw: dict[str, Any] | None = None

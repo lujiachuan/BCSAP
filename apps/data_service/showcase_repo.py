@@ -104,31 +104,43 @@ def list_spectra(
     *,
     q: str | None = None,
     element_set: str | None = None,
+    status: str | None = None,
     limit: int = 100,
+    offset: int = 0,
 ) -> dict[str, Any]:
     limit = max(1, min(int(limit), 500))
-    sql = """
-        SELECT s.id, s.name, s.sample_name, s.element_set, s.status,
-               COALESCE(s.annotation_count, 0) AS annotation_count,
-               COALESCE(s.peak_count, 0) AS peak_count
-        FROM spectra s
-        WHERE 1=1
-    """
+    offset = max(0, int(offset))
+    where = " WHERE 1=1"
     params: list[Any] = []
     if q:
-        sql += """ AND (s.name ILIKE %s OR COALESCE(s.sample_name,'') ILIKE %s
+        where += """ AND (s.name ILIKE %s OR COALESCE(s.sample_name,'') ILIKE %s
                    OR COALESCE(s.element_set,'') ILIKE %s OR COALESCE(s.notes,'') ILIKE %s)"""
         kw = f"%{q.strip()}%"
         params.extend([kw, kw, kw, kw])
     if element_set:
-        sql += " AND COALESCE(s.element_set,'') ILIKE %s"
+        where += " AND COALESCE(s.element_set,'') ILIKE %s"
         params.append(f"%{element_set.strip()}%")
-    sql += " ORDER BY s.updated_at DESC NULLS LAST, s.id DESC LIMIT %s"
-    params.append(limit)
+    if status:
+        where += " AND COALESCE(s.status,'') = %s"
+        params.append(status.strip())
+
+    count_sql = f"SELECT COUNT(*) FROM spectra s{where}"
+    sql = f"""
+        SELECT s.id, s.name, s.sample_name, s.element_set, s.status,
+               COALESCE(s.annotation_count, 0) AS annotation_count,
+               COALESCE(s.peak_count, 0) AS peak_count
+        FROM spectra s
+        {where}
+        ORDER BY s.updated_at DESC NULLS LAST, s.id DESC
+        LIMIT %s OFFSET %s
+    """
+    list_params = list(params) + [limit, offset]
 
     with pg_conn() as conn:
         cur = conn.cursor()
-        cur.execute(sql, params)
+        cur.execute(count_sql, params)
+        total = int(cur.fetchone()[0])
+        cur.execute(sql, list_params)
         rows = _dicts(cur)
 
     items = []
@@ -149,7 +161,7 @@ def list_spectra(
         )
     return {
         "items": items,
-        "total": len(items),
+        "total": total,
         "detail": f"cluster_ms 只读 · DSN {ping().get('dsn_hint')}",
     }
 
