@@ -270,11 +270,14 @@ def list_spectrum_images(spectrum_id: int) -> ShowcaseImageList:
     if code >= 400 or not isinstance(payload, dict):
         _raise_upstream(code, payload)
     items: list[ShowcaseImageItem] = []
+    names_seen: set[str] = set()
     for row in payload.get("items") or []:
         if not isinstance(row, dict):
             continue
         # 把上游相对 URL 改写为 data_service 代理路径，便于桌面同源拉取
         name = str(row.get("name") or "")
+        if name:
+            names_seen.add(name)
         proxy_url = f"/api/v1/showcase/spectra/{spectrum_id}/images/{name}" if name else None
         items.append(
             ShowcaseImageItem(
@@ -286,6 +289,23 @@ def list_spectrum_images(spectrum_id: int) -> ShowcaseImageList:
                 rel_path=str(row["rel_path"]) if row.get("rel_path") else None,
                 url=proxy_url or (str(row["url"]) if row.get("url") else None),
                 created_at=str(row["created_at"]) if row.get("created_at") else None,
+            )
+        )
+    # peaks_*_long 常只在 annotate_data，不进 spectrum_images；用 Range 探活后补进目录
+    peaks_name = f"peaks_{spectrum_id}_long.png"
+    if peaks_name not in names_seen and upstream.proxy_exists(
+        f"/api/annotate/images/{spectrum_id}/{peaks_name}"
+    ):
+        items.append(
+            ShowcaseImageItem(
+                id=None,
+                name=peaks_name,
+                kind="peaks_long",
+                mime="image/png",
+                byte_size=None,
+                rel_path=None,
+                url=f"/api/v1/showcase/spectra/{spectrum_id}/images/{peaks_name}",
+                created_at=None,
             )
         )
     return ShowcaseImageList(spectrum_id=spectrum_id, items=items, detail="上游图片目录")

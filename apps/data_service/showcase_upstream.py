@@ -104,6 +104,22 @@ def proxy_bytes(
         return 502, msg.encode("utf-8"), "text/plain; charset=utf-8"
 
 
+def proxy_exists(path: str, *, timeout: float = 8.0) -> bool:
+    """轻量探活：Range 读 1 字节，避免把整张 peaks 长图拉进列表接口。"""
+    req = urllib.request.Request(
+        _url(path),
+        method="GET",
+        headers={"Range": "bytes=0-0", "Accept": "*/*"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return int(resp.status) in {200, 206}
+    except urllib.error.HTTPError as exc:
+        return int(exc.code) in {200, 206}
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def normalize_spectrum_row(row: dict[str, Any]) -> dict[str, Any]:
     """把上游列表行规范成 BCSAP ShowcaseSpectrumSummary 字段。"""
     sid = int(row.get("spectrum_id") or row.get("id") or 0)
