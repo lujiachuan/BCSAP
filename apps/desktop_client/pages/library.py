@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import html
 import json
 import math
@@ -12,7 +13,16 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QRectF, QSettings, QSize, QThread, QTimer, Qt, Signal
+from PySide6.QtCore import (
+    QRectF,
+    QSettings,
+    QSize,
+    QStandardPaths,
+    QThread,
+    QTimer,
+    Qt,
+    Signal,
+)
 from PySide6.QtGui import QColor, QKeyEvent, QPainter, QPen, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -1034,52 +1044,58 @@ class LibraryPage(QWidget):
 
         self._start(url, _ok, _err)
 
-    def _decode_pixmap(self, raw: bytes, max_w: int | None = None) -> QPixmap | None:
-        """用 Pillow 强制缩到安全宽度后再交给 Qt（原图像素过高会解码失败）。"""
+    @staticmethod
+    def _long_cache_dir() -> Path:
+        root = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.CacheLocation
+        )
+        path = Path(root or ".") / "bcsap_long_images"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @classmethod
+    def _long_cache_path(cls, url: str) -> Path:
+        digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:28]
+        return cls._long_cache_dir() / f"{digest}.jpg"
+
+    def _decode_pixmap(
+        self, raw: bytes, max_w: int | None = None, *, cache_path: Path | None = None
+    ) -> QPixmap | None:
+        """Pillow 缩放超高长图后再交给 Qt；成功则写入本地缓存，避免每次重下重解。"""
         import io
-        import os
-        import tempfile
+
+        if cache_path is not None and cache_path.is_file() and cache_path.stat().st_size > 1000:
+            pix = QPixmap(str(cache_path))
+            if not pix.isNull():
+                return pix
 
         max_w = min(int(max_w or _LONG_DECODE_MAX_W), _LONG_DECODE_MAX_W)
         max_w = max(800, max_w)
+        max_h = 10000
         try:
             from PIL import Image
 
+            Image.MAX_IMAGE_PIXELS = None  # 长图超限
             with Image.open(io.BytesIO(raw)) as im:
                 im = im.convert("RGB")
-                # 必须缩放：原图约 3300×23000，直接 QPixmap 会失败
                 target_w = min(max_w, im.width)
-                if im.width != target_w or im.height > 18000:
-                    nh = max(1, int(im.height * (target_w / float(im.width))))
-                    im = im.resize((target_w, nh), Image.Resampling.LANCZOS)
-                fd, path = tempfile.mkstemp(prefix="bcsap_long_", suffix=".jpg")
-                os.close(fd)
-                try:
-                    # JPEG 中间文件更小，Qt 加载更稳
-                    im.save(path, "JPEG", quality=92, optimize=True)
-                    pix = QPixmap(path)
-                    if not pix.isNull():
-                        return pix
-                finally:
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-                # PNG 回退
-                fd, path = tempfile.mkstemp(prefix="bcsap_long_", suffix=".png")
-                os.close(fd)
-                try:
-                    im.save(path, "PNG", optimize=False)
-                    pix = QPixmap(path)
-                    if not pix.isNull():
-                        return pix
-                finally:
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-        except Exception:
-            pass
+                nh = max(1, int(im.height * (target_w / float(im.width))))
+                if nh > max_h:
+                    scale = max_h / float(nh)
+                    target_w = max(400, int(target_w * scale))
+                    nh = max_h
+                if im.size != (target_w, nh):
+                    # 超大图用 BILINEAR，比 LANCZOS 稳且快
+                    im = im.resize((target_w, nh), Image.Resampling.BILINEAR)
+                out = cache_path or (self._long_cache_dir() / "_tmp_decode.jpg")
+                im.save(str(out), "JPEG", quality=88, optimize=True)
+                pix = QPixmap(str(out))
+                if not pix.isNull():
+                    return pix
+        except Exception as exc:  # noqa: BLE001
+            self._last_decode_error = f"{type(exc).__name__}: {exc}"
+            return None
+        self._last_decode_error = "Qt 无法加载缩放后的 JPEG"
         return None
 
     def _fetch_pixmap(
@@ -1092,6 +1108,15 @@ class LibraryPage(QWidget):
     ) -> None:
         view = self._long_viewer(which)
         tip = "峰值长图" if mode == "peaks" else "标注长图"
+        cache_path = self._long_cache_path(url)
+        # 本地缓存命中：不再从上游拉
+        if cache_path.is_file() and cache_path.stat().st_size > 1000:
+            pix = QPixmap(str(cache_path))
+            if not pix.isNull():
+                self._show_image_loading(which=which, on=False)
+                view.set_pixmap(pix)
+                return
+
         self._show_image_loading(
             which=which, on=True, message=f"正在下载高清{tip}…"
         )
@@ -1118,10 +1143,14 @@ class LibraryPage(QWidget):
             self._show_image_loading(
                 which=which, on=True, message=f"正在解码{tip}…"
             )
-            pix = self._decode_pixmap(bytes(payload), _LONG_DECODE_MAX_W)
+            self._last_decode_error = ""
+            pix = self._decode_pixmap(
+                bytes(payload), _LONG_DECODE_MAX_W, cache_path=cache_path
+            )
             self._show_image_loading(which=which, on=False)
             if pix is None or pix.isNull():
-                view.set_placeholder("解码失败，请确认已安装 Pillow")
+                err = getattr(self, "_last_decode_error", "") or "未知原因"
+                view.set_placeholder(f"解码失败：{err}")
                 return
             view.set_pixmap(pix)
 

@@ -124,6 +124,19 @@ QPushButton#primaryButton:hover { background: $accentSolidHover; border-color: $
 QPushButton#primaryButton:pressed { background: $accentSolidHover; }
 QPushButton#primaryButton:disabled { color: $disabledText; background: $disabledBg;
                                      border-color: $disabledBg; }
+/* 谱图库步骤条：选中更深 */
+QPushButton#stepChip {
+    min-height: 34px; padding: 0 16px; background: $buttonBg; color: $muted;
+    border: 1px solid $buttonBorder; border-radius: ${radiusControl}px; font-weight: 500;
+}
+QPushButton#stepChip:hover { background: $navHover; color: $textBase; border-color: $accent; }
+QPushButton#stepChip:checked {
+    background: $navSelectedBg; color: $navSelectedText;
+    border: 1px solid $accentSolidHover; font-weight: 700;
+}
+QPushButton#stepChip:checked:hover {
+    background: $accentSolidHover; color: $onAccent;
+}
 QPushButton#dangerButton { color: $dangerText; }
 QPushButton#dangerButton:hover { background: $dangerBg; border-color: $dangerText; }
 QPushButton#inlineRetry { min-height: 22px; max-height: 22px; padding: 0 8px;
