@@ -49,7 +49,9 @@ from PySide6.QtWidgets import (
 )
 
 # Qt 加载超高 PNG 会失败；Pillow 先缩到此宽度再显示（可再放大查看）
-_LONG_DECODE_MAX_W = 2800
+# 提高宽度减轻「糊」；缓存文件名带版本以免沿用旧糊图
+_LONG_DECODE_MAX_W = 3600
+_LONG_CACHE_TAG = "v3w3600"
 
 from apps.desktop_client.pages.common import page_layout, primary_button
 from apps.desktop_client.pages.registry import PageSpec
@@ -204,9 +206,13 @@ class _LongImageView(QWidget):
         tools = QHBoxLayout()
         self._btn_fit = QPushButton("适应宽度")
         self._btn_fit.clicked.connect(self.fit_width)
-        self._btn_zoom_out = QPushButton("缩小")
+        self._btn_zoom_out = QPushButton("−")
+        self._btn_zoom_out.setFixedWidth(36)
+        self._btn_zoom_out.setToolTip("缩小")
         self._btn_zoom_out.clicked.connect(lambda: self.nudge_zoom(1 / 1.25))
-        self._btn_zoom_in = QPushButton("放大")
+        self._btn_zoom_in = QPushButton("+")
+        self._btn_zoom_in.setFixedWidth(36)
+        self._btn_zoom_in.setToolTip("放大")
         self._btn_zoom_in.clicked.connect(lambda: self.nudge_zoom(1.25))
         self._btn_100 = QPushButton("100%")
         self._btn_100.clicked.connect(self.zoom_native)
@@ -332,10 +338,16 @@ class _LongImageView(QWidget):
             return
         w = max(1, int(self._source.width() * self._zoom))
         h = max(1, int(self._source.height() * self._zoom))
+        # 放大用快速变换更锐；缩小再用平滑
+        xform = (
+            Qt.TransformationMode.FastTransformation
+            if self._zoom >= 0.98
+            else Qt.TransformationMode.SmoothTransformation
+        )
         scaled = self._source.scaled(
             QSize(w, h),
             Qt.AspectRatioMode.IgnoreAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+            xform,
         )
         self._label.setPixmap(scaled)
         self._label.setText("")
@@ -1056,7 +1068,7 @@ class LibraryPage(QWidget):
     @classmethod
     def _long_cache_path(cls, url: str) -> Path:
         digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:28]
-        return cls._long_cache_dir() / f"{digest}.jpg"
+        return cls._long_cache_dir() / f"{digest}_{_LONG_CACHE_TAG}.jpg"
 
     def _decode_pixmap(
         self, raw: bytes, max_w: int | None = None, *, cache_path: Path | None = None
@@ -1071,24 +1083,26 @@ class LibraryPage(QWidget):
 
         max_w = min(int(max_w or _LONG_DECODE_MAX_W), _LONG_DECODE_MAX_W)
         max_w = max(800, max_w)
-        max_h = 10000
+        max_h = 16000
         try:
             from PIL import Image
 
             Image.MAX_IMAGE_PIXELS = None  # 长图超限
             with Image.open(io.BytesIO(raw)) as im:
                 im = im.convert("RGB")
+                # 原图不超宽则尽量保留全宽，避免二次缩糊
                 target_w = min(max_w, im.width)
                 nh = max(1, int(im.height * (target_w / float(im.width))))
                 if nh > max_h:
                     scale = max_h / float(nh)
-                    target_w = max(400, int(target_w * scale))
+                    target_w = max(800, int(target_w * scale))
                     nh = max_h
                 if im.size != (target_w, nh):
-                    # 超大图用 BILINEAR，比 LANCZOS 稳且快
-                    im = im.resize((target_w, nh), Image.Resampling.BILINEAR)
-                out = cache_path or (self._long_cache_dir() / "_tmp_decode.jpg")
-                im.save(str(out), "JPEG", quality=88, optimize=True)
+                    im = im.resize((target_w, nh), Image.Resampling.LANCZOS)
+                out = cache_path or (
+                    self._long_cache_dir() / f"_tmp_decode_{_LONG_CACHE_TAG}.jpg"
+                )
+                im.save(str(out), "JPEG", quality=95, optimize=True)
                 pix = QPixmap(str(out))
                 if not pix.isNull():
                     return pix

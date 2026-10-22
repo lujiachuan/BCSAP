@@ -182,65 +182,119 @@ def good3_spectra(element: str | None = Query(default=None)) -> ShowcaseGood3:
     )
 
 
+def _peaks_from_upstream_payload(payload: dict[str, Any]) -> list[ShowcasePeakAnnotation]:
+    """上游 peaks 多为 {x,height}；分子式在 annotations。优先 annotations。"""
+    out: list[ShowcasePeakAnnotation] = []
+    ann_rows = list(payload.get("annotations") or [])
+    peak_rows = list(payload.get("peaks") or [])
+    source = ann_rows if ann_rows else peak_rows
+    for p in source[:800]:
+        if not isinstance(p, dict):
+            continue
+        mass = p.get("peak_mass")
+        if mass is None:
+            mass = p.get("mass")
+        if mass is None:
+            mass = p.get("x")
+        if mass is None:
+            continue
+        # annotations 常有多候选；默认只要 rank=1（与本地 working 一致）
+        if ann_rows and int(p.get("rank_in_peak") or 1) != 1:
+            continue
+        intensity = p.get("intensity")
+        if intensity is None:
+            intensity = p.get("peak_height")
+        if intensity is None:
+            intensity = p.get("height")
+        out.append(
+            ShowcasePeakAnnotation(
+                peak_mass=float(mass),
+                formula=p.get("formula"),
+                err=None if p.get("err") is None else float(p["err"]),
+                rank_in_peak=int(p.get("rank_in_peak") or 1),
+                intensity=None if intensity is None else float(intensity),
+            )
+        )
+    return out
+
+
 @router.get("/spectra/{spectrum_id}", response_model=ShowcaseSpectrumMeta)
 def get_spectrum_meta(spectrum_id: int) -> ShowcaseSpectrumMeta:
     try:
         raw = showcase_repo.get_spectrum_meta(spectrum_id)
     except Exception:
         raw = None
-    if raw is None:
+
+    local_peaks = [
+        ShowcasePeakAnnotation(**p) for p in (raw.get("peaks") or [])
+    ] if isinstance(raw, dict) else []
+
+    # 本地 working 峰表为空时（长图有标注、库表未同步），补上游 annotations
+    need_upstream = raw is None or not local_peaks
+    upstream_peaks: list[ShowcasePeakAnnotation] = []
+    upstream_payload: dict[str, Any] | None = None
+    if need_upstream:
         code, payload = upstream.proxy_json("GET", f"/api/spectra/{spectrum_id}")
-        if code >= 400 or not isinstance(payload, dict):
-            _raise_upstream(code if code >= 400 else 404, payload)
-        # 上游详情字段与 meta 不完全一致：尽量映射
+        if code < 400 and isinstance(payload, dict):
+            upstream_payload = payload
+            upstream_peaks = _peaks_from_upstream_payload(payload)
+
+    if raw is None:
+        if upstream_payload is None:
+            _raise_upstream(404, {"detail": "谱图不存在"})
         from .showcase_repo import _metal_from_element_set, isotope_class
 
-        el = payload.get("element_set")
+        el = upstream_payload.get("element_set")
         metal = _metal_from_element_set(str(el) if el else None)
-        peaks_raw = payload.get("peaks") or []
-        peaks = []
-        for p in peaks_raw[:800]:
-            if not isinstance(p, dict):
-                continue
-            mass = p.get("peak_mass") if p.get("peak_mass") is not None else p.get("mass")
-            if mass is None:
-                continue
-            peaks.append(
-                ShowcasePeakAnnotation(
-                    peak_mass=float(mass),
-                    formula=p.get("formula"),
-                    err=None if p.get("err") is None else float(p["err"]),
-                    rank_in_peak=int(p.get("rank_in_peak") or 1),
-                    intensity=(
-                        None
-                        if p.get("intensity") is None and p.get("peak_height") is None
-                        else float(p.get("intensity") or p.get("peak_height"))
-                    ),
-                )
-            )
         return ShowcaseSpectrumMeta(
-            spectrum_id=int(payload.get("id") or spectrum_id),
-            name=str(payload.get("name") or ""),
+            spectrum_id=int(upstream_payload.get("id") or spectrum_id),
+            name=str(upstream_payload.get("name") or ""),
             metal=metal,
-            sample_name=payload.get("sample_name"),
+            sample_name=upstream_payload.get("sample_name"),
             element_set=el if isinstance(el, str) else None,
-            status=payload.get("status"),
+            status=upstream_payload.get("status"),
             isotope_class=isotope_class(metal),
-            peaks=peaks,
-            power=str(payload["power"]) if payload.get("power") not in (None, "") else None,
-            ar_flow=str(payload["ar_flow"]) if payload.get("ar_flow") not in (None, "") else None,
-            he_flow=str(payload["he_flow"]) if payload.get("he_flow") not in (None, "") else None,
-            pressure=str(payload["pressure"]) if payload.get("pressure") not in (None, "") else None,
-            condensation_distance=(
-                str(payload["condensation_distance"])
-                if payload.get("condensation_distance") not in (None, "")
+            peaks=upstream_peaks,
+            power=(
+                str(upstream_payload["power"])
+                if upstream_payload.get("power") not in (None, "")
                 else None
             ),
-            notes=str(payload["notes"]) if payload.get("notes") not in (None, "") else None,
-            detail="上游详情",
+            ar_flow=(
+                str(upstream_payload["ar_flow"])
+                if upstream_payload.get("ar_flow") not in (None, "")
+                else None
+            ),
+            he_flow=(
+                str(upstream_payload["he_flow"])
+                if upstream_payload.get("he_flow") not in (None, "")
+                else None
+            ),
+            pressure=(
+                str(upstream_payload["pressure"])
+                if upstream_payload.get("pressure") not in (None, "")
+                else None
+            ),
+            condensation_distance=(
+                str(upstream_payload["condensation_distance"])
+                if upstream_payload.get("condensation_distance") not in (None, "")
+                else None
+            ),
+            notes=(
+                str(upstream_payload["notes"])
+                if upstream_payload.get("notes") not in (None, "")
+                else None
+            ),
+            detail=f"上游详情 · 标注 {len(upstream_peaks)} 条",
         )
-    peaks = [ShowcasePeakAnnotation(**p) for p in raw.get("peaks") or []]
+
+    peaks = local_peaks or upstream_peaks
     body = {k: v for k, v in raw.items() if k != "peaks"}
+    if upstream_peaks and not local_peaks:
+        body["detail"] = (
+            f"{body.get('detail') or '本地元数据'} · 峰表补自上游 annotations "
+            f"({len(upstream_peaks)})"
+        )
     return ShowcaseSpectrumMeta(**body, peaks=peaks)
 
 
