@@ -30,8 +30,8 @@ LIGHT = {
     "gridColor": "#e5ebef",
     "tableAltBg": "#f7f9fb",
     "tableHoverBg": "#eef4fa",
-    "tableSelectionBg": "#e5f2f7",
-    "tableSelectionText": "#1b2731",
+    "tableSelectionBg": "#c5ddf5",
+    "tableSelectionText": "#0d2f52",
 
     # ---- 文本 ---- 
     "textBase": "#17212b",
@@ -44,11 +44,12 @@ LIGHT = {
     "sidebarBg": "#f2f5f9",
     "sidebarBorder": "#d8dfe8",
     "headBorder": "#e1e7ee",
-    "navHover": "#e5ecf3",
+    "navHover": "#d5e3f2",
     "navText": "#3e4c5a",
     "navMuted": "#5f7185",
-    "navSelectedBg": "#e3f0fc",
-    "navSelectedText": "#0b5ca4",
+    # 选中态加深，避免侧栏/步骤看起来「几乎没选中」
+    "navSelectedBg": "#2f7fd4",
+    "navSelectedText": "#ffffff",
     "iconBtnHover": "#e0e8f0",
     "iconDefault": "#5d7083",
 

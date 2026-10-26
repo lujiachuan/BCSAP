@@ -2,31 +2,33 @@
 
 面向实验室质谱数据管理与离子光学控制的一体化平台。项目用同一个桌面客户端承载样品管理、手动控制、扫谱、自动调束、谱图库检索与谱图分析，并通过独立的仪器执行服务隔离硬件控制，通过共享数据服务统一管理实验记录。
 
-> 当前版本为 `0.1.0`。**控制链路已闭环**：桌面客户端 → 仪器执行服务 → 真实 EPICS Channel Access → IOC，手动控制、扫谱、自动调束都走服务端执行层（设备组锁、参数边界、本地暂存、重启恢复均已落地）；**数据链路仍为演示阶段**：data_service 返回内存演示目录，PostgreSQL、用户权限、中央归档与上传补传尚未接入。无真实 IOC 时可起仓库 `sim/` 下的本地模拟 IOC 走通全链路（150 个 PV，与实机台账一一对应）。
+> 当前版本为 `0.1.0`。**控制链路已闭环**：桌面客户端 → 仪器执行服务 → 真实 EPICS Channel Access → IOC，手动控制、扫谱、自动调束都走服务端执行层（设备组锁、参数边界、本地暂存、重启恢复均已落地）；**数据链路分两块**：团簇谱 Showcase / 谱图库已对标现网六步工作流（经 `data_service` 读 PG 或代理上游 `SHOWCASE_UPSTREAM`，默认 `http://172.16.12.143:8787`；写路径标注/峰确认/校正/Good3/交付代理 `web_manager`，长图按现网规则在服务器生成），其余数据面（BCSAP 自有 PostgreSQL/Alembic、用户权限、中央归档与上传补传）仍待建设。无真实 IOC 时可起仓库 `sim/` 下的本地模拟 IOC 走通全链路（150 个 PV，与实机台账一一对应）。
 
 ## 1. 当前能力
 
 ### 已实现
 
+- **Showcase / 谱图库（数据服务）**：`/api/v1/showcase/status|facets|spectra|rank|good3|{id}|curve|images`；写接口 `annotate` / `peaks/confirm` / `correct/*` / `good3/refresh` / `export/pack` 代理上游 `SHOWCASE_UPSTREAM`。桌面「谱图库」为六步 UI（身份→筛选→峰值→校正→分析→交付），含曲线与长图。
 - 基于 PySide6 的统一桌面客户端：浅/深主题、侧栏收起、页面动画、窗口偏好保存、进行中任务退出保护、Esc 安全停止。
 - **手动控制页**：一页三列、一行一设备，设定/回读/开关/脉冲合并展示；实时束流趋势（30s/2min/10min/30min）；滚轮调值不自动下发；全部关断走服务端批量事务；卡片布局可持久化。
 - **扫谱（服务端驱动）**：执行服务逐点执行「写设定 → 等回读稳定 → 采探测信号 → 落盘」，界面只轮询状态与增量点；x 轴取设备**实际回读值**；质量不合格点标注并排除；安全停止后按统一策略成组回落；SQLite + NPZ 本地暂存（SHA-256）。
-- **自动调束（建议 → 人工确认）**：`packages/optimizer` 的 GP + EI 贝叶斯优化器只提候选，人工确认后由执行层校验（边界/单步/速率）再写设备，逐轮记录建议值/下发值/回读值/目标测量；含目标与变量白名单、束线拓扑、启动前快照、束流丢失回退、两阶段策略（逐参数 → 联合微调）与三种收尾动作（应用最优/恢复初始/回安全值）。
+- **自动调束（建议 → 人工确认）**：`packages/optimizer` 的 GP + EI 贝叶斯优化器只提候选，人工确认后由执行层校验（边界/单步/速率）再写设备，逐轮记录建议值/下发值/回读值/目标测量；含目标与变量白名单、束线拓扑、启动前快照、束流丢失回退、单阶段/分阶段策略（分阶段时可逐阶段配置变量组与轮次预算）与三种收尾动作（应用最优/恢复初始/回安全值）。
 - **真实 EPICS 通道访问**：执行服务固定调用现场 EPICS `caget/caput`；每次请求使用独立进程，不持有可能卡死的 CA 长连接，失败原因写入 PV 健康明细。
 - **受控 PV 映射**：业务信号 → PV 的唯一配置源，执行服务持有并校验，客户端经 `/control/v1/pv-mapping` 读写；设置页可增删改、逐行 caget 检测（连接/当前值）、关键字查找与筛选；保存即热更新；条目骤减需显式确认；配置损坏时进入只读保护并保留 `.bak`。
 - **写入执行层**：所有写路径统一经过边界（min/max）、最大单步、变化速率、斜坡规划与 `command_id` 幂等校验；支持单点、成组原子写入、磁铁成组回落。
 - **设备组锁与重启恢复**：按真实共享资源分组，扫谱/调束/成组写/回落互斥；服务重启后扫描本地暂存中的非终态任务，重新占用设备组并要求人工确认（`/control/v1/recovery`）。
 - **全局只读部署**：`SPECTRUM_READ_ONLY=1` 启动时整台服务拒绝一切写入，客户端压住手动/扫谱/调束/设置页的写入入口。
 - **客户端监督器**：打包交付后客户端启动自动探测并拉起同目录分发的仪器执行服务（检索电脑无服务 exe 时自动跳过）。
-- **中央数据演示同步**：data_service 提供 `manifest/changes/谱图内容` 演示端点；客户端以 SQLite 目录 + NPZ 谱图增量镜像到本地缓存目录。
+- **中央数据同步**：data_service 提供 `manifest/changes/谱图内容` 演示端点与 Showcase 只读/写代理；客户端以 SQLite 目录 + NPZ 谱图增量镜像到本地缓存目录。
 - **测试护栏**：`tests/conftest.py` 拦截一切指向本机开发服务（8765/8767/8000）的写类请求，防止测试污染现场配置或设备。
 
 ### 尚未实现
 
-- PostgreSQL 数据模型、Alembic 迁移与数据服务正式 API（`/api/v1` 目前只有健康与演示同步端点）。
+- **BCSAP 自有** PostgreSQL 数据模型与 Alembic 迁移（把 `cluster_ms` 正式纳入本仓迁移体系）；现有 `/api/v1` 是健康、演示同步与 Showcase 代理，尚无自有的样品/实验/谱图表。
+- 将 `web_manager` 算法 vendoring 进 `packages/spectrum`（当前写路径仍代理上游）。
 - 本地暂存 → 中央服务器的可靠上传、断线续传与幂等归档（`scan_runs.upload_state` 已就位，上传实现未开始）。
 - LabVIEW/MSScan 采集链路接入：帧协议、批次标识、完成判据与唯一事实数据源规则已冻结在 `docs/LabVIEW数据链路协议冻结.md`，**开工前需现场回答该文档 §10 的 7 个问题**。
-- 样品管理、谱图库、谱图分析、任务与同步页面（已保留导航入口，当前为占位页）。
+- 样品管理、任务与同步页面（已保留导航入口，当前为占位页）；谱图分析页的多谱对比增强。
 - 登录、角色权限、审计日志与生产环境鉴权。
 - 正式安装包（Inno Setup）、代码签名、Windows 服务化与自动升级。
 
@@ -112,7 +114,7 @@ packages/domain、contracts、spectrum、epics_adapter、optimizer
   → 人工确认（第一版只开放 confirm 模式）
   → 执行层校验边界/单步/速率 → 写设备 → 等读回稳定 → 测目标
   → 逐轮记录候选值/下发值/回读值/目标/质量/算法版本/随机种子
-  → 束流丢失回退（可选）与两阶段策略（逐参数 → 联合微调）
+  → 束流丢失回退（可选）；分阶段策略按阶段切换变量组（单阶段=全部联合）
   → 结束后三种处置：应用最优 / 恢复启动前 / 回安全值（confirm=true）
 ```
 
@@ -135,6 +137,11 @@ packages/domain、contracts、spectrum、epics_adapter、optimizer
 │  │  ├─ trend_buffer.py         # 手动控制页束流趋势环形缓冲
 │  │  ├─ tuning_config.py        # 调束配置持久化
 │  │  ├─ tuning_analysis.py      # 调束结果分析（单变量响应曲线等）
+│  │  ├─ manual_library.py       # 手动控制页卡片与控件库（一行一设备）
+│  │  ├─ manual_dashboard_api.py # 手动控制页总览（服务端聚合的只读接口）
+│  │  ├─ science_canvas.py       # Matplotlib 科研风画布（响应面、收敛图）
+│  │  ├─ plot_style.py           # 图表统一风格与配色令牌
+│  │  ├─ components/             # 复用组件（紧凑表单等）
 │  │  ├─ spectrum_plot.py        # 谱图/收敛曲线实时绘图控件
 │  │  ├─ theme.py / ui_tokens.py # 浅/深色设计令牌与 QSS 应用
 │  │  ├─ surfaces.py / widgets.py# 自绘背景画布、玻璃卡片与复用控件
@@ -150,8 +157,8 @@ packages/domain、contracts、spectrum、epics_adapter、optimizer
 │  │     ├─ tuning.py            # 自动调束（建议→确认→执行、结果与日志）
 │  │     ├─ settings.py          # 系统设置（服务连接、PV 映射、日志、外观）
 │  │     ├─ samples.py           # 样品管理占位页
-│  │     ├─ library.py           # 谱图库占位页
-│  │     ├─ analysis.py          # 谱图分析占位页
+│  │     ├─ library.py           # 谱图库六步（身份→筛选→峰值→校正→分析→交付）
+│  │     ├─ analysis.py          # 谱图分析（按 ID 只读摘要）
 │  │     └─ sync.py              # 任务与同步占位页
 │  ├─ instrument_service/        # 仅部署在授权操作电脑的控制服务
 │  │  ├─ app.py                  # FastAPI 应用与 /control/v1 全部端点
@@ -170,14 +177,19 @@ packages/domain、contracts、spectrum、epics_adapter、optimizer
 │  │  ├─ retract.py              # 磁铁成组回落（写速率→写电流→等回读到位）
 │  │  └─ __init__.py
 │  ├─ data_service/              # 面向多客户端的共享数据服务
-│  │  ├─ app.py                  # FastAPI 应用（健康 + 演示同步端点）
+│  │  ├─ app.py                  # FastAPI 应用（健康 + 演示同步 + Showcase 端点）
 │  │  ├─ main.py                 # Uvicorn 启动入口（127.0.0.1:8000）
-│  │  └─ sync_catalog.py         # 模拟阶段的演示同步目录（后续由数据库替换）
+│  │  ├─ sync_catalog.py         # 模拟阶段的演示同步目录（后续由数据库替换）
+│  │  ├─ showcase_api.py         # /api/v1/showcase 只读接口与写路径代理
+│  │  ├─ showcase_repo.py        # Showcase 数据访问（PG 直读 / 上游回落）
+│  │  ├─ showcase_upstream.py    # web_manager 上游代理（标注/峰确认/校正/交付）
+│  │  └─ pg.py                   # PostgreSQL 连接与查询助手
 │  └─ __init__.py
 ├─ packages/                     # 跨应用复用、与具体进程解耦的核心包
 │  ├─ contracts/                 # Pydantic 跨进程 DTO 契约
 │  │  ├─ health.py / initialization.py / pv_mapping.py
 │  │  ├─ scan.py / signals.py / tuning.py
+│  │  ├─ showcase.py             # Showcase 谱图/标注/Good3 契约
 │  │  └─ __init__.py             # 对外导出公共契约
 │  ├─ domain/
 │  │  ├─ scan.py                 # 扫描状态机与合法转换校验
@@ -270,9 +282,9 @@ packages/domain、contracts、spectrum、epics_adapter、optimizer
 | 手动控制 | 一页三列、一行一设备：设定（滚轮调值、点「下发」才写）、回读、开关、脉冲；FC1/FC2 实时读数与束流趋势；全部关断（二次确认、服务端批量）；卡片布局可拖拽/折叠/持久化；重启恢复确认入口 |
 | 样品管理 | 已保留导航入口，目前为占位页 |
 | 扫谱 | 选择轴（单路/磁铁成组同步）与探测器、范围/步长/驻留时间，提交执行服务；实时曲线、进度、质量标注；安全停止与自动回落；现场快照 + 谱图导出（JSON/TXT） |
-| 自动调束 | 目标与变量白名单（来自服务端目录）、两阶段策略、启动前快照与束流丢失回退、逐轮建议/确认/执行、响应曲线与日志、三种收尾动作 |
-| 谱图库 | 已保留导航入口，目前为占位页 |
-| 谱图分析 | 已保留导航入口，目前为占位页 |
+| 自动调束 | 目标与变量白名单（来自服务端目录）、单阶段/分阶段策略、启动前快照与束流丢失回退、逐轮建议/确认/执行、响应曲线与日志、三种收尾动作 |
+| 谱图库 | 六步工作流（身份→筛选→峰值→校正→分析→交付）：队列/Good3/曲线/长图/校正代理/交付，数据来自 data_service 的 Showcase 代理 |
+| 谱图分析 | 按谱图 ID 取只读摘要；完整流程见谱图库 |
 | 任务与同步 | 已保留导航入口，目前为占位页 |
 | 系统设置 | 服务连接（数据/仪器地址、本地数据目录）、PV 映射增删改（连接/当前值检测、关键字查找、只看筛选、骤减确认、保存自动重测）、日志等级、外观与偏好 |
 
@@ -394,6 +406,8 @@ spectrum-client
 | `SPECTRUM_PV_MAPPING` | PV 映射 JSON 文件路径 | 默认 `%APPDATA%\SpectrumPlatform\pv_mapping.json`；映射损坏时服务进入只读保护，不静默使用默认配置 |
 | `SPECTRUM_CLIENT_CACHE` | 客户端中央数据本地镜像目录 | 默认 `%LOCALAPPDATA%\SpectrumPlatform\client_cache`；也可在设置页配置或 `QSettings` 键 `sync/cacheRoot` |
 | `EPICS_BASE` / `EPICS_HOST_ARCH` | 定位 `caget/caput` | 命令不在系统 `PATH` 时，执行服务会从 `EPICS_BASE/bin/$EPICS_HOST_ARCH` 及 `EPICS_BASE/bin` 下的架构子目录查找 |
+| `SHOWCASE_UPSTREAM` | 谱图库写/曲线/图片/Good3 上游 | data_service 代理的 `web_manager` 根地址，默认 `http://172.16.12.143:8787`。桌面客户端只访问 data_service，不直连该端口 |
+| `SPECTRUM_PG_DSN` / `MS_PG_DSN` | PostgreSQL DSN | 可选；本机有 `cluster_ms` 时用于 Showcase 详情/标注直读，否则经 data_service 回落上游 |
 
 只读部署长这样（端口与在线实例分开，便于同时在线的联调实例不受影响）：
 
@@ -494,9 +508,9 @@ $env:SPECTRUM_READ_ONLY = "1"
 建议按可验证的纵向闭环推进：
 
 1. **LabVIEW/MSScan 采集链路**：现场回答 `docs/LabVIEW数据链路协议冻结.md` §10 的 7 个问题后，实现接收器（帧协议、批次标识、完成判据、唯一事实数据源、DRAINING/FINALIZING 收尾、完整性指标），并通过该文档 §8 的验收清单。
-2. **PostgreSQL 与数据 API**：建立数据模型与 Alembic 迁移，实现样品/实验/谱图/上传会话等 `/api/v1` 接口。
+2. **PostgreSQL 与数据 API**：建立 **BCSAP 自有**的数据模型与 Alembic 迁移（把 `cluster_ms` 纳入本仓迁移体系），实现样品/实验/谱图/上传会话等 `/api/v1` 接口；Showcase 写路径当前仍代理上游 `web_manager`，算法包 vendoring 进 `packages/spectrum` 后收归自有。
 3. **可靠上传**：操作电脑本地暂存 → 中央归档的幂等上传、断线续传与 outbox 顺序补传。
-4. **补齐页面**：样品管理、谱图库、谱图分析与任务同步页面。
+4. **补齐页面**：样品管理、任务与同步页面；谱图分析补多谱对比。
 5. **权限与审计**：用户/角色/令牌、执行服务操作授权验证、审计日志。
 6. **打包与运维**：Inno 安装包、代码签名、Windows 服务化、备份恢复与升级回退。
 7. **开放高级控制**：连续自动调束与扫谱暂停需另行通过现场安全评审。

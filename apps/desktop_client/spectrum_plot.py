@@ -107,6 +107,12 @@ class SpectrumPlot(QWidget):
         )
         self.refresh_theme()
 
+    def set_axis_labels(self, x_label: str, y_label: str | None = None) -> None:
+        """切换横/纵轴标题（筛选步：电流 ↔ 质量）。"""
+        self.view.setLabel("bottom", x_label)
+        if y_label is not None:
+            self.view.setLabel("left", y_label)
+
     def set_data(
         self,
         x: Sequence[float],

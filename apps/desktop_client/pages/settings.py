@@ -418,7 +418,11 @@ class SystemSettingsPage(QWidget):
         form.addRow("数据服务地址", self.data_url)
         form.addRow("仪器执行地址", self.instrument_url)
         panel.body.addLayout(form)
-        hint = QLabel("开发基线：数据服务 127.0.0.1:8000，仪器执行 127.0.0.1:8765。")
+        hint = QLabel(
+            "开发基线：数据服务 127.0.0.1:8000，仪器执行 127.0.0.1:8765。"
+            " 谱图库写路径由 data_service 代理上游 showcase（环境变量 SHOWCASE_UPSTREAM，"
+            "默认 http://172.16.12.143:8787）。"
+        )
         hint.setWordWrap(True)
         panel.body.addWidget(hint)
         layout.addWidget(panel)

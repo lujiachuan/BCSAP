@@ -32,6 +32,26 @@ from apps.instrument_service.pv_mapping import default_config
 from packages.spectrum import encode_spectrum, spectrum_checksum
 
 
+def _route_paths(app) -> set[str]:
+    """收集应用注册的全部路由路径。
+
+    Starlette 1.x 起 `include_router` 挂的是 `_IncludedRouter` 包装对象（自身没有
+    `.path`），真实路由在它的 `original_router` 里、前缀在 `include_context.prefix`。
+    按版本差异直接取 `route.path` 会让"路由存在性"这类守门用例假失败。
+    """
+    paths: set[str] = set()
+    for route in app.routes:
+        path = getattr(route, "path", None)
+        if path:
+            paths.add(path)
+        inner = getattr(route, "original_router", None)
+        if inner is None:
+            continue
+        prefix = getattr(getattr(route, "include_context", None), "prefix", "") or ""
+        paths.update(prefix + child for child in _route_paths(inner))
+    return paths
+
+
 class InitializationApiTests(unittest.TestCase):
     def test_instrument_service_reports_all_controlled_pvs(self) -> None:
         config = default_config()
@@ -72,8 +92,8 @@ class InitializationApiTests(unittest.TestCase):
             self.assertEqual(metadata["sha256"], spectrum_checksum(content))
 
     def test_apps_expose_initialization_routes(self) -> None:
-        data_paths = {route.path for route in create_data_app().routes}
-        instrument_paths = {route.path for route in create_instrument_app().routes}
+        data_paths = _route_paths(create_data_app())
+        instrument_paths = _route_paths(create_instrument_app())
 
         self.assertIn("/api/v1/sync/manifest", data_paths)
         self.assertIn("/api/v1/sync/changes", data_paths)

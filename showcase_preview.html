@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>Showcase 预览（cluster_ms）</title>
+<style>
+body{font:14px/1.45 system-ui,sans-serif;margin:24px;max-width:960px;color:#1a1a1a}
+h1{font-size:20px;margin:0 0 8px}
+.muted{color:#666;margin-bottom:16px}
+input,button{font:inherit;padding:6px 10px}
+button{cursor:pointer}
+table{border-collapse:collapse;width:100%;margin-top:12px}
+th,td{border:1px solid #ddd;padding:6px 8px;text-align:left}
+th{background:#f5f5f5}
+#meta{white-space:pre-wrap;background:#f8f8f8;padding:12px;border-radius:6px;margin-top:12px}
+.err{color:#b00020}
+</style>
+</head>
+<body>
+<h1>Showcase 只读预览</h1>
+<p class="muted">读 <code>http://127.0.0.1:8000/api/v1/showcase/*</code> → 本机 <code>cluster_ms</code></p>
+<p id="status">加载状态…</p>
+<p>
+  <input id="q" placeholder="关键字，如 Ag / Mo" value="Ag"/>
+  <button id="btn">查列表</button>
+</p>
+<table>
+  <thead><tr><th>ID</th><th>名称</th><th>金属</th><th>同位素类</th><th>标注数</th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<div id="meta"></div>
+<script>
+const base = 'http://127.0.0.1:8000/api/v1/showcase';
+async function loadStatus(){
+  const r = await fetch(base + '/status');
+  const j = await r.json();
+  document.getElementById('status').textContent =
+    `状态: ${j.status} · ${j.detail || ''} · n_spectra=${j.n_spectra}`;
+}
+async function loadList(){
+  const q = document.getElementById('q').value.trim();
+  const r = await fetch(base + '/spectra?limit=20' + (q ? '&q=' + encodeURIComponent(q) : ''));
+  const j = await r.json();
+  const tb = document.getElementById('rows');
+  tb.innerHTML = '';
+  for (const i of (j.items || [])) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${i.spectrum_id}</td><td>${i.name}</td><td>${i.metal||''}</td><td>${i.isotope_class}</td><td>${i.n_annotations}</td>`;
+    tr.style.cursor = 'pointer';
+    tr.onclick = () => loadMeta(i.spectrum_id);
+    tb.appendChild(tr);
+  }
+}
+async function loadMeta(id){
+  const box = document.getElementById('meta');
+  box.textContent = '加载 #' + id + ' …';
+  const r = await fetch(base + '/spectra/' + id);
+  const j = await r.json();
+  const peaks = (j.peaks || []).slice(0, 15).map(p => `${p.peak_mass}\t${p.formula||''}\t${p.err??''}`).join('\n');
+  box.textContent =
+`#${j.spectrum_id} ${j.name}
+metal=${j.metal} class=${j.isotope_class}
+policy=${j.axis_policy}
+method=${j.calibration_method||''}
+hint=${j.axis_hint||''}
+peaks(show 15/${(j.peaks||[]).length}):
+mass\tformula\terr
+${peaks}`;
+}
+document.getElementById('btn').onclick = loadList;
+loadStatus().then(loadList).catch(e => {
+  document.getElementById('status').innerHTML = '<span class="err">连不上 data_service：'+e+'</span>';
+});
+</script>
+</body>
+</html>
